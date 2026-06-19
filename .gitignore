@@ -27,3 +27,4 @@ Thumbs.db
 
 # Local agent config
 /.claude/
+/.handoff/

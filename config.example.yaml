@@ -8,8 +8,25 @@
 # different thing for Azure severity/6 than for an AWS confidence/100 score.
 
 adapter:
-  name: stub            # "stub" (no creds) or "azure" (M1). Selects the single active model.
+  name: stub            # "stub" (no creds) or "azure". Selects the single active model.
   options: {}           # adapter-specific, opaque to the core; decoded inside the adapter.
+
+  # --- Azure AI Content Safety (image:analyze) ---
+  # Set name: azure and uncomment. All options below are NON-secret. The API key
+  # / bearer token are env-ONLY (never in yaml):
+  #   VISMOD_AZURE_KEY=...      (auth_mode: apikey, the default)
+  #   VISMOD_AZURE_TOKEN=...    (auth_mode: bearer — Entra ID token acquired out-of-band
+  #                              for scope https://cognitiveservices.azure.com/.default)
+  #   VISMOD_AZURE_ENDPOINT=... (alternative to options.endpoint below)
+  # options:
+  #   endpoint: https://<resource>.cognitiveservices.azure.com  # required (or VISMOD_AZURE_ENDPOINT)
+  #   auth_mode: apikey         # apikey (default) | bearer
+  #   api_version: "2024-09-01" # GA; Azure deprecates on ~90-day cadence
+  #   rps: 5                    # shared token-bucket rate (Azure F0 = 5 RPS; S0 = 100/s)
+  #   max_retries: 3            # transient (429/5xx/net) retries before failing the frame (0 disables)
+  #   retry_backoff: 500ms      # base backoff; doubles per attempt (+jitter), capped 30s, honors Retry-After
+  # NOTE: v1 sends inline base64 content ONLY. Remote blobUrl is disabled (SSRF/egress).
+  # Azure thresholds are NOT portable to other adapters (severity/6 scale) — re-tune below.
 
 # Two boundaries per category: flag_at (-> verdict flag) and block_at (-> verdict block).
 # Categories not listed fall back to thresholds.default.

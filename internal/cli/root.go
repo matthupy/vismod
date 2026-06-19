@@ -8,6 +8,7 @@ import (
 
 	// Blank imports: each adapter self-registers via init(). This is the ONLY
 	// place that knows the concrete adapter set.
+	_ "github.com/matthupy/vismod/internal/moderate/adapters/azure"
 	_ "github.com/matthupy/vismod/internal/moderate/adapters/stub"
 )
 
