@@ -21,14 +21,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out vismod
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: vismod
 
       # vismod's go.mod has `replace github.com/matthupy/videosift => ../videosift`,
       # so the sibling repo must be present for build/vet/test to resolve.
       - name: Check out videosift (replace target)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: matthupy/videosift
           path: videosift
@@ -62,12 +62,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out vismod
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: vismod
 
       - name: Check out videosift (replace target)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: matthupy/videosift
           path: videosift
@@ -89,12 +89,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out vismod
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: vismod
 
       - name: Check out videosift (replace target)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: matthupy/videosift
           path: videosift
