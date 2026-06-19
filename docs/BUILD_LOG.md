@@ -117,13 +117,77 @@ Git init + GitHub Actions PR validation. Repo `matthupy/vismod` (**private**).
 
 ---
 
-## NEXT — M1: Azure AI Content Safety adapter (§C)
-- Direct REST `POST {endpoint}/contentsafety/image:analyze?api-version=2024-09-01`
-  (configurable const). No Go SDK.
-- Both auth modes: `Ocp-Apim-Subscription-Key` + Entra ID / Managed Identity.
-- Normalize: `severity/6.0`, `ScoreOrigin="severity"`, 4 categories (Hate/SelfHarm/Sexual/Violence
-  — NOT Task Adherence). Input: 4 MB cap, format allow-list, dimension cap (default 2048).
-- Shared token-bucket rate limiter owned by the adapter (Azure F0 = 5 RPS), `MaxImageBytes` preflight.
-- Retry classification (429/5xx→retry, 4xx→terminal), surface `x-ms-error-code`.
-- Tests: `httptest` server, golden-file normalization (`-update`).
-- SSRF: v1 local-file/inline `content` only; `blobUrl` stays disabled (allow-list when enabled).
+## M1 — Azure AI Content Safety adapter ✅ COMPLETE (2026-06-19)
+
+Second in-tree adapter at `internal/moderate/adapters/azure/`, self-registers via `init()`
+alongside `stub`. Switching `adapter.name: azure` selects it at startup, zero call-site changes.
+Branch `feat/m1-azure-adapter` (PR, not merged to main directly).
+
+### Files
+| File | Responsibility |
+|---|---|
+| `azure.go` | Factory `New` (fail-fast on missing endpoint/secret), `Moderator` impl, `Caps`, `validateInput` (4 MB cap + MIME allow-list). |
+| `client.go` | Direct-REST data-plane client: request/response structs, single-attempt `do`, retry loop with bounded backoff, `classifyHTTPError`. |
+| `normalize.go` | Azure response → canonical `[]CategoryResult` (`severity/6.0`, `ScoreOrigin="severity"`, unknown native label → OTHER). |
+| `auth.go` | `authProvider` seam: `apiKeyAuth` (default) + `bearerAuth` (zero-dep). |
+| `options.go` | Decodes the provider-opaque `adapter.options` map into a typed struct. |
+| `*_test.go` + `testdata/` | httptest client tests, golden normalization (`-update`), factory/validate/auth tests. |
+
+### Key decisions / deviations
+- **Auth — zero new heavy deps.** Spec §C says "support both" auth modes. Shipped
+  `apikey` (default, `Ocp-Apim-Subscription-Key`) + `bearer` (`Authorization: Bearer`).
+  Bearer covers Microsoft Entra ID via a token acquired out-of-band (scope
+  `…/.default`). **Full `DefaultAzureCredential` / Managed Identity is deliberately
+  NOT wired** — it pulls the large `azidentity` SDK tree, violating "add a dep only
+  when it earns its place". The `authProvider` interface is the seam to add it later.
+- **Secrets (§F.1/§F.2):** env-only via the `AdapterConfig.Secret` accessor.
+  `VISMOD_AZURE_KEY` (apikey), `VISMOD_AZURE_TOKEN` (bearer). Endpoint is non-secret —
+  read from `options.endpoint` first, else `VISMOD_AZURE_ENDPOINT`. **Boot fails fast**
+  if endpoint or the active scheme's secret is missing (verified live via `scan`).
+- **Rate limiter (§F.3):** added `golang.org/x/time/rate` (stdlib-adjacent, the standard).
+  Token bucket constructed in the Factory, owned by the single adapter, burst=1 so
+  aggregate rate == `rps` regardless of `workers × frames.concurrency`. Default 5 RPS (F0).
+- **Retry (§F.4):** adapter-internal bounded retry — 429/5xx/408/transport-error →
+  retryable (backoff doubles per attempt, honors `Retry-After` delta-seconds on 429);
+  other 4xx + unparseable-200 → terminal. `x-ms-error-code` surfaced (header, else body).
+  This is the inner safety net; the queue `Disposition` retry is the outer one.
+- **Fail-safe (§F.5):** `AnalyzeImage` returns an `error` on any provider/validation
+  failure → pipeline records frame `Status=error` → `Verdict=error`, **never allow**.
+  Verified live against an unreachable host (DNS fail → exhaust retries → `verdict:error`).
+- **api-version** const `2024-09-01`, overridable via `options.api_version`; set as
+  `NormalizedResult.ModelVersion` (the §E single source the envelope copies).
+- **SSRF (§C):** v1 sends inline base64 `content` ONLY; `blobUrl` not implemented
+  (no remote-fetch vector). Documented in `config.example.yaml`; `SECURITY.md` is M4.
+- **Dimension cap (2048) NOT enforced in M1.** Azure rejects oversize dimensions itself
+  (terminal 4xx, surfaced) and decoding every frame just to measure W/H is wasteful;
+  the 4 MB byte cap is the hard pre-flight bound. Pixel-dimension pre-flight deferred —
+  low value vs. decode cost. (Re-evaluate if false 4xx noise shows up in practice.)
+
+### Verified live
+- `vismod adapters` lists `azure` + `stub` (azure shows a clear init-error when creds absent).
+- `vismod scan --config az.yaml x.png` with no creds → fail-fast boot error.
+- Same with bogus endpoint → `verdict:error`, `config_hash` stamped, never `allow`.
+
+### Tests
+- `go test ./...` all green. Module coverage **79.8%** (`-coverpkg=./...`); azure pkg
+  well-covered (normalize/validate/caps 100%, client 79–91%).
+- Golden fixtures: `mixed_severity`, `all_safe`, `unknown_category` (proves OTHER fallback +
+  `TaskAdherence` is treated as unmapped, never special-cased). `-update` regenerates.
+- httptest covers: success+auth-header+api-version, 429→retry→success, 4xx terminal
+  (no retry, code surfaced), 5xx exhausts retries, Retry-After parse.
+
+### Deferred to later milestones (unchanged)
+- videosift import + video framing = M2. Audit RFC 8785 JCS, docs (SECURITY/RESPONSIBLE_USE),
+  potential-CSAM divert = M4. asynq/Redis + `-race` in CI = M5.
+
+---
+
+## NEXT — M2: Video via videosift (§B)
+- `FrameSource` impl backed by `videosift.Extract`: absolute caller-owned `cfg.WorkDir`,
+  `defer cleanup` on every exit path, map `videosift.Frame`→`frames.Frame`, set non-zero
+  `MaxFrames` (config default 64). Boot probe for `ffmpeg`+`ffprobe` (`ErrNoBinaries`).
+- Lazy-decode fan-out already in `pipeline.analyzeVideoByFrames` — swap `FakeFrameSource`
+  for the real one in `wire.go`.
+- Fail-safe: `ErrNoFrames` / `*FFmpegError` → `Verdict=error` (never allow on zero frames).
+- Add the `require github.com/matthupy/videosift` line (replace directive already present);
+  track @latest, never pin (§B).
