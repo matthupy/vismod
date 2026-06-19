@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -78,6 +79,32 @@ func TestFramesMissingVideoCleansWorkDir(t *testing.T) {
 		if strings.HasPrefix(e.Name(), "vismod-frames-") {
 			t.Errorf("workdir %q survived cleanup", e.Name())
 		}
+	}
+}
+
+// The base WorkDir holds per-job extracted PNGs (sensitive content); it must be
+// created owner-only (0o700), not world-traversable. Frames creates the base
+// even when extraction later fails, so a missing-video call exercises this path.
+func TestFramesBaseDirIsOwnerOnly(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Go only models the read-only bit on Windows; POSIX perms not enforced")
+	}
+	// A not-yet-existing base under TempDir so MkdirAll actually creates it.
+	base := filepath.Join(t.TempDir(), "vismod-base")
+	src := NewVideosiftSource(VideosiftOptions{WorkDir: base})
+
+	_, cleanup, err := src.Frames(context.Background(), filepath.Join(base, "does-not-exist.mp4"))
+	if err == nil {
+		t.Fatal("Frames on missing video returned nil error, want error")
+	}
+	t.Cleanup(func() { _ = cleanup() })
+
+	info, err := os.Stat(base)
+	if err != nil {
+		t.Fatalf("stat base dir: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o700 {
+		t.Errorf("base dir perm = %o, want 0700", perm)
 	}
 }
 

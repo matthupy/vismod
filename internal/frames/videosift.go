@@ -66,6 +66,12 @@ func (s *VideosiftSource) ffprobePath() string {
 // runtime; call Probe once at boot so a missing binary surfaces as a clear
 // operator error rather than a per-job failure. The returned error wraps
 // videosift.ErrNoBinaries.
+//
+// TODO(videosift): this re-implements videosift's unexported validateBinaries
+// (iffmpeg.LookPath) with stdlib exec.LookPath. Identical today, but if
+// videosift adds a version/codec check the boot probe could pass while real
+// jobs fail. videosift exposes no public probe — track exporting e.g.
+// ValidateBinaries(cfg) upstream and call it here so both paths share one check.
 func (s *VideosiftSource) Probe(_ context.Context) error {
 	for _, bin := range []string{s.ffmpegPath(), s.ffprobePath()} {
 		if _, err := exec.LookPath(bin); err != nil {
@@ -96,7 +102,10 @@ func (s *VideosiftSource) Frames(ctx context.Context, videoPath string) ([]Frame
 		return nil, noopCleanup, fmt.Errorf("frames: resolve absolute workdir %q: %w", base, err)
 	}
 	base = abs
-	if err := os.MkdirAll(base, 0o755); err != nil {
+	// 0o700: the base holds per-job workdirs of extracted PNGs (sensitive
+	// moderation content). Owner-only keeps the base as locked-down as the
+	// 0o700 MkdirTemp workdirs beneath it.
+	if err := os.MkdirAll(base, 0o700); err != nil {
 		return nil, noopCleanup, fmt.Errorf("frames: create base dir %q: %w", base, err)
 	}
 
