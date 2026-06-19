@@ -78,11 +78,15 @@ jobs:
           go-version-file: vismod/go.mod
           cache-dependency-path: vismod/go.sum
 
+      # Install from source with the project's Go toolchain so the linter binary
+      # is built with the same Go version go.mod targets (prebuilt releases lag
+      # behind new Go versions and refuse a newer `go` directive).
+      - name: Install golangci-lint
+        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest
+
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v6
-        with:
-          version: latest
-          working-directory: vismod
+        working-directory: vismod
+        run: golangci-lint run ./...
 
   govulncheck:
     name: Vulnerability scan
