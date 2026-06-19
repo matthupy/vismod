@@ -11,6 +11,7 @@ package azure
 import (
 	"context"
 	"fmt"
+	"math/rand/v2"
 	"net/http"
 	"time"
 
@@ -31,6 +32,10 @@ const maxImageBytes = 4 * 1024 * 1024
 
 // defaultRPS is Azure F0 (free tier) = 5 requests/sec (§C). Overridable.
 const defaultRPS = 5.0
+
+// defaultMaxRetries is the transient-failure retry count when unset. An explicit
+// max_retries: 0 disables retries (see the sentinel in decodeOptions).
+const defaultMaxRetries = 3
 
 // allowedMIME is the input format allow-list (§C). MIME is sniffed from the
 // source extension upstream; an unsupported type is a terminal per-frame error.
@@ -90,11 +95,11 @@ func New(cfg moderate.AdapterConfig) (moderation.Moderator, error) {
 	if rps <= 0 {
 		rps = defaultRPS
 	}
+	// opts.maxRetries is -1 only when unset (decodeOptions sentinel); an explicit
+	// 0 is honored to disable retries. Any other negative is nonsense -> default.
 	maxRetries := opts.maxRetries
 	if maxRetries < 0 {
-		maxRetries = 0
-	} else if opts.maxRetries == 0 {
-		maxRetries = 3
+		maxRetries = defaultMaxRetries
 	}
 	backoff := opts.retryBackoff
 	if backoff <= 0 {
@@ -111,6 +116,9 @@ func New(cfg moderate.AdapterConfig) (moderation.Moderator, error) {
 		limiter:    rate.NewLimiter(rate.Limit(rps), 1),
 		maxRetries: maxRetries,
 		backoff:    backoff,
+		// Seeded RNG drives backoff jitter so concurrent workers that all hit a
+		// 429 don't retry in lockstep (thundering herd) against the shared limiter.
+		rng: rand.New(rand.NewPCG(uint64(time.Now().UnixNano()), 0x9E3779B97F4A7C15)),
 	}
 	return &azure{client: c, apiVersion: apiVersion}, nil
 }

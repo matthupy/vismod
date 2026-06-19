@@ -23,7 +23,13 @@ func decodeOptions(m map[string]any) options {
 	o.authMode = asString(m["auth_mode"])
 	o.apiVersion = asString(m["api_version"])
 	o.rps = asFloat(m["rps"])
-	o.maxRetries = asInt(m["max_retries"])
+	// Sentinel -1 marks "unset" so the factory can distinguish an absent key
+	// (apply default) from an explicit max_retries: 0 (retries disabled).
+	if v, ok := m["max_retries"]; ok {
+		o.maxRetries = asInt(v)
+	} else {
+		o.maxRetries = -1
+	}
 	if d, err := time.ParseDuration(asString(m["retry_backoff"])); err == nil {
 		o.retryBackoff = d
 	}

@@ -23,8 +23,8 @@ adapter:
   #   auth_mode: apikey         # apikey (default) | bearer
   #   api_version: "2024-09-01" # GA; Azure deprecates on ~90-day cadence
   #   rps: 5                    # shared token-bucket rate (Azure F0 = 5 RPS; S0 = 100/s)
-  #   max_retries: 3            # transient (429/5xx/net) retries before failing the frame
-  #   retry_backoff: 500ms      # base backoff; doubles per attempt, honors Retry-After on 429
+  #   max_retries: 3            # transient (429/5xx/net) retries before failing the frame (0 disables)
+  #   retry_backoff: 500ms      # base backoff; doubles per attempt (+jitter), capped 30s, honors Retry-After
   # NOTE: v1 sends inline base64 content ONLY. Remote blobUrl is disabled (SSRF/egress).
   # Azure thresholds are NOT portable to other adapters (severity/6 scale) — re-tune below.
 

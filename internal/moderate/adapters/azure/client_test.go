@@ -3,6 +3,7 @@ package azure
 import (
 	"context"
 	"errors"
+	"math/rand/v2"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -154,5 +155,45 @@ func TestParseRetryAfter(t *testing.T) {
 	}
 	if got := parseRetryAfter("garbage"); got != 0 {
 		t.Errorf("parseRetryAfter(garbage) = %v, want 0", got)
+	}
+}
+
+// A hostile/buggy server must not park a worker arbitrarily long: Retry-After is
+// clamped to maxBackoff for BOTH the delta-seconds and HTTP-date forms.
+func TestParseRetryAfterClamped(t *testing.T) {
+	if got := parseRetryAfter("99999"); got != maxBackoff {
+		t.Errorf("parseRetryAfter(99999s) = %v, want clamp %v", got, maxBackoff)
+	}
+	if got := parseRetryAfter("Wed, 21 Oct 2099 07:28:00 GMT"); got != maxBackoff {
+		t.Errorf("parseRetryAfter(far-future date) = %v, want clamp %v", got, maxBackoff)
+	}
+	// Under the cap is returned verbatim.
+	if got := parseRetryAfter("1"); got != time.Second {
+		t.Errorf("parseRetryAfter(1) = %v, want 1s (under cap)", got)
+	}
+}
+
+// Exponential backoff must not overflow past maxBackoff even for a large attempt.
+func TestRetryWaitClampsExponential(t *testing.T) {
+	c := &client{backoff: time.Second} // rng nil -> deterministic, no jitter
+	if got := c.retryWait(40, &apiError{Retryable: true}); got != maxBackoff {
+		t.Fatalf("retryWait(40) = %v, want clamp %v", got, maxBackoff)
+	}
+}
+
+// Jitter stays within [d/2, d] (equal jitter) and is only applied to the
+// exponential path — never to a server-set Retry-After.
+func TestApplyJitterWithinBounds(t *testing.T) {
+	c := &client{backoff: time.Second, rng: rand.New(rand.NewPCG(1, 2))}
+	d := 4 * time.Second
+	for range 100 {
+		got := c.applyJitter(d)
+		if got < d/2 || got > d {
+			t.Fatalf("applyJitter(%v) = %v, want within [%v, %v]", d, got, d/2, d)
+		}
+	}
+	// Server Retry-After is honored exactly (no jitter applied).
+	if got := c.retryWait(1, &apiError{Retryable: true, retryAfter: 3 * time.Second}); got != 3*time.Second {
+		t.Fatalf("retryWait honoring Retry-After = %v, want exact 3s", got)
 	}
 }

@@ -8,12 +8,18 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net/http"
 	"strconv"
 	"time"
 
 	"golang.org/x/time/rate"
 )
+
+// maxBackoff caps every wait between attempts — both the exponential fallback
+// and a server-supplied Retry-After. Without it a hostile/buggy server could
+// park a worker arbitrarily long via a huge Retry-After header.
+const maxBackoff = 30 * time.Second
 
 // analyzeRequest is the image:analyze request body. v1 sends inline base64
 // content only — blobUrl is an SSRF/egress vector and stays disabled (§C).
@@ -50,6 +56,7 @@ type client struct {
 	limiter    *rate.Limiter // shared token bucket, owned by the adapter
 	maxRetries int
 	backoff    time.Duration
+	rng        *rand.Rand // backoff jitter source; nil disables jitter (tests)
 }
 
 // analyze sends one image and returns the parsed response. It honors the shared
@@ -162,33 +169,49 @@ func classifyHTTPError(resp *http.Response, raw []byte) *apiError {
 }
 
 // retryWait computes the backoff for the next attempt: Retry-After when the
-// server set it (Azure sends it on 429 AND 503), else exponential
-// (backoff * 2^(attempt-1)).
+// server set it (Azure sends it on 429 AND 503, already clamped at parse, honored
+// exactly), else jittered exponential (backoff * 2^(attempt-1), clamped to
+// maxBackoff). attempt is always >= 1 here.
 func (c *client) retryWait(attempt int, lastErr error) time.Duration {
 	var ae *apiError
 	if errors.As(lastErr, &ae) && ae.retryAfter > 0 {
 		return ae.retryAfter
 	}
-	w := c.backoff
-	for i := 1; i < attempt; i++ {
-		w *= 2
+	// backoff << (attempt-1) == backoff * 2^(attempt-1). A large attempt can
+	// overflow Duration to <= 0; clamp guards that and the upper bound.
+	w := c.backoff << (attempt - 1)
+	if w <= 0 || w > maxBackoff {
+		w = maxBackoff
 	}
-	return w
+	return c.applyJitter(w)
+}
+
+// applyJitter returns an equal-jitter wait in [d/2, d]: half fixed (guarantees
+// progress) plus a random half (spreads concurrent retries). A nil rng returns d
+// unchanged so tests stay deterministic.
+func (c *client) applyJitter(d time.Duration) time.Duration {
+	if c.rng == nil {
+		return d
+	}
+	half := d / 2
+	return half + time.Duration(c.rng.Int64N(int64(half)+1))
 }
 
 // parseRetryAfter reads the Retry-After header in either RFC 7231 form:
-// delta-seconds (integer) or an HTTP-date. A past/invalid date yields 0.
+// delta-seconds (integer) or an HTTP-date. A past/invalid date yields 0. The
+// result is clamped to maxBackoff so a server cannot park a worker arbitrarily.
 func parseRetryAfter(h string) time.Duration {
 	if h == "" {
 		return 0
 	}
+	var d time.Duration
 	if secs, err := strconv.Atoi(h); err == nil && secs >= 0 {
-		return time.Duration(secs) * time.Second
+		d = time.Duration(secs) * time.Second
+	} else if t, err := http.ParseTime(h); err == nil {
+		d = time.Until(t)
 	}
-	if t, err := http.ParseTime(h); err == nil {
-		if d := time.Until(t); d > 0 {
-			return d
-		}
+	if d <= 0 {
+		return 0
 	}
-	return 0
+	return min(d, maxBackoff)
 }
