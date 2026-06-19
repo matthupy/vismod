@@ -38,6 +38,8 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("frames.keyframe", true)
 	v.SetDefault("frames.temporal", true)
 	v.SetDefault("frames.mpdecimate", true)
+	v.SetDefault("frames.ffmpeg_path", "")
+	v.SetDefault("frames.ffprobe_path", "")
 
 	v.SetDefault("log.level", "info")
 	v.SetDefault("metrics.addr", ":9090")

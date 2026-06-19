@@ -58,6 +58,8 @@ frames:
   keyframe: true
   temporal: true
   mpdecimate: true
+  ffmpeg_path: ""       # override ffmpeg binary (empty -> discovered on PATH; validated at boot)
+  ffprobe_path: ""      # override ffprobe binary (empty -> discovered on PATH; validated at boot)
 
 log:
   level: info           # debug | info | warn | error

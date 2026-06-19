@@ -62,6 +62,9 @@ type FramesConfig struct {
 	Keyframe    bool   `mapstructure:"keyframe"`
 	Temporal    bool   `mapstructure:"temporal"`
 	MPDecimate  bool   `mapstructure:"mpdecimate"`
+	// Binary overrides for the videosift extractor; empty => discovered on PATH.
+	FFmpegPath  string `mapstructure:"ffmpeg_path"`
+	FFprobePath string `mapstructure:"ffprobe_path"`
 }
 
 // Config is the full typed configuration.

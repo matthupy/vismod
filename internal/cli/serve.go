@@ -41,6 +41,13 @@ func runServe(cmd *cobra.Command, _ []string) error {
 		return fmt.Errorf("serve: queue.driver=%q not supported in v1 (redis is M5)", cfg.Queue.Driver)
 	}
 
+	// Boot validation (§F.2): videosift execs ffmpeg+ffprobe for every video
+	// job. Validate once at boot so a missing binary is a clear operator error,
+	// not a per-job failure surfacing as error-verdict envelopes.
+	if err := probeFrameSource(cfg); err != nil {
+		return fmt.Errorf("serve: %w", err)
+	}
+
 	resultSink := result.NewJSONLSink(os.Stdout)
 	dlqSink := result.NewJSONLSink(os.Stderr)
 

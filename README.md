@@ -8,11 +8,11 @@ A public good for trust & safety. Positioned as the **Classification** stage in 
 Hash Matching → Classification → Review → Investigation taxonomy (cf. ROOST), feeding
 a review console / rules engine downstream.
 
-> **Status: M0 (runnable skeleton).** The full pipeline runs end-to-end with a
-> credential-free `stub` adapter. Azure (M1), real videosift framing (M2), Docker +
-> metrics (M3), responsible-use docs + audit wiring (M4), and Redis/scale (M5) follow.
-> Responsible-use, security and licensing docs land in M4 — **do not deploy against
-> real-world content yet.**
+> **Status: M2 (video framing).** The full pipeline runs end-to-end with the
+> credential-free `stub` adapter or Azure (M1), and video inputs are framed by the
+> real `videosift` extractor (M2). Docker + metrics (M3), responsible-use docs +
+> audit wiring (M4), and Redis/scale (M5) follow. Responsible-use, security and
+> licensing docs land in M4 — **do not deploy against real-world content yet.**
 
 ## Quick start
 

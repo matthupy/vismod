@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"log/slog"
 	"os"
 
@@ -27,9 +28,35 @@ func buildModerator(cfg config.Config) (moderation.Moderator, error) {
 	return moderate.New(cfg.Adapter.Name, ac)
 }
 
-// buildPipeline wires a Pipeline from config with the given sink. The v1/M0
-// FrameSource is a fake (videosift-backed source lands in M2); the HashMatcher
-// is the no-op default.
+// buildFrameSource wires the videosift-backed FrameSource (M2) from config,
+// carrying the frame-extraction knobs. The pipeline lazily decodes each frame;
+// this source owns only extraction + WorkDir lifecycle.
+func buildFrameSource(cfg config.Config) frames.FrameSource {
+	return frames.NewVideosiftSource(frames.VideosiftOptions{
+		WorkDir:     cfg.Frames.WorkDir,
+		MaxFrames:   cfg.Frames.MaxFrames,
+		Scene:       cfg.Frames.Scene,
+		Keyframe:    cfg.Frames.Keyframe,
+		Temporal:    cfg.Frames.Temporal,
+		MPDecimate:  cfg.Frames.MPDecimate,
+		FFmpegPath:  cfg.Frames.FFmpegPath,
+		FFprobePath: cfg.Frames.FFprobePath,
+	})
+}
+
+// probeFrameSource validates ffmpeg/ffprobe at boot (§F.2) so a missing binary
+// surfaces as a clear operator error, not a per-job failure. Wraps
+// videosift.ErrNoBinaries.
+func probeFrameSource(cfg config.Config) error {
+	src := frames.NewVideosiftSource(frames.VideosiftOptions{
+		FFmpegPath:  cfg.Frames.FFmpegPath,
+		FFprobePath: cfg.Frames.FFprobePath,
+	})
+	return src.Probe(context.Background())
+}
+
+// buildPipeline wires a Pipeline from config with the given sink. The
+// FrameSource is videosift-backed (M2); the HashMatcher is the no-op default.
 func buildPipeline(cfg config.Config, sink result.Sink, log *slog.Logger) (*pipeline.Pipeline, moderation.Moderator, error) {
 	mod, err := buildModerator(cfg)
 	if err != nil {
@@ -37,7 +64,7 @@ func buildPipeline(cfg config.Config, sink result.Sink, log *slog.Logger) (*pipe
 	}
 	p := &pipeline.Pipeline{
 		Moderator: mod,
-		Frames:    &frames.FakeFrameSource{}, // M2: videosift-backed source
+		Frames:    buildFrameSource(cfg),
 		Matcher:   hashmatch.NoOp{},
 		Sink:      sink,
 		Cfg:       cfg,

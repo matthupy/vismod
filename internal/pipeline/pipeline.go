@@ -213,6 +213,11 @@ func errorResult(ts *float64, err error) moderation.NormalizedResult {
 	}
 }
 
+// DetectMediaType resolves a Source to "image" or "video" (honoring an explicit
+// MediaType, else by extension). Exported so commands can pre-flight the video
+// path (e.g. boot-probe ffmpeg only when a video is involved).
+func DetectMediaType(src moderation.Source) string { return detectMediaType(src) }
+
 func detectMediaType(src moderation.Source) string {
 	if src.MediaType == "image" || src.MediaType == "video" {
 		return src.MediaType

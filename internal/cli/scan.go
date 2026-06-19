@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"github.com/matthupy/vismod/internal/pipeline"
 	"github.com/matthupy/vismod/internal/result"
 	"github.com/matthupy/vismod/pkg/moderation"
 	"github.com/spf13/cobra"
@@ -18,6 +19,17 @@ func newScanCmd() *cobra.Command {
 				return err
 			}
 
+			src := moderation.Source{Kind: "file", Ref: args[0], MediaType: mediaType}
+
+			// Boot-probe ffmpeg/ffprobe only when a video is involved, so a
+			// missing binary fails fast with a clear error instead of an
+			// error-verdict envelope (image scans need no ffmpeg).
+			if pipeline.DetectMediaType(src) == "video" {
+				if err := probeFrameSource(cfg); err != nil {
+					return err
+				}
+			}
+
 			sink := result.NewJSONLSink(cmd.OutOrStdout())
 			p, mod, err := buildPipeline(cfg, sink, log)
 			if err != nil {
@@ -25,7 +37,6 @@ func newScanCmd() *cobra.Command {
 			}
 			defer mod.Close()
 
-			src := moderation.Source{Kind: "file", Ref: args[0], MediaType: mediaType}
 			return p.Process(cmd.Context(), result.JobID("scan-1"), src)
 		},
 	}
