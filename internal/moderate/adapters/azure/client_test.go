@@ -120,6 +120,25 @@ func TestClientExhaustsRetriesOn5xx(t *testing.T) {
 	}
 }
 
+func TestRetryWaitHonorsRetryAfterOn5xx(t *testing.T) {
+	c := &client{backoff: time.Second}
+	// Azure sends Retry-After on 503 too, not just 429. The server hint must win
+	// over blind exponential backoff for any retryable status.
+	err := &apiError{Status: http.StatusServiceUnavailable, Retryable: true, retryAfter: 3 * time.Second}
+	if got := c.retryWait(1, err); got != 3*time.Second {
+		t.Fatalf("retryWait on 503 with Retry-After = %v, want 3s", got)
+	}
+}
+
+func TestRetryWaitFallsBackToExponentialWithoutRetryAfter(t *testing.T) {
+	c := &client{backoff: time.Second}
+	// No Retry-After -> exponential: backoff * 2^(attempt-1) = 1s * 2^1 = 2s.
+	err := &apiError{Status: http.StatusServiceUnavailable, Retryable: true}
+	if got := c.retryWait(2, err); got != 2*time.Second {
+		t.Fatalf("retryWait without Retry-After = %v, want 2s", got)
+	}
+}
+
 func TestParseRetryAfter(t *testing.T) {
 	if got := parseRetryAfter("2"); got != 2*time.Second {
 		t.Errorf("parseRetryAfter(2) = %v", got)

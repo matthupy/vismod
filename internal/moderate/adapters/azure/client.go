@@ -33,7 +33,7 @@ type apiError struct {
 	Code       string
 	Message    string
 	Retryable  bool
-	retryAfter time.Duration // parsed Retry-After on 429; 0 if absent
+	retryAfter time.Duration // parsed Retry-After (429/503); 0 if absent
 }
 
 func (e *apiError) Error() string {
@@ -54,7 +54,7 @@ type client struct {
 
 // analyze sends one image and returns the parsed response. It honors the shared
 // rate limiter (Wait blocks until a token is free) and retries transient
-// failures (429/5xx/net) with bounded backoff, respecting Retry-After on 429.
+// failures (429/5xx/net) with bounded backoff, respecting Retry-After (429/503).
 func (c *client) analyze(ctx context.Context, img []byte) (analyzeResponse, error) {
 	body := analyzeRequest{
 		Image:      imageContent{Content: base64.StdEncoding.EncodeToString(img)},
@@ -162,10 +162,11 @@ func classifyHTTPError(resp *http.Response, raw []byte) *apiError {
 }
 
 // retryWait computes the backoff for the next attempt: Retry-After when the
-// server set it on a 429, else exponential (backoff * 2^(attempt-1)).
+// server set it (Azure sends it on 429 AND 503), else exponential
+// (backoff * 2^(attempt-1)).
 func (c *client) retryWait(attempt int, lastErr error) time.Duration {
 	var ae *apiError
-	if errors.As(lastErr, &ae) && ae.Status == http.StatusTooManyRequests && ae.retryAfter > 0 {
+	if errors.As(lastErr, &ae) && ae.retryAfter > 0 {
 		return ae.retryAfter
 	}
 	w := c.backoff

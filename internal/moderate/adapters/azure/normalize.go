@@ -46,6 +46,14 @@ func normalize(resp analyzeResponse) []moderation.CategoryResult {
 	for _, ca := range resp.CategoriesAnalysis {
 		cat, ok := categoryMap[ca.Category]
 		if !ok {
+			// Defensive: image:analyze only ever returns the 4 safety categories
+			// (azure.go Capabilities), so this branch is unreachable in practice.
+			// If a future api-version adds a native label, it maps to OTHER and
+			// the pipeline runs Thresholds.For(Other) — meaning OTHER is subject
+			// to the default block threshold like any category. Intended: an
+			// unmapped signal is never silently dropped. If OTHER should be
+			// exempt or carry a dedicated threshold, that is a rollup-layer policy
+			// decision, not a normalization concern.
 			cat = moderation.CategoryOther
 		}
 		score := float64(ca.Severity) / severityScale
