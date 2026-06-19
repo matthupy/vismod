@@ -107,6 +107,13 @@ Git init + GitHub Actions PR validation. Repo `matthupy/vismod` (**private**).
 - **`.github/dependabot.yml`:** weekly gomod + github-actions updates.
 - Tooling: built-in `go vet`/`gofmt`/`go test`; golangci-lint + govulncheck are the
   de-facto-standard Go lint/vuln tools (widely used, not niche).
+- **golangci-lint install via `go install ...@latest`, NOT the prebuilt action:**
+  prebuilt releases lag new Go versions — the action's binary (built w/ go1.24)
+  refused our go.mod `go 1.26.4` (exit 3). Building from source w/ the runner's
+  toolchain always matches. Trade-off: ~1–2 min slower, no lint-result cache.
+- **Verified green:** push→main CI run all 3 jobs ✅ (build-test, lint, govulncheck).
+- Open nit: actions emit Node20-deprecation warnings (non-fatal); bump to newer
+  action majors later.
 
 ---
 
