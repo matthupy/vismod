@@ -34,7 +34,7 @@ jobs:
           path: videosift
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: vismod/go.mod
           cache-dependency-path: vismod/go.sum
@@ -73,7 +73,7 @@ jobs:
           path: videosift
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: vismod/go.mod
           cache-dependency-path: vismod/go.sum
@@ -100,7 +100,7 @@ jobs:
           path: videosift
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: vismod/go.mod
           cache-dependency-path: vismod/go.sum
