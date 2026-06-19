@@ -1,0 +1,26 @@
+# golangci-lint configuration (v2 schema).
+# Conservative, widely-used baseline: the standard linter set plus misspell.
+# Tighten over time as the codebase matures.
+version: "2"
+
+linters:
+  # "standard" = errcheck, govet, ineffassign, staticcheck, unused.
+  default: standard
+  enable:
+    - misspell      # catches common spelling mistakes in comments/strings
+  exclusions:
+    # Curated presets that suppress well-known false positives — notably the
+    # std-error-handling preset, which exempts unchecked .Close()/.Flush()/print*
+    # calls that errcheck would otherwise flag.
+    presets:
+      - common-false-positives
+      - std-error-handling
+    rules:
+      # Test files are allowed to ignore errors for brevity in setup/teardown.
+      - path: _test\.go
+        linters:
+          - errcheck
+
+formatters:
+  enable:
+    - gofmt

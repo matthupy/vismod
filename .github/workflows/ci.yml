@@ -1,0 +1,113 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# Least-privilege: jobs only read the repo.
+permissions:
+  contents: read
+
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out vismod
+        uses: actions/checkout@v4
+        with:
+          path: vismod
+
+      # vismod's go.mod has `replace github.com/matthupy/videosift => ../videosift`,
+      # so the sibling repo must be present for build/vet/test to resolve.
+      - name: Check out videosift (replace target)
+        uses: actions/checkout@v4
+        with:
+          repository: matthupy/videosift
+          path: videosift
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: vismod/go.mod
+          cache-dependency-path: vismod/go.sum
+
+      - name: Verify go.mod / go.sum are tidy
+        working-directory: vismod
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
+      - name: Build
+        working-directory: vismod
+        run: go build ./...
+
+      - name: go vet
+        working-directory: vismod
+        run: go vet ./...
+
+      - name: Test (race detector + coverage)
+        working-directory: vismod
+        run: go test -race -covermode=atomic -coverprofile=coverage.out ./...
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out vismod
+        uses: actions/checkout@v4
+        with:
+          path: vismod
+
+      - name: Check out videosift (replace target)
+        uses: actions/checkout@v4
+        with:
+          repository: matthupy/videosift
+          path: videosift
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: vismod/go.mod
+          cache-dependency-path: vismod/go.sum
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+          working-directory: vismod
+
+  govulncheck:
+    name: Vulnerability scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out vismod
+        uses: actions/checkout@v4
+        with:
+          path: vismod
+
+      - name: Check out videosift (replace target)
+        uses: actions/checkout@v4
+        with:
+          repository: matthupy/videosift
+          path: videosift
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: vismod/go.mod
+          cache-dependency-path: vismod/go.sum
+
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+
+      - name: Run govulncheck
+        working-directory: vismod
+        run: govulncheck ./...

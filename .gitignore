@@ -1,0 +1,29 @@
+# Binaries
+vismod
+vismod.exe
+/dist/
+
+# Local artifacts
+*.out
+*.err
+audit.log
+*.tmp
+
+# Test/sample media — NEVER commit media (esp. potential illegal content)
+/testmedia/
+sample.*
+
+# Go
+/vendor/
+*.test
+coverage.out
+coverage.txt
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Local agent config
+/.claude/

@@ -1,0 +1,49 @@
+# vismod configuration example.
+#
+# Secrets are NEVER read from this file. They come only from environment
+# variables with the VISMOD_ prefix (dots -> underscores), e.g.:
+#   VISMOD_AZURE_KEY=...        VISMOD_AZURE_ENDPOINT=https://<res>.cognitiveservices.azure.com
+#
+# Thresholds are PER-ADAPTER and NOT portable: a 0.667 threshold means a
+# different thing for Azure severity/6 than for an AWS confidence/100 score.
+
+adapter:
+  name: stub            # "stub" (no creds) or "azure" (M1). Selects the single active model.
+  options: {}           # adapter-specific, opaque to the core; decoded inside the adapter.
+
+# Two boundaries per category: flag_at (-> verdict flag) and block_at (-> verdict block).
+# Categories not listed fall back to thresholds.default.
+thresholds:
+  default:
+    flag_at: 0.5
+    block_at: 0.8
+  SEXUAL:               # strictest by default
+    flag_at: 0.5
+    block_at: 0.667
+    potential_csam: 0.667   # SEXUAL score at/above which a frame is treated as potential-CSAM (M4 divert)
+
+queue:
+  driver: memory        # "memory" (dev/CLI, non-durable) or "redis" (M5).
+  workers: 4            # parallel job workers (bounds parallelism, not throughput)
+  buffer: 64            # in-memory FIFO buffer depth
+  max_retries: 3        # bounded retry before dead-letter
+  retry_backoff: 500ms
+  drain_timeout: 30s    # graceful-drain budget for in-flight jobs on shutdown
+  job_timeout: 60s      # per-job processing timeout
+  deadletter_max: 1024  # DLQ depth cap; at capacity new enqueues are rejected
+  redis_addr: localhost:6379   # used only when driver=redis
+
+frames:
+  workdir: ""           # absolute, caller-owned, ephemeral, writable dir (empty -> system temp under a vismod dir)
+  max_frames: 64        # REQUIRED > 0: primary bound on per-video cost AND peak disk
+  concurrency: 4        # per-job moderation fan-out limit (distinct from videosift internal concurrency)
+  scene: true
+  keyframe: true
+  temporal: true
+  mpdecimate: true
+
+log:
+  level: info           # debug | info | warn | error
+
+metrics:
+  addr: ":9090"         # serve exposes /healthz and /readyz here (Prometheus /metrics in M3)
