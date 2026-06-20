@@ -46,6 +46,10 @@ func (e *apiError) Error() string {
 	return fmt.Sprintf("azure: HTTP %d code=%s: %s", e.Status, e.Code, e.Message)
 }
 
+// ErrorCode implements moderation.CodedError so observability can label
+// vismod_adapter_errors_total{code} with the x-ms-error-code.
+func (e *apiError) ErrorCode() string { return e.Code }
+
 // client is the direct-REST Content Safety data-plane client. There is no Go
 // SDK for this surface, so it calls net/http directly.
 type client struct {

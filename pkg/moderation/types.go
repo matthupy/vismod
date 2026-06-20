@@ -166,6 +166,14 @@ type VideoModerator interface {
 	AnalyzeVideo(ctx context.Context, video Source) (NormalizedResult, error)
 }
 
+// CodedError is an OPTIONAL interface an adapter error may implement to expose a
+// provider error code (e.g. Azure's x-ms-error-code). Observability uses it to
+// label vismod_adapter_errors_total{code}; absent, the code is "unknown".
+type CodedError interface {
+	error
+	ErrorCode() string
+}
+
 // HashMatch is a binary list-membership result, NOT a score.
 type HashMatch struct {
 	Matched  bool

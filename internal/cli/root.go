@@ -27,7 +27,7 @@ func newRootCmd() *cobra.Command {
 	}
 	root.PersistentFlags().StringVar(&configPath, "config", "", "path to config file (yaml)")
 
-	root.AddCommand(newScanCmd(), newServeCmd(), newAdaptersCmd(), newAuditCmd(), newVersionCmd())
+	root.AddCommand(newScanCmd(), newServeCmd(), newAdaptersCmd(), newAuditCmd(), newVersionCmd(), newHealthcheckCmd())
 	return root
 }
 

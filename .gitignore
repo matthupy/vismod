@@ -1,6 +1,7 @@
-# Binaries
-vismod
-vismod.exe
+# Binaries (anchored to repo root — a bare `vismod` also matches the
+# cmd/vismod/ source dir and silently un-tracks the entrypoint).
+/vismod
+/vismod.exe
 /dist/
 
 # Local artifacts

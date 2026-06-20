@@ -101,6 +101,48 @@ func TestLoadEnvOverlay(t *testing.T) {
 	}
 }
 
+func TestLoadConfigPathFromEnv(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "c.yaml")
+	if err := os.WriteFile(path, []byte("metrics:\n  addr: \":7654\"\nframes:\n  max_frames: 10\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Empty path arg + VISMOD_CONFIG set: the env file is read. This is the
+	// container HEALTHCHECK path (no --config flag), and it must resolve the same
+	// metrics.addr a serve started against the file would.
+	t.Setenv("VISMOD_CONFIG", path)
+	c, err := Load("")
+	if err != nil {
+		t.Fatalf("Load(\"\") with VISMOD_CONFIG: %v", err)
+	}
+	if c.MetricsAddr != ":7654" {
+		t.Errorf("metrics addr from VISMOD_CONFIG file = %q, want :7654", c.MetricsAddr)
+	}
+}
+
+func TestLoadFlagPathBeatsEnv(t *testing.T) {
+	dir := t.TempDir()
+	envFile := filepath.Join(dir, "env.yaml")
+	flagFile := filepath.Join(dir, "flag.yaml")
+	if err := os.WriteFile(envFile, []byte("metrics:\n  addr: \":1111\"\nframes:\n  max_frames: 10\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(flagFile, []byte("metrics:\n  addr: \":2222\"\nframes:\n  max_frames: 10\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Explicit path arg (the --config flag) wins over VISMOD_CONFIG: flag > env.
+	t.Setenv("VISMOD_CONFIG", envFile)
+	c, err := Load(flagFile)
+	if err != nil {
+		t.Fatalf("Load(flagFile): %v", err)
+	}
+	if c.MetricsAddr != ":2222" {
+		t.Errorf("metrics addr = %q, want :2222 (flag must beat VISMOD_CONFIG)", c.MetricsAddr)
+	}
+}
+
 func TestValidateErrors(t *testing.T) {
 	dir := t.TempDir()
 	cases := map[string]string{

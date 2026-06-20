@@ -24,6 +24,13 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+// JobRecorder counts finished jobs by overall verdict for observability
+// (§F.6 vismod_jobs_total{verdict}). Optional — a nil Metrics is a no-op, so
+// the one-shot scan path needs no metrics server. observe.Metrics satisfies it.
+type JobRecorder interface {
+	RecordJob(verdict moderation.Verdict)
+}
+
 // Pipeline holds the wired dependencies for processing jobs. One active
 // Moderator per process; its shared rate limiter (M1) gates all fan-out.
 type Pipeline struct {
@@ -33,6 +40,7 @@ type Pipeline struct {
 	Sink      result.Sink
 	Cfg       config.Config
 	Log       *slog.Logger
+	Metrics   JobRecorder // optional; nil = no metrics
 }
 
 // Process handles one job: it builds and writes the ResultEnvelope to the Sink.
@@ -73,6 +81,14 @@ func (p *Pipeline) Process(ctx context.Context, jobID result.JobID, src moderati
 
 	if err := p.Sink.Write(ctx, env); err != nil {
 		return fmt.Errorf("sink write: %w", err)
+	}
+
+	// Count only AFTER a successful emit. Counting earlier would (a) inflate
+	// jobs_total for a job whose envelope never reached the sink and (b) double
+	// count on queue retry, since a sink-write failure re-runs Process. Recording
+	// here makes vismod_jobs_total = jobs successfully emitted, once each.
+	if p.Metrics != nil {
+		p.Metrics.RecordJob(res.Overall.Verdict)
 	}
 	return nil
 }
@@ -139,7 +155,6 @@ func (p *Pipeline) analyzeVideoByFrames(ctx context.Context, src moderation.Sour
 	g.SetLimit(conc)
 
 	for i, f := range fr {
-		i, f := i, f
 		g.Go(func() error {
 			// Lazy decode INSIDE the task so at most `conc` images are resident.
 			img, derr := loadImage(f.Path)

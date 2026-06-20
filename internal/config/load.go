@@ -4,10 +4,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"github.com/matthupy/vismod/pkg/moderation"
-	"github.com/spf13/viper"
+	"os"
 	"sort"
 	"strings"
+
+	"github.com/matthupy/vismod/pkg/moderation"
+	"github.com/spf13/viper"
 )
 
 // defaults are applied before file/env overlay.
@@ -47,7 +49,17 @@ func setDefaults(v *viper.Viper) {
 
 // Load reads config from an optional file plus the VISMOD_ env overlay.
 // Secrets are env-only and are never decoded into Config.
+//
+// When path is empty, the config-file path falls back to the VISMOD_CONFIG env
+// var (flag > env > none). This lets the container HEALTHCHECK — which runs
+// `vismod healthcheck` with no --config flag — resolve the SAME metrics.addr as
+// a `serve` started against a mounted config file, by pointing both at it via
+// one env var instead of baking a file into the slim image.
 func Load(path string) (Config, error) {
+	if path == "" {
+		path = os.Getenv("VISMOD_CONFIG")
+	}
+
 	v := viper.New()
 	setDefaults(v)
 
