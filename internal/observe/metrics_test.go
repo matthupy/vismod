@@ -57,21 +57,20 @@ func TestRegisterQueueDepthSurfacesScrapeError(t *testing.T) {
 		func() float64 { return 0 },
 	)
 
-	// One scrape: gauge reads, error bumps the counter.
-	if got := testutil.CollectAndCount(m.Registry(), "vismod_queue_depth"); got == 0 {
-		t.Error("expected vismod_queue_depth to be collectable")
+	// The error counter increments once PER scrape (it is bumped inside the gauge
+	// collect), so assert against a known number of scrapes. Gather the registry
+	// exactly once, then read the counter directly via ToFloat64 — a separate
+	// collect pass, so it neither adds a scrape nor races the gauge's collect
+	// order within a single Gather.
+	if _, err := m.Registry().Gather(); err != nil {
+		t.Fatalf("gather: %v", err)
 	}
-	want := `
-# HELP vismod_queue_depth_scrape_errors_total Times a scrape-time queue-depth read failed (depth reported as 0 for that scrape).
-# TYPE vismod_queue_depth_scrape_errors_total counter
-vismod_queue_depth_scrape_errors_total 1
-`
-	if err := testutil.GatherAndCompare(m.Registry(), strings.NewReader(want),
-		"vismod_queue_depth_scrape_errors_total"); err != nil {
-		t.Errorf("scrape-error counter mismatch: %v", err)
+	if got := testutil.ToFloat64(m.queueDepthErrors); got != 1 {
+		t.Errorf("scrape-error counter = %v, want 1 after one failed scrape", got)
 	}
 
-	// Depth itself must read 0 on the failed scrape (not stale/garbage).
+	// Depth itself must read 0 on the failed scrape (not stale/garbage). This
+	// gather is a second scrape (counter now 2); we assert only the depth value.
 	wantDepth := `
 # HELP vismod_queue_depth Jobs buffered in the queue and not yet started.
 # TYPE vismod_queue_depth gauge
