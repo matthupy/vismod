@@ -65,4 +65,4 @@ log:
   level: info           # debug | info | warn | error
 
 metrics:
-  addr: ":9090"         # serve exposes /healthz and /readyz here (Prometheus /metrics in M3)
+  addr: ":9090"         # serve exposes /healthz, /readyz and Prometheus /metrics here

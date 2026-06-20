@@ -24,6 +24,13 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+// JobRecorder counts finished jobs by overall verdict for observability
+// (§F.6 vismod_jobs_total{verdict}). Optional — a nil Metrics is a no-op, so
+// the one-shot scan path needs no metrics server. observe.Metrics satisfies it.
+type JobRecorder interface {
+	RecordJob(verdict moderation.Verdict)
+}
+
 // Pipeline holds the wired dependencies for processing jobs. One active
 // Moderator per process; its shared rate limiter (M1) gates all fan-out.
 type Pipeline struct {
@@ -33,6 +40,7 @@ type Pipeline struct {
 	Sink      result.Sink
 	Cfg       config.Config
 	Log       *slog.Logger
+	Metrics   JobRecorder // optional; nil = no metrics
 }
 
 // Process handles one job: it builds and writes the ResultEnvelope to the Sink.
@@ -54,6 +62,10 @@ func (p *Pipeline) Process(ctx context.Context, jobID result.JobID, src moderati
 	// Apply thresholds and roll up the asset verdict.
 	p.applyThresholds(&res)
 	res.Overall = p.rollup(res.Frames)
+
+	if p.Metrics != nil {
+		p.Metrics.RecordJob(res.Overall.Verdict)
+	}
 
 	env := result.ResultEnvelope{
 		JobID:  jobID,

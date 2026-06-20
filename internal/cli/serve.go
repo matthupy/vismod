@@ -51,7 +51,11 @@ func runServe(cmd *cobra.Command, _ []string) error {
 	resultSink := result.NewJSONLSink(os.Stdout)
 	dlqSink := result.NewJSONLSink(os.Stderr)
 
-	p, mod, err := buildPipeline(cfg, resultSink, log)
+	// Metrics (§F.6): one registry, instruments the adapter + pipeline and backs
+	// /metrics. Depth gauges are registered below once the queue exists.
+	metrics := observe.NewMetrics()
+
+	p, mod, err := buildPipeline(cfg, resultSink, log, metrics)
 	if err != nil {
 		return err
 	}
@@ -71,10 +75,21 @@ func runServe(cmd *cobra.Command, _ []string) error {
 		return err
 	}
 
-	// DURABILITY WARNING: memory driver is non-durable; a crash loses jobs.
-	log.Warn("queue driver=memory is non-durable, single-process (dev/CLI only); use driver=redis for production intake")
+	// Scrape-time depth gauges read live queue state (uniform QueueDepth across
+	// drivers; memq exposes its DLQ depth).
+	metrics.RegisterQueueDepth(
+		func() float64 {
+			n, _ := q.QueueDepth(context.Background())
+			return float64(n)
+		},
+		func() float64 { return float64(q.DeadLetterDepth()) },
+	)
 
-	health := observe.NewHealth(cfg.MetricsAddr, log)
+	// DURABILITY WARNING: memory driver is non-durable; a crash loses jobs.
+	const memqWarning = "queue driver=memory is non-durable, single-process (dev/CLI only); use driver=redis for production intake"
+	log.Warn(memqWarning)
+
+	health := observe.NewHealth(cfg.MetricsAddr, log, metrics.Registry())
 	health.Start()
 
 	workerCtx, cancelWorkers := context.WithCancel(context.Background())
@@ -82,7 +97,13 @@ func runServe(cmd *cobra.Command, _ []string) error {
 	if err := q.Start(workerCtx, jobHandler(p)); err != nil {
 		return err
 	}
-	health.SetReady(true)
+	// Readiness carries boot-validation detail (§F.2): ffmpeg/ffprobe probed
+	// above, plus the memq non-durability warning (§D.3).
+	health.SetReadyDetail(observe.ReadyDetail{
+		Ready:    true,
+		Checks:   map[string]string{"ffmpeg": "ok", "adapter": cfg.Adapter.Name},
+		Warnings: []string{memqWarning},
+	})
 	log.Info("serve ready", "workers", cfg.Queue.Workers, "health_addr", cfg.MetricsAddr)
 
 	// Ingress: enqueue file paths from stdin (if any).

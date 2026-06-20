@@ -57,7 +57,10 @@ func probeFrameSource(cfg config.Config) error {
 
 // buildPipeline wires a Pipeline from config with the given sink. The
 // FrameSource is videosift-backed (M2); the HashMatcher is the no-op default.
-func buildPipeline(cfg config.Config, sink result.Sink, log *slog.Logger) (*pipeline.Pipeline, moderation.Moderator, error) {
+// When metrics is non-nil (serve), the Moderator is wrapped to record adapter
+// latency/errors and the pipeline records jobs_total{verdict}. The returned
+// moderation.Moderator is the UNWRAPPED adapter — callers Close() that one.
+func buildPipeline(cfg config.Config, sink result.Sink, log *slog.Logger, metrics *observe.Metrics) (*pipeline.Pipeline, moderation.Moderator, error) {
 	mod, err := buildModerator(cfg)
 	if err != nil {
 		return nil, nil, err
@@ -69,6 +72,10 @@ func buildPipeline(cfg config.Config, sink result.Sink, log *slog.Logger) (*pipe
 		Sink:      sink,
 		Cfg:       cfg,
 		Log:       log,
+	}
+	if metrics != nil {
+		p.Moderator = metrics.Instrument(mod)
+		p.Metrics = metrics
 	}
 	return p, mod, nil
 }

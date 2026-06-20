@@ -62,6 +62,39 @@ jobs:
         working-directory: vismod
         run: go test -race -covermode=atomic -coverprofile=coverage.out ./...
 
+  docker-build:
+    name: Docker build
+    runs-on: ubuntu-latest
+    steps:
+      # The image is built with the PARENT dir as context so the
+      # `replace => ../videosift` target resolves (same sibling layout as build-test).
+      - name: Check out vismod
+        uses: actions/checkout@v7
+        with:
+          path: vismod
+
+      - name: Check out videosift (replace target)
+        uses: actions/checkout@v7
+        with:
+          repository: matthupy/videosift
+          path: videosift
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Build only (no push): proves the multi-stage Dockerfile compiles the
+      # binary and assembles the ffmpeg-bearing runtime. Context = workspace root
+      # (holds vismod/ and videosift/ as siblings).
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: vismod/Dockerfile
+          push: false
+          tags: vismod:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
   lint:
     name: Lint
     runs-on: ubuntu-latest

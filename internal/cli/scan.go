@@ -31,7 +31,8 @@ func newScanCmd() *cobra.Command {
 			}
 
 			sink := result.NewJSONLSink(cmd.OutOrStdout())
-			p, mod, err := buildPipeline(cfg, sink, log)
+			// One-shot scan: no metrics server scrapes a CLI run, so no metrics.
+			p, mod, err := buildPipeline(cfg, sink, log, nil)
 			if err != nil {
 				return err
 			}

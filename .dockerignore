@@ -1,0 +1,33 @@
+# NOTE: the image is built with the PARENT directory as context (see Dockerfile
+# header) so the `../videosift` replace target resolves. Docker uses the
+# .dockerignore at the context root, i.e. parent/.dockerignore — keep a copy
+# there. This file applies when the context happens to be the vismod dir.
+
+# Binaries / build output
+vismod
+vismod.exe
+/dist/
+/out/
+
+# Local artifacts & secrets
+*.out
+*.err
+*.tmp
+audit.log
+.env
+*.local.yaml
+
+# Test/sample media — NEVER ship media into an image layer
+/testmedia/
+sample.*
+
+# VCS / tooling / agent state
+.git/
+.github/
+.golangci.yml
+.idea/
+.vscode/
+.claude/
+.handoff/
+docs/
+*.md
