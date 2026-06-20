@@ -3,8 +3,21 @@ package audit
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 )
+
+// canonical() is only JCS-safe while every Payload field is a string (numbers
+// would need ECMAScript normalization it does not do). Fail loudly if a future
+// field breaks that invariant — see the Payload doc comment.
+func TestPayloadFieldsAllString(t *testing.T) {
+	pt := reflect.TypeOf(Payload{})
+	for i := 0; i < pt.NumField(); i++ {
+		if f := pt.Field(i); f.Type.Kind() != reflect.String {
+			t.Errorf("Payload.%s is %s, must be string (canonical() is not JCS number-safe; widen it first)", f.Name, f.Type.Kind())
+		}
+	}
+}
 
 func payload(id string) Payload {
 	return Payload{JobID: id, Verdict: "block", RawSHA256: RawSHA256([]byte(id)), Adapter: "stub"}

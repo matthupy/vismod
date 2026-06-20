@@ -34,6 +34,12 @@ type Item struct {
 
 // Diverter routes a potential-CSAM frame to human review. Implementations MUST
 // NOT persist or transmit media bytes; they receive only the Item metadata.
+//
+// Delivery is AT-LEAST-ONCE: the pipeline diverts before Sink.Write, and a
+// retried job re-runs the divert (redelivery may hit a different worker, so the
+// pipeline cannot dedup). A production Diverter MUST treat (Item.JobID,
+// Item.FrameSHA256) as the idempotency key and collapse repeats — otherwise a
+// transient retry enqueues the same potential-CSAM frame twice for reviewers.
 type Diverter interface {
 	Divert(ctx context.Context, it Item) error
 }
@@ -53,12 +59,18 @@ func (d *LogDiverter) Divert(_ context.Context, it Item) error {
 	if d == nil || d.log == nil {
 		return nil
 	}
-	d.log.Warn("potential-CSAM frame diverted to human review",
+	fields := []any{
 		"event", "potential_csam_divert",
 		"job_id", it.JobID,
 		"frame_sha256", it.FrameSHA256,
 		"category", it.Category,
 		"reason", it.Reason,
-	)
+	}
+	// Score is an optional pointer; log the value (not the address) only when set
+	// so the WARN matches the doc claim "records the frame hash and score".
+	if it.Score != nil {
+		fields = append(fields, "score", *it.Score)
+	}
+	d.log.Warn("potential-CSAM frame diverted to human review", fields...)
 	return nil
 }

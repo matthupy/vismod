@@ -199,9 +199,11 @@ Branch `feat/m1-azure-adapter` (PR, not merged to main directly).
 Branch `feat/m4-responsible-use` off `main` (post #6 merge).
 
 ### Audit log (§G.5)
-- Canonicalization upgraded to **RFC 8785 JCS** (`internal/audit`: `jcs`/`writeCanonical`)
+- Canonicalization upgraded to a **JCS-shaped** form (`internal/audit`: `jcs`/`writeCanonical`)
   — object keys sorted lexicographically, compact, `json.Number`-preserving — so
   `audit verify` recomputes byte-identical hashes regardless of Go struct order.
+  (Self-consistent, NOT byte-for-byte RFC 8785: Go `\u`-escapes `<>&`/U+2028-2029,
+  so cross-implementation interop is not claimed — same canonicalizer both sides.)
   Length-prefixed `SHA-256(seq‖ts‖prev‖canonical(payload))`, idempotent per job_id
   (all pre-existing). Added `audit.ReadRecords` for inspection.
 - **Pipeline wired**: `Pipeline.Audit *audit.Log`; appends after a successful
@@ -233,6 +235,25 @@ Branch `feat/m4-responsible-use` off `main` (post #6 merge).
   trigger + below-threshold no-divert, LogDiverter logs hash-not-bytes.
 - `go build`/`go vet`/`gofmt -l`/`go test ./...` all green. `-race` deferred to CI
   (no local gcc). E2E smoke: `scan` appends an audit record, `audit verify` intact.
+
+### PR #7 review fixes (iter-1)
+- **Divert delivery contract** (`pipeline.go`, `review.go`): documented as
+  **at-least-once** — divert fires inside `analyze`, which re-runs on `Process`
+  retry (redelivery may hit another worker, so the pipeline can't dedup). The
+  downstream `Diverter` MUST dedup on `(JobID, FrameSHA256)`; `LogDiverter` is
+  dedup-exempt. Reconciles the "idempotent per JobID" claim that covered Sink+Audit.
+- **Divert-failure observability** (`observe.Metrics`, `pipeline.go`): new
+  `vismod_divert_failures_total` counter, bumped via optional `DivertFailureRecorder`
+  type-assert when `Diverter.Divert` errors. Job stays **fail-safe** (never blocked);
+  the dropped frame is now alertable instead of WARN-only.
+- **JCS honesty** (`audit.go`, `SECURITY.md`, above): doc claims lowered from
+  "RFC 8785 JCS / byte-identical across implementations" to "self-consistent
+  canonical form".
+- **Payload all-string invariant** (`audit.go`): guard comment + `TestPayloadFieldsAllString`
+  (reflection) fails if a non-string field is added — `canonical()` is not JCS
+  number-normalized.
+- **LogDiverter score** (`review.go`): WARN now emits `score` (nil-safe) to match
+  its doc claim.
 
 ### Deferred (unchanged)
 - Real PDQ/TMK CSAM matcher = **v1.1**. asynq/Redis + scale + `-race` in CI = **M5**.

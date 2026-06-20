@@ -48,8 +48,12 @@ log. Each record is
 `{seq, timestamp, prev_hash, payload, entry_hash}` where
 `entry_hash = SHA-256(seq ‖ timestamp ‖ prev_hash ‖ canonical(payload))`,
 the genesis `prev_hash` is all-zeros, fields are **length-prefixed**, and
-`canonical(payload)` is **RFC 8785 JCS** (sorted-key, compact, UTF-8) so
-`vismod audit verify` recomputes byte-identical hashes across processes.
+`canonical(payload)` is a **JCS-shaped** canonical form (sorted-key, compact,
+UTF-8) so `vismod audit verify` recomputes byte-identical hashes across
+processes and runs. **Scope:** the same canonicalizer hashes and verifies, which
+is all the chain needs; it is **not** byte-for-byte RFC 8785 (Go `json.Marshal`
+`\u`-escapes `<` `>` `&` and U+2028/2029), so the hashes are **not** a
+cross-implementation interop contract — only self-consistent.
 Appends are **idempotent per `job_id`** (no duplicate `seq`, no gap). The
 payload binds a decision to its inputs **by hash** — `SHA-256(Raw)` +
 `ModelIdentity` + verdict — and **never stores `Raw` itself**.

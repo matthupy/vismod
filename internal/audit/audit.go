@@ -26,6 +26,13 @@ import (
 
 // Payload is the verdict-affecting content bound into the chain. It never
 // contains media bytes or Raw free-text.
+//
+// INVARIANT: every field MUST stay string-typed. canonical() emits numbers
+// verbatim via json.Number.String() and skips JCS's ECMAScript number
+// normalization (an all-string payload never hits that path). Add a float/int
+// field and two writers that format it differently (1e3 vs 1000, -0 vs 0) would
+// hash to different chains while "meaning" the same — a silent integrity split.
+// TestPayloadFieldsAllString enforces this; widen canonical() before relaxing it.
 type Payload struct {
 	JobID        string `json:"job_id"`
 	Verdict      string `json:"verdict"`
@@ -164,12 +171,19 @@ func writeField(h interface{ Write([]byte) (int, error) }, b []byte) {
 	_, _ = h.Write(b)
 }
 
-// canonical serializes the payload as RFC 8785 JCS (JSON Canonicalization
-// Scheme): object members sorted lexicographically by key, compact (no
-// insignificant whitespace), UTF-8. This makes `audit verify` recompute
-// byte-identical hashes across processes and implementations, independent of
-// Go struct declaration order. The payload is all-string, so JCS number
-// formatting edge cases do not arise.
+// canonical serializes the payload in a self-consistent canonical form: object
+// members sorted lexicographically by key, compact (no insignificant
+// whitespace), UTF-8. This makes `audit verify` recompute byte-identical hashes
+// across processes and runs, independent of Go struct declaration order — which
+// is all the chain needs, since the SAME canonicalizer hashes and verifies.
+//
+// SCOPE HONESTY: this is JCS-SHAPED, not byte-for-byte RFC 8785. Go's
+// json.Marshal \u-escapes '<' '>' '&' and U+2028/2029 in string values; strict
+// JCS does not. JobID is caller-supplied and may contain those, so a different
+// JCS implementation could emit a different byte string for the same payload.
+// That does not affect chain integrity (one verifier, both sides); it only means
+// the hashes are NOT a cross-implementation interop contract. The payload is
+// all-string (see Payload), so JCS number-formatting rules never apply here.
 func canonical(p Payload) []byte {
 	b, _ := json.Marshal(p)
 	out, err := jcs(b)

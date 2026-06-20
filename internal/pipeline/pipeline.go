@@ -35,6 +35,15 @@ type JobRecorder interface {
 	RecordJob(verdict moderation.Verdict)
 }
 
+// DivertFailureRecorder counts potential-CSAM diverts that failed to reach the
+// review channel (§G.8 vismod_divert_failures_total). It is an OPTIONAL
+// capability discovered by type-asserting the wired Metrics — a recorder that
+// does not implement it (or a nil Metrics) makes the bump a no-op, so the divert
+// stays fail-safe. observe.Metrics satisfies it.
+type DivertFailureRecorder interface {
+	RecordDivertFailure()
+}
+
 // Pipeline holds the wired dependencies for processing jobs. One active
 // Moderator per process; its shared rate limiter (M1) gates all fan-out.
 type Pipeline struct {
@@ -243,6 +252,15 @@ func (p *Pipeline) moderateFrame(ctx context.Context, img moderation.Image, ts *
 	// §G.8: a high-severity SEXUAL hit is NOT a CSAM determination but MUST be
 	// handled as potential-CSAM. Divert to human review BEFORE Sink.Write,
 	// carrying only SHA-256(frame) — never the frame bytes or Raw (§G.2).
+	//
+	// DELIVERY CONTRACT — AT-LEAST-ONCE (unlike Sink.Write + Audit.Append, which
+	// are idempotent per JobID). Divert fires here inside analyze, which re-runs
+	// in full whenever Process is retried (a transient sink/audit failure
+	// dead-letters and redelivers the whole job). The pipeline cannot dedup across
+	// that retry: redelivery may land on a different worker, so any in-process
+	// seen-set is lost. The (JobID, FrameSHA256) pair on review.Item is the stable
+	// dedup key — the downstream Diverter (durable review queue) MUST collapse
+	// repeats on it. v1 LogDiverter is dedup-exempt (a repeated WARN is harmless).
 	p.divertPotentialCSAM(ctx, meta, img, ts, cats)
 	return moderation.FrameResult{TimestampSec: ts, Status: moderation.FrameStatusOK, Categories: cats}
 }
@@ -281,7 +299,14 @@ func (p *Pipeline) divertPotentialCSAM(ctx context.Context, meta jobMeta, img mo
 			Reason:       "SEXUAL score >= thresholds.SEXUAL.potential_csam",
 		}
 		if err := p.Diverter.Divert(ctx, it); err != nil {
+			// FAIL-SAFE: a dropped divert must NOT block the job (the §G.8 seam is
+			// best-effort by contract). But a silently-lost potential-CSAM frame is
+			// the one thing §G.8 must not hide, so make the drop observable via a
+			// counter an operator can alert on — log alone is not alertable.
 			p.Log.Warn("potential-CSAM divert failed", "job_id", meta.ID, "err", err)
+			if r, ok := p.Metrics.(DivertFailureRecorder); ok {
+				r.RecordDivertFailure()
+			}
 		}
 		return // one divert per frame
 	}
