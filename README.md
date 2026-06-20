@@ -52,6 +52,13 @@ docker run --rm -p 9090:9090 vismod:dev
 docker run --rm -v "$PWD/data:/data" vismod:dev scan /data/clip.mp4
 ```
 
+> **Config in-container:** the image bakes no config file. Override via the
+> `VISMOD_` env overlay, or mount a file and point at it with `VISMOD_CONFIG`
+> (e.g. `-v "$PWD/config.yaml:/etc/vismod.yaml" -e VISMOD_CONFIG=/etc/vismod.yaml`).
+> The `HEALTHCHECK` runs `vismod healthcheck` with no `--config` flag, so a config
+> that moves `metrics.addr` must be reachable via `VISMOD_CONFIG` (or `VISMOD_METRICS_ADDR`)
+> for the probe to target the right port.
+
 ## Observability (M3)
 
 `serve` exposes one HTTP server on `metrics.addr` (default `:9090`):
@@ -59,7 +66,7 @@ docker run --rm -v "$PWD/data:/data" vismod:dev scan /data/clip.mp4
 | Endpoint | Purpose |
 |---|---|
 | `/healthz` | Liveness — always 200 while the process is up. |
-| `/readyz`  | Readiness — JSON `{ready, checks, warnings}`; 503 until boot validation passes. Carries the memq non-durability warning. |
+| `/readyz`  | Readiness — JSON `{ready, adapter_name, checks, warnings}`; 503 until boot validation passes. `checks` are health verdicts only (e.g. `"adapter":"ok"`); the active adapter's identity is the separate `adapter_name`. Carries the memq non-durability warning. |
 | `/metrics` | Prometheus text exposition. |
 
 Metrics: `vismod_jobs_total{verdict}`, `vismod_adapter_request_seconds{adapter}`,

@@ -40,11 +40,14 @@ func TestReadyzReflectsReadiness(t *testing.T) {
 		t.Errorf("SetReady(true) readyz = %d, want 200", rec.Code)
 	}
 
-	// With boot-validation detail + a durability warning.
+	// With boot-validation detail + a durability warning. Adapter identity rides
+	// in AdapterName; Checks holds health verdicts ONLY (adapter:"ok"), never the
+	// adapter name.
 	h.SetReadyDetail(ReadyDetail{
-		Ready:    true,
-		Checks:   map[string]string{"ffmpeg": "ok"},
-		Warnings: []string{"queue driver=memory is non-durable"},
+		Ready:       true,
+		AdapterName: "azure",
+		Checks:      map[string]string{"ffmpeg": "ok", "adapter": "ok"},
+		Warnings:    []string{"queue driver=memory is non-durable"},
 	})
 	rec := get(t, h, "/readyz")
 	if rec.Code != http.StatusOK {
@@ -56,6 +59,13 @@ func TestReadyzReflectsReadiness(t *testing.T) {
 	}
 	if !d.Ready || d.Checks["ffmpeg"] != "ok" || len(d.Warnings) != 1 {
 		t.Errorf("readyz detail = %+v, want ready+ffmpeg ok+1 warning", d)
+	}
+	// Identity is separate from health: name in AdapterName, status in Checks.
+	if d.AdapterName != "azure" {
+		t.Errorf("adapter_name = %q, want azure", d.AdapterName)
+	}
+	if d.Checks["adapter"] != "ok" {
+		t.Errorf("checks[adapter] = %q, want health verdict ok (not the name)", d.Checks["adapter"])
 	}
 }
 

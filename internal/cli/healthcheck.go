@@ -12,8 +12,11 @@ import (
 
 // newHealthcheckCmd is a self-contained liveness probe for the container
 // HEALTHCHECK (§I). It GETs /healthz on metrics.addr and exits non-zero on
-// failure, so the slim runtime image needs no curl/wget. Honors the same config
-// as serve, so a custom metrics.addr is respected.
+// failure, so the slim runtime image needs no curl/wget. It loads the same
+// config as serve, so a custom metrics.addr is respected: the HEALTHCHECK has no
+// --config flag, but config.Load falls back to the VISMOD_CONFIG env var, so an
+// operator who points serve at a mounted config file via VISMOD_CONFIG gets a
+// matching probe target for free.
 func newHealthcheckCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:    "healthcheck",

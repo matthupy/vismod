@@ -100,9 +100,10 @@ func runServe(cmd *cobra.Command, _ []string) error {
 	// Readiness carries boot-validation detail (§F.2): ffmpeg/ffprobe probed
 	// above, plus the memq non-durability warning (§D.3).
 	health.SetReadyDetail(observe.ReadyDetail{
-		Ready:    true,
-		Checks:   map[string]string{"ffmpeg": "ok", "adapter": cfg.Adapter.Name},
-		Warnings: []string{memqWarning},
+		Ready:       true,
+		AdapterName: cfg.Adapter.Name,
+		Checks:      map[string]string{"ffmpeg": "ok", "adapter": "ok"},
+		Warnings:    []string{memqWarning},
 	})
 	log.Info("serve ready", "workers", cfg.Queue.Workers, "health_addr", cfg.MetricsAddr)
 

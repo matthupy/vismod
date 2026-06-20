@@ -38,9 +38,13 @@ func NewMetrics() *Metrics {
 			Help: "Total moderation jobs finished, partitioned by overall verdict.",
 		}, []string{"verdict"}),
 		adapterSeconds: prometheus.NewHistogramVec(prometheus.HistogramOpts{
-			Name:    "vismod_adapter_request_seconds",
-			Help:    "Latency of a single adapter AnalyzeImage call.",
-			Buckets: prometheus.DefBuckets,
+			Name: "vismod_adapter_request_seconds",
+			Help: "Latency of a single adapter AnalyzeImage call.",
+			// DefBuckets cap at 10s; a remote moderation provider (Azure) under
+			// load/retry routinely exceeds that, collapsing the p95/p99 tail into
+			// +Inf exactly when it matters. Extend to 60s so slow-call latency
+			// stays observable.
+			Buckets: []float64{.05, .1, .25, .5, 1, 2.5, 5, 10, 20, 30, 60},
 		}, []string{"adapter"}),
 		adapterErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "vismod_adapter_errors_total",

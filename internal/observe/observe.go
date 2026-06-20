@@ -36,12 +36,15 @@ func NewLogger(level string) *slog.Logger {
 }
 
 // ReadyDetail is the JSON body of /readyz. Checks carries boot-validation
-// results (e.g. "ffmpeg":"ok"); Warnings carries non-fatal operator notes (e.g.
-// the memq non-durability boundary — §D.3).
+// results as health verdicts ONLY (each value is a status like "ok"), so an
+// operator can treat any non-"ok" as a failed check. Identity (which adapter is
+// active) is a separate field — AdapterName — never mixed into Checks. Warnings
+// carries non-fatal operator notes (e.g. the memq non-durability boundary — §D.3).
 type ReadyDetail struct {
-	Ready    bool              `json:"ready"`
-	Checks   map[string]string `json:"checks,omitempty"`
-	Warnings []string          `json:"warnings,omitempty"`
+	Ready       bool              `json:"ready"`
+	AdapterName string            `json:"adapter_name,omitempty"`
+	Checks      map[string]string `json:"checks,omitempty"`
+	Warnings    []string          `json:"warnings,omitempty"`
 }
 
 // Health serves /healthz (liveness), /readyz (readiness incl. boot-validation
