@@ -27,6 +27,21 @@ vismod_jobs_total{verdict="block"} 2
 	}
 }
 
+func TestRecordDivertFailureCounts(t *testing.T) {
+	m := NewMetrics()
+	m.RecordDivertFailure()
+	m.RecordDivertFailure()
+
+	want := `
+# HELP vismod_divert_failures_total Total potential-CSAM diverts that failed to reach the review channel (frame may never reach a human).
+# TYPE vismod_divert_failures_total counter
+vismod_divert_failures_total 2
+`
+	if err := testutil.GatherAndCompare(m.Registry(), strings.NewReader(want), "vismod_divert_failures_total"); err != nil {
+		t.Errorf("divert_failures_total mismatch: %v", err)
+	}
+}
+
 func TestRegisterQueueDepthExposesGaugesAtScrapeTime(t *testing.T) {
 	m := NewMetrics()
 	qd, dlq := 7.0, 3.0

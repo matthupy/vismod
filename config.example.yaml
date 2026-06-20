@@ -66,3 +66,11 @@ log:
 
 metrics:
   addr: ":9090"         # serve exposes /healthz, /readyz and Prometheus /metrics here
+
+audit:
+  # Tamper-evident decision log (§G.5): append-only, hash-chained, idempotent per
+  # job_id. Stores SHA-256(Raw) + ModelIdentity + verdict — NEVER media or Raw text.
+  # Empty disables the trail (OK for one-shot CLI scans). A production `serve`
+  # SHOULD set an absolute path on durable storage. Verify with:
+  #   vismod audit verify <path>
+  path: ""              # e.g. /var/lib/vismod/audit.log

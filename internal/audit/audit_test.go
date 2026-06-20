@@ -3,8 +3,21 @@ package audit
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 )
+
+// canonical() is only JCS-safe while every Payload field is a string (numbers
+// would need ECMAScript normalization it does not do). Fail loudly if a future
+// field breaks that invariant — see the Payload doc comment.
+func TestPayloadFieldsAllString(t *testing.T) {
+	pt := reflect.TypeOf(Payload{})
+	for i := 0; i < pt.NumField(); i++ {
+		if f := pt.Field(i); f.Type.Kind() != reflect.String {
+			t.Errorf("Payload.%s is %s, must be string (canonical() is not JCS number-safe; widen it first)", f.Name, f.Type.Kind())
+		}
+	}
+}
 
 func payload(id string) Payload {
 	return Payload{JobID: id, Verdict: "block", RawSHA256: RawSHA256([]byte(id)), Adapter: "stub"}
@@ -82,4 +95,23 @@ func indexOf(s, sub string) int {
 		}
 	}
 	return -1
+}
+
+func TestCanonicalSortsKeysLexicographically(t *testing.T) {
+	// Payload struct declares fields as job_id, verdict, raw_sha256, adapter,
+	// model_version, config_hash. RFC 8785 JCS requires object members sorted
+	// by key, so the canonical form must NOT follow struct declaration order.
+	p := Payload{
+		JobID:        "j1",
+		Verdict:      "block",
+		RawSHA256:    "abc",
+		Adapter:      "stub",
+		ModelVersion: "1.0",
+		ConfigHash:   "deadbeef",
+	}
+	got := string(canonical(p))
+	want := `{"adapter":"stub","config_hash":"deadbeef","job_id":"j1","model_version":"1.0","raw_sha256":"abc","verdict":"block"}`
+	if got != want {
+		t.Fatalf("canonical not JCS sorted:\n got=%s\nwant=%s", got, want)
+	}
 }

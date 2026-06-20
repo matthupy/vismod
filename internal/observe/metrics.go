@@ -20,12 +20,14 @@ import (
 //   - vismod_queue_depth                      gauge (scrape-time, via GaugeFunc)
 //   - vismod_deadletter_depth                 gauge (scrape-time, via GaugeFunc)
 //   - vismod_queue_depth_scrape_errors_total  counter (live-depth read failed)
+//   - vismod_divert_failures_total            counter (potential-CSAM divert dropped)
 type Metrics struct {
 	reg              *prometheus.Registry
 	jobsTotal        *prometheus.CounterVec
 	adapterSeconds   *prometheus.HistogramVec
 	adapterErrors    *prometheus.CounterVec
 	queueDepthErrors prometheus.Counter
+	divertFailures   prometheus.Counter
 }
 
 // NewMetrics builds the collectors and registers the job/adapter series. Queue
@@ -56,8 +58,12 @@ func NewMetrics() *Metrics {
 			Name: "vismod_queue_depth_scrape_errors_total",
 			Help: "Times a scrape-time queue-depth read failed (depth reported as 0 for that scrape).",
 		}),
+		divertFailures: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "vismod_divert_failures_total",
+			Help: "Total potential-CSAM diverts that failed to reach the review channel (frame may never reach a human).",
+		}),
 	}
-	reg.MustRegister(m.jobsTotal, m.adapterSeconds, m.adapterErrors, m.queueDepthErrors)
+	reg.MustRegister(m.jobsTotal, m.adapterSeconds, m.adapterErrors, m.queueDepthErrors, m.divertFailures)
 	return m
 }
 
@@ -68,6 +74,14 @@ func (m *Metrics) Registry() *prometheus.Registry { return m.reg }
 // pipeline after the asset rollup.
 func (m *Metrics) RecordJob(verdict moderation.Verdict) {
 	m.jobsTotal.WithLabelValues(string(verdict)).Inc()
+}
+
+// RecordDivertFailure counts one potential-CSAM divert that failed to reach its
+// review channel (§G.8). The pipeline stays fail-safe — a dropped divert never
+// blocks the job — so this counter is the ONLY signal that a frame which should
+// have reached a human did not. Alert on rate(vismod_divert_failures_total) > 0.
+func (m *Metrics) RecordDivertFailure() {
+	m.divertFailures.Inc()
 }
 
 // RegisterQueueDepth registers scrape-time gauges fed by the live queue. Queue

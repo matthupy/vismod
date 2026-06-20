@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"os"
 
+	"github.com/matthupy/vismod/internal/audit"
 	"github.com/matthupy/vismod/internal/config"
 	"github.com/matthupy/vismod/internal/frames"
 	"github.com/matthupy/vismod/internal/hashmatch"
@@ -12,6 +13,7 @@ import (
 	"github.com/matthupy/vismod/internal/observe"
 	"github.com/matthupy/vismod/internal/pipeline"
 	"github.com/matthupy/vismod/internal/result"
+	"github.com/matthupy/vismod/internal/review"
 	"github.com/matthupy/vismod/pkg/moderation"
 )
 
@@ -72,6 +74,17 @@ func buildPipeline(cfg config.Config, sink result.Sink, log *slog.Logger, metric
 		Sink:      sink,
 		Cfg:       cfg,
 		Log:       log,
+		// §G.8: default to the log-only Diverter so a potential-CSAM frame is
+		// always surfaced. Production supplies an encrypted review channel.
+		Diverter: review.NewLogDiverter(log),
+	}
+	if cfg.AuditPath != "" {
+		al, aerr := audit.Open(cfg.AuditPath)
+		if aerr != nil {
+			_ = mod.Close()
+			return nil, nil, aerr
+		}
+		p.Audit = al
 	}
 	if metrics != nil {
 		p.Moderator = metrics.Instrument(mod)

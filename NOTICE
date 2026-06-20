@@ -1,0 +1,33 @@
+vismod — open-source visual content moderation pipeline
+Copyright 2026 vismod contributors
+
+This product includes software developed as a public good for trust & safety,
+positioned as the Classification stage in the Hash Matching → Classification →
+Review → Investigation taxonomy (cf. ROOST — Robust Open Online Safety Tools).
+
+Licensed under the Apache License, Version 2.0. See the LICENSE file.
+
+--------------------------------------------------------------------------------
+Third-party components
+--------------------------------------------------------------------------------
+
+This software depends on, but does not bundle, the following components. Each
+is governed by its own license; this NOTICE does not relicense them.
+
+- github.com/matthupy/videosift (MIT) — video frame extraction. Execs the
+  external ffmpeg and ffprobe binaries at runtime.
+- github.com/spf13/cobra, github.com/spf13/viper (Apache-2.0) — CLI + config.
+- github.com/prometheus/client_golang (Apache-2.0) — metrics.
+- golang.org/x/sync (BSD-3-Clause) — errgroup.
+- github.com/hibiken/asynq (MIT) — Redis-backed queue (M5; not yet wired).
+
+The Azure AI Content Safety adapter calls Microsoft's hosted REST API and is
+subject to Microsoft's terms. Per Microsoft policy, Azure AI Content Safety
+MUST NOT be used to detect child sexual abuse material (CSAM); CSAM is handled
+by the hash-match seam (not the classifier) — see RESPONSIBLE_USE.md.
+
+ffmpeg and ffprobe are NOT distributed with this source. The Docker runtime
+stage installs them from the base image's package repository under their own
+licenses (LGPL/GPL depending on build).
+
+PhotoDNA is licensed-access only and is NEVER bundled or redistributed here.

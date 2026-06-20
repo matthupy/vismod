@@ -12,6 +12,7 @@ package audit
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -19,11 +20,19 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"sync"
 )
 
 // Payload is the verdict-affecting content bound into the chain. It never
 // contains media bytes or Raw free-text.
+//
+// INVARIANT: every field MUST stay string-typed. canonical() emits numbers
+// verbatim via json.Number.String() and skips JCS's ECMAScript number
+// normalization (an all-string payload never hits that path). Add a float/int
+// field and two writers that format it differently (1e3 vs 1000, -0 vs 0) would
+// hash to different chains while "meaning" the same — a silent integrity split.
+// TestPayloadFieldsAllString enforces this; widen canonical() before relaxing it.
 type Payload struct {
 	JobID        string `json:"job_id"`
 	Verdict      string `json:"verdict"`
@@ -36,7 +45,7 @@ type Payload struct {
 // Record is one chain entry as persisted (one JSON object per line).
 type Record struct {
 	Seq       uint64  `json:"seq"`
-	Timestamp string  `json:"timestamp"` // RFC3339 UTC nanoseconds
+	Timestamp string  `json:"timestamp"` // RFC3339 UTC, second precision (pipeline uses time.RFC3339); ordering is by seq, not this field
 	PrevHash  string  `json:"prev_hash"` // hex
 	Payload   Payload `json:"payload"`
 	EntryHash string  `json:"entry_hash"` // hex
@@ -46,6 +55,12 @@ var zeroHash [32]byte
 
 // Log is a file-backed append-only hash chain. Appends are idempotent per
 // JobID (a JobID already in the chain is skipped — no new seq, no gap).
+//
+// SINGLE-WRITER ONLY: idempotency is enforced by the in-memory `seen` map, so it
+// holds only within one process. It does NOT survive a process restart
+// mid-retry, and two Logs over one file (M5 asynq multi-worker) would both
+// O_APPEND and interleave — double-append + a corrupt chain. M5 must serialize
+// writers (single audit-writer goroutine/process) before sharing a chain file.
 type Log struct {
 	mu    sync.Mutex
 	path  string
@@ -162,12 +177,90 @@ func writeField(h interface{ Write([]byte) (int, error) }, b []byte) {
 	_, _ = h.Write(b)
 }
 
-// canonical serializes the payload deterministically. Go's json.Marshal emits
-// struct fields in declaration order, giving a stable encoding for this fixed
-// struct. (M4 upgrades this to RFC 8785 JCS for cross-implementation parity.)
+// canonical serializes the payload in a self-consistent canonical form: object
+// members sorted lexicographically by key, compact (no insignificant
+// whitespace), UTF-8. This makes `audit verify` recompute byte-identical hashes
+// across processes and runs, independent of Go struct declaration order — which
+// is all the chain needs, since the SAME canonicalizer hashes and verifies.
+//
+// SCOPE HONESTY: this is JCS-SHAPED, not byte-for-byte RFC 8785. Go's
+// json.Marshal \u-escapes '<' '>' '&' and U+2028/2029 in string values; strict
+// JCS does not. JobID is caller-supplied and may contain those, so a different
+// JCS implementation could emit a different byte string for the same payload.
+// That does not affect chain integrity (one verifier, both sides); it only means
+// the hashes are NOT a cross-implementation interop contract. The payload is
+// all-string (see Payload), so JCS number-formatting rules never apply here.
 func canonical(p Payload) []byte {
 	b, _ := json.Marshal(p)
-	return b
+	out, err := jcs(b)
+	if err != nil {
+		// UNREACHABLE: b is freshly marshalled from a struct, so it is always
+		// valid JSON. If jcs ever fails here it is a broken invariant, not a
+		// recoverable error — falling back to raw (unsorted) b would silently
+		// produce a different hash and split the chain. Fail loud instead.
+		panic(fmt.Sprintf("audit: canonicalize freshly-marshalled payload: %v", err))
+	}
+	return out
+}
+
+// jcs re-emits arbitrary JSON in RFC 8785 canonical form: object keys sorted,
+// compact, numbers preserved verbatim via json.Number.
+func jcs(b []byte) ([]byte, error) {
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.UseNumber()
+	var v any
+	if err := dec.Decode(&v); err != nil {
+		return nil, err
+	}
+	var buf bytes.Buffer
+	if err := writeCanonical(&buf, v); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func writeCanonical(buf *bytes.Buffer, v any) error {
+	switch t := v.(type) {
+	case map[string]any:
+		keys := make([]string, 0, len(t))
+		for k := range t {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		buf.WriteByte('{')
+		for i, k := range keys {
+			if i > 0 {
+				buf.WriteByte(',')
+			}
+			ks, _ := json.Marshal(k)
+			buf.Write(ks)
+			buf.WriteByte(':')
+			if err := writeCanonical(buf, t[k]); err != nil {
+				return err
+			}
+		}
+		buf.WriteByte('}')
+	case []any:
+		buf.WriteByte('[')
+		for i, e := range t {
+			if i > 0 {
+				buf.WriteByte(',')
+			}
+			if err := writeCanonical(buf, e); err != nil {
+				return err
+			}
+		}
+		buf.WriteByte(']')
+	case json.Number:
+		buf.WriteString(t.String())
+	default: // string, bool, nil
+		enc, err := json.Marshal(t)
+		if err != nil {
+			return err
+		}
+		buf.Write(enc)
+	}
+	return nil
 }
 
 func readAll(path string) ([]Record, error) {
@@ -195,6 +288,11 @@ func readAll(path string) ([]Record, error) {
 	}
 	return out, sc.Err()
 }
+
+// ReadRecords returns every persisted chain record in order (empty if the log
+// does not exist yet). Intended for inspection/testing — Verify is the
+// integrity check.
+func ReadRecords(path string) ([]Record, error) { return readAll(path) }
 
 // RawSHA256 hashes raw provider output for binding into the chain.
 func RawSHA256(raw []byte) string {
