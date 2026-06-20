@@ -96,7 +96,7 @@ func (q *asynqQueue) Enqueue(ctx context.Context, j Job) (result.JobID, error) {
 		j.SubmittedAt = time.Now().UTC()
 	}
 
-	payload, err := json.Marshal(jobPayload{ID: j.ID, Source: j.Source, SubmittedAt: j.SubmittedAt})
+	payload, err := json.Marshal(jobPayload(j))
 	if err != nil {
 		return "", fmt.Errorf("queue: marshal payload: %w", err)
 	}
@@ -170,7 +170,7 @@ func (q *asynqQueue) processor(handler Handler) func(context.Context, *asynq.Tas
 			// Undecodable payload is a poison message: archive, do not retry.
 			return fmt.Errorf("decode payload: %v: %w", err, asynq.SkipRetry)
 		}
-		j := Job{ID: p.ID, Source: p.Source, SubmittedAt: p.SubmittedAt}
+		j := Job(p)
 
 		disp, herr := q.invoke(ctx, handler, j)
 		switch disp {
