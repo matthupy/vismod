@@ -155,7 +155,6 @@ func (p *Pipeline) analyzeVideoByFrames(ctx context.Context, src moderation.Sour
 	g.SetLimit(conc)
 
 	for i, f := range fr {
-		i, f := i, f
 		g.Go(func() error {
 			// Lazy decode INSIDE the task so at most `conc` images are resident.
 			img, derr := loadImage(f.Path)
