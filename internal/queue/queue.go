@@ -63,6 +63,21 @@ type QueueConfig struct {
 	DeadLetter    result.Sink   // where dead-lettered jobs go (exists in the prototype)
 }
 
+// DepthReporter is a Queue that also exposes DLQ depth for metrics. Both the
+// memq and asynq drivers implement it, so serve can wire the depth gauges
+// uniformly regardless of driver.
+type DepthReporter interface {
+	Queue
+	DeadLetterDepth() int
+}
+
+// Pinger is implemented by drivers backed by an external dependency (the redis
+// driver) so serve can validate reachability at boot and on /readyz. The memq
+// driver is in-process and does not implement it.
+type Pinger interface {
+	Ping(ctx context.Context) error
+}
+
 // Queue is the FIFO job queue. Dequeue order == enqueue order. With >1 worker,
 // completion order is NOT guaranteed (jobs finish at different speeds); strict
 // end-to-end ordering needs Workers=1 or per-key serialization.

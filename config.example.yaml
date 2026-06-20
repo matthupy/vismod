@@ -40,15 +40,20 @@ thresholds:
     potential_csam: 0.667   # SEXUAL score at/above which a frame is treated as potential-CSAM (M4 divert)
 
 queue:
-  driver: memory        # "memory" (dev/CLI, non-durable) or "redis" (M5).
+  driver: memory        # "memory" (dev/CLI, non-durable) or "redis" (durable, at-least-once).
   workers: 4            # parallel job workers (bounds parallelism, not throughput)
-  buffer: 64            # in-memory FIFO buffer depth
-  max_retries: 3        # bounded retry before dead-letter
-  retry_backoff: 500ms
+  buffer: 64            # in-memory FIFO buffer depth (memory driver only)
+  max_retries: 3        # bounded retry before dead-letter (both drivers)
+  retry_backoff: 500ms  # linear backoff base between retries (both drivers)
   drain_timeout: 30s    # graceful-drain budget for in-flight jobs on shutdown
   job_timeout: 60s      # per-job processing timeout
-  deadletter_max: 1024  # DLQ depth cap; at capacity new enqueues are rejected
-  redis_addr: localhost:6379   # used only when driver=redis
+  deadletter_max: 1024  # DLQ depth cap; at capacity new enqueues are rejected (memory driver)
+  redis_addr: localhost:6379   # REQUIRED when driver=redis; PING-validated at boot AND on /readyz
+  # redis driver (asynq-backed): durable + at-least-once across restarts and multiple
+  # workers/replicas. At-least-once requires idempotency — the result sink and audit
+  # append dedupe per job_id, so redelivery never double-writes. Job payloads in Redis
+  # carry only opaque IDs/refs (file paths), never media bytes. A Redis outage flips
+  # /readyz to not-ready (backpressure) rather than accepting jobs it cannot hold.
 
 frames:
   workdir: ""           # absolute, caller-owned, ephemeral, writable dir (empty -> system temp under a vismod dir)

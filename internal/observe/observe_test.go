@@ -1,7 +1,9 @@
 package observe
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -95,5 +97,49 @@ func TestNewLoggerLevels(t *testing.T) {
 		if NewLogger(lvl) == nil {
 			t.Fatalf("nil logger for %q", lvl)
 		}
+	}
+}
+
+func TestReadyzLiveProbeFlipsOnDependencyFailure(t *testing.T) {
+	h := NewHealth(":0", NewLogger("error"), nil)
+	// Boot says ready; a live dependency probe is the source of truth for /readyz.
+	h.SetReadyDetail(ReadyDetail{Ready: true, AdapterName: "stub",
+		Checks: map[string]string{"adapter": "ok"}})
+
+	var fail bool
+	h.SetReadinessProbe("redis", func(_ context.Context) error {
+		if fail {
+			return errors.New("dial tcp: connection refused")
+		}
+		return nil
+	})
+
+	// Healthy dependency: 200, and the probe records an "ok" check.
+	rec := get(t, h, "/readyz")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("healthy probe readyz = %d, want 200", rec.Code)
+	}
+	var d ReadyDetail
+	_ = json.Unmarshal(rec.Body.Bytes(), &d)
+	if d.Checks["redis"] != "ok" {
+		t.Errorf("checks[redis] = %q, want ok", d.Checks["redis"])
+	}
+
+	// Dependency down: readiness flips to 503 even though boot detail said ready.
+	fail = true
+	rec = get(t, h, "/readyz")
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("failed-probe readyz = %d, want 503", rec.Code)
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &d)
+	if d.Ready {
+		t.Error("detail.Ready must be false when the probe fails")
+	}
+	if d.Checks["redis"] == "" || d.Checks["redis"] == "ok" {
+		t.Errorf("checks[redis] = %q, want the failure reason", d.Checks["redis"])
+	}
+	// The stored boot checks survive the merge.
+	if d.Checks["adapter"] != "ok" {
+		t.Errorf("checks[adapter] = %q, want ok preserved", d.Checks["adapter"])
 	}
 }
