@@ -191,3 +191,48 @@ Branch `feat/m1-azure-adapter` (PR, not merged to main directly).
 - Fail-safe: `ErrNoFrames` / `*FFmpegError` → `Verdict=error` (never allow on zero frames).
 - Add the `require github.com/matthupy/videosift` line (replace directive already present);
   track @latest, never pin (§B).
+
+---
+
+## M4 — Responsible-use & docs (§G) — DONE
+
+Branch `feat/m4-responsible-use` off `main` (post #6 merge).
+
+### Audit log (§G.5)
+- Canonicalization upgraded to **RFC 8785 JCS** (`internal/audit`: `jcs`/`writeCanonical`)
+  — object keys sorted lexicographically, compact, `json.Number`-preserving — so
+  `audit verify` recomputes byte-identical hashes regardless of Go struct order.
+  Length-prefixed `SHA-256(seq‖ts‖prev‖canonical(payload))`, idempotent per job_id
+  (all pre-existing). Added `audit.ReadRecords` for inspection.
+- **Pipeline wired**: `Pipeline.Audit *audit.Log`; appends after a successful
+  `Sink.Write`, binding verdict + `SHA-256(Raw)` + `ModelIdentity` — never `Raw`.
+  Append failure → infra error → retry (Sink+audit both idempotent). New
+  `audit.path` config key (empty = disabled; OK for one-shot scan). Wired in `wire.go`.
+
+### Potential-CSAM divert (§G.8)
+- New `internal/review`: `Diverter` interface + `Item` (carries `SHA-256(frame)` +
+  metadata, **never bytes/Raw**) + default `LogDiverter` (WARN event).
+- Pipeline trigger in `moderateFrame`: a `SEXUAL` score ≥ `thresholds.SEXUAL.potential_csam`
+  diverts the frame BEFORE `Sink.Write`. `jobMeta` threads job identity into the
+  fan-out. Default `LogDiverter` wired in `wire.go`. Frames path already never
+  persists bytes/Raw, so §G.2 transient-handling holds by construction.
+
+### Docs shipped (§G.9)
+- `LICENSE` (Apache-2.0 full text) + `NOTICE` (third-party + CSAM/PhotoDNA notes).
+- `RESPONSIBLE_USE.md` (not-legal-advice, no-CSAM-in-v1, potential-CSAM policy,
+  NCMEC reporting, "do not test against real CSAM").
+- `SECURITY.md` (SSRF/egress, audit tamper-evidence honest scope + signing/anchoring
+  seam, anti-abuse residual risk, fail-safe posture).
+- `MODEL_AND_HASH_LIMITATIONS.md` (classifier bias/FP, perceptual-hash evadability,
+  cross-provider score non-portability, nil≠0).
+- `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md` (Contributor Covenant 2.1 + T&S clause).
+- `README.md` status→M4 + responsible-use section; `config.example.yaml` audit block.
+
+### Tests / verification
+- TDD: JCS sorted-keys, audit-wiring round-trip + redelivery idempotency, divert
+  trigger + below-threshold no-divert, LogDiverter logs hash-not-bytes.
+- `go build`/`go vet`/`gofmt -l`/`go test ./...` all green. `-race` deferred to CI
+  (no local gcc). E2E smoke: `scan` appends an audit record, `audit verify` intact.
+
+### Deferred (unchanged)
+- Real PDQ/TMK CSAM matcher = **v1.1**. asynq/Redis + scale + `-race` in CI = **M5**.

@@ -8,12 +8,14 @@ A public good for trust & safety. Positioned as the **Classification** stage in 
 Hash Matching → Classification → Review → Investigation taxonomy (cf. ROOST), feeding
 a review console / rules engine downstream.
 
-> **Status: M3 (Docker + observability).** The full pipeline runs end-to-end with
+> **Status: M4 (responsible-use & docs).** The full pipeline runs end-to-end with
 > the credential-free `stub` adapter or Azure (M1); video inputs are framed by the
-> real `videosift` extractor (M2); and the worker ships a Docker image, boot
-> validation, and Prometheus metrics + `/healthz`/`/readyz` (M3). Responsible-use
-> docs + audit wiring (M4) and Redis/scale (M5) follow. Responsible-use, security
-> and licensing docs land in M4 — **do not deploy against real-world content yet.**
+> real `videosift` extractor (M2); the worker ships a Docker image, boot
+> validation, and Prometheus metrics + `/healthz`/`/readyz` (M3); and the
+> tamper-evident audit log, responsible-use/security/licensing docs, and the
+> potential-CSAM divert seam land in M4. Redis/scale is M5. **CSAM detection is NOT
+> implemented (v1.1) — read [RESPONSIBLE_USE.md](RESPONSIBLE_USE.md) before any
+> deployment, and never test against real illegal content.**
 
 ## Quick start
 
@@ -93,6 +95,30 @@ The container `HEALTHCHECK` uses the self-contained `vismod healthcheck` subcomm
 - **CSAM** is handled by a hash-match pre-stage seam (no-op in v1; PDQ/TMK in v1.1),
   never the classifier. The schema ships the `CSAM_HASH_MATCH` category + `match_*`
   fields now.
+
+## Responsible use, safety & licensing (M4)
+
+This tool may encounter illegal content (especially **CSAM**). Read these before
+deploying — they are acceptance criteria, not optional reading:
+
+- [RESPONSIBLE_USE.md](RESPONSIBLE_USE.md) — not-legal-advice disclaimer, reporting
+  guidance (e.g. NCMEC CyberTipline), "do not test against real CSAM", and the
+  **potential-CSAM** policy (a high-severity `SEXUAL` hit is diverted to human
+  review, never auto-actioned, and its frame bytes are never persisted).
+- [SECURITY.md](SECURITY.md) — threat model: SSRF/egress posture, the audit-log
+  tamper-evidence scope (what a hash chain does and does **not** detect), and the
+  score/threshold anti-abuse residual risk.
+- [MODEL_AND_HASH_LIMITATIONS.md](MODEL_AND_HASH_LIMITATIONS.md) — classifier
+  false-positives/bias, perceptual-hash evadability, and cross-provider score
+  non-portability.
+- [LICENSE](LICENSE) (Apache-2.0) + [NOTICE](NOTICE).
+- [CONTRIBUTING.md](CONTRIBUTING.md), [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
+
+**Audit trail.** Set `audit.path` in config to enable the append-only,
+hash-chained decision log (§G.5). Each record binds a decision to its inputs by
+hash — `SHA-256(Raw)` + `ModelIdentity` + verdict, **never the media or `Raw`
+text**. `vismod audit verify <path>` recomputes the chain and reports the first
+broken link.
 
 ## Internal dependency
 

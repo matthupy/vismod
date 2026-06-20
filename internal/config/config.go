@@ -75,4 +75,8 @@ type Config struct {
 	Frames      FramesConfig  `mapstructure:"frames"`
 	LogLevel    string        `mapstructure:"-"`
 	MetricsAddr string        `mapstructure:"-"`
+	// AuditPath is the file path for the tamper-evident decision log (§G.5).
+	// Empty disables the audit trail (acceptable for one-shot CLI scans; a
+	// production `serve` should set it).
+	AuditPath string `mapstructure:"-"`
 }

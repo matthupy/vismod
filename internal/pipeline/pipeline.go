@@ -10,6 +10,8 @@ package pipeline
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"os"
@@ -17,9 +19,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/matthupy/vismod/internal/audit"
 	"github.com/matthupy/vismod/internal/config"
 	"github.com/matthupy/vismod/internal/frames"
 	"github.com/matthupy/vismod/internal/result"
+	"github.com/matthupy/vismod/internal/review"
 	"github.com/matthupy/vismod/pkg/moderation"
 	"golang.org/x/sync/errgroup"
 )
@@ -40,7 +44,9 @@ type Pipeline struct {
 	Sink      result.Sink
 	Cfg       config.Config
 	Log       *slog.Logger
-	Metrics   JobRecorder // optional; nil = no metrics
+	Metrics   JobRecorder     // optional; nil = no metrics
+	Audit     *audit.Log      // optional; nil = no audit trail (CLI scan default)
+	Diverter  review.Diverter // optional; nil = no potential-CSAM divert (§G.8)
 }
 
 // Process handles one job: it builds and writes the ResultEnvelope to the Sink.
@@ -51,7 +57,8 @@ func (p *Pipeline) Process(ctx context.Context, jobID result.JobID, src moderati
 	started := time.Now().UTC()
 
 	mediaType := detectMediaType(src)
-	res, procErr := p.analyze(ctx, mediaType, src)
+	meta := jobMeta{ID: string(jobID), AssetID: assetID(jobID, src)}
+	res, procErr := p.analyze(ctx, mediaType, src, meta)
 
 	// Stamp normalizer-owned provenance fields.
 	res.SchemaVersion = moderation.SchemaVersion
@@ -83,6 +90,25 @@ func (p *Pipeline) Process(ctx context.Context, jobID result.JobID, src moderati
 		return fmt.Errorf("sink write: %w", err)
 	}
 
+	// Tamper-evident audit (§G.5): bind the decision to its inputs BY HASH after
+	// the Sink commits. Idempotent per JobID (asynq redelivery never double-
+	// appends). Stores SHA-256(Raw) + ModelIdentity + verdict — NEVER Raw itself
+	// (§G.2). An audit failure is an infra error: the job is retried (Sink and
+	// audit are both idempotent per JobID, so retry is safe).
+	if p.Audit != nil {
+		pl := audit.Payload{
+			JobID:        string(jobID),
+			Verdict:      string(res.Overall.Verdict),
+			RawSHA256:    audit.RawSHA256(res.Raw),
+			Adapter:      env.ModelID.Adapter,
+			ModelVersion: env.ModelID.ModelVersion,
+			ConfigHash:   env.ModelID.ConfigHash,
+		}
+		if _, _, err := p.Audit.Append(pl, env.FinishedAt); err != nil {
+			return fmt.Errorf("audit append: %w", err)
+		}
+	}
+
 	// Count only AFTER a successful emit. Counting earlier would (a) inflate
 	// jobs_total for a job whose envelope never reached the sink and (b) double
 	// count on queue retry, since a sink-write failure re-runs Process. Recording
@@ -96,7 +122,7 @@ func (p *Pipeline) Process(ctx context.Context, jobID result.JobID, src moderati
 // analyze produces an un-thresholded NormalizedResult (frames + raw categories).
 // It never returns an error that maps to "allow": on failure it returns a
 // result whose frames carry Status=error.
-func (p *Pipeline) analyze(ctx context.Context, mediaType string, src moderation.Source) (moderation.NormalizedResult, error) {
+func (p *Pipeline) analyze(ctx context.Context, mediaType string, src moderation.Source, meta jobMeta) (moderation.NormalizedResult, error) {
 	if mediaType == "video" {
 		// Prefer a video-native adapter when one is present.
 		if vm, ok := p.Moderator.(moderation.VideoModerator); ok && p.Moderator.Capabilities().SupportsVideo {
@@ -106,18 +132,18 @@ func (p *Pipeline) analyze(ctx context.Context, mediaType string, src moderation
 			}
 			return res, nil
 		}
-		return p.analyzeVideoByFrames(ctx, src)
+		return p.analyzeVideoByFrames(ctx, src, meta)
 	}
-	return p.analyzeImage(ctx, src)
+	return p.analyzeImage(ctx, src, meta)
 }
 
 // analyzeImage moderates a single still image (one frame, TimestampSec nil).
-func (p *Pipeline) analyzeImage(ctx context.Context, src moderation.Source) (moderation.NormalizedResult, error) {
+func (p *Pipeline) analyzeImage(ctx context.Context, src moderation.Source, meta jobMeta) (moderation.NormalizedResult, error) {
 	img, err := loadImage(src.Ref)
 	if err != nil {
 		return errorResult(nil, err), err
 	}
-	fr := p.moderateFrame(ctx, img, nil)
+	fr := p.moderateFrame(ctx, img, nil, meta)
 	res := moderation.NormalizedResult{Frames: []moderation.FrameResult{fr}}
 	if fr.Status == moderation.FrameStatusError {
 		return res, fmt.Errorf("%s", fr.Error)
@@ -127,7 +153,7 @@ func (p *Pipeline) analyzeImage(ctx context.Context, src moderation.Source) (mod
 
 // analyzeVideoByFrames extracts frames, then moderates each as an independent
 // image. One frame's error never cancels its siblings.
-func (p *Pipeline) analyzeVideoByFrames(ctx context.Context, src moderation.Source) (moderation.NormalizedResult, error) {
+func (p *Pipeline) analyzeVideoByFrames(ctx context.Context, src moderation.Source, meta jobMeta) (moderation.NormalizedResult, error) {
 	fr, cleanup, err := p.Frames.Frames(ctx, src.Ref)
 	// LIFECYCLE: delete the WorkDir on every exit path (error, cancel, panic).
 	defer func() {
@@ -167,7 +193,7 @@ func (p *Pipeline) analyzeVideoByFrames(ctx context.Context, src moderation.Sour
 				}
 				return nil // never cancel siblings
 			}
-			res := p.moderateFrame(gctx, img, &ts)
+			res := p.moderateFrame(gctx, img, &ts, meta)
 			results[i] = res
 			return nil
 		})
@@ -179,7 +205,7 @@ func (p *Pipeline) analyzeVideoByFrames(ctx context.Context, src moderation.Sour
 
 // moderateFrame runs the hash-match pre-stage then (if no match) the classifier
 // for one decoded image. Pre-flight oversize rejection is terminal per frame.
-func (p *Pipeline) moderateFrame(ctx context.Context, img moderation.Image, ts *float64) moderation.FrameResult {
+func (p *Pipeline) moderateFrame(ctx context.Context, img moderation.Image, ts *float64, meta jobMeta) moderation.FrameResult {
 	// Pre-stage: CSAM hash match short-circuits the classifier.
 	if m, err := p.Matcher.Match(ctx, img); err == nil && m.Matched {
 		return moderation.FrameResult{
@@ -214,7 +240,51 @@ func (p *Pipeline) moderateFrame(ctx context.Context, img moderation.Image, ts *
 	if len(res.Frames) > 0 {
 		cats = res.Frames[0].Categories
 	}
+	// §G.8: a high-severity SEXUAL hit is NOT a CSAM determination but MUST be
+	// handled as potential-CSAM. Divert to human review BEFORE Sink.Write,
+	// carrying only SHA-256(frame) — never the frame bytes or Raw (§G.2).
+	p.divertPotentialCSAM(ctx, meta, img, ts, cats)
 	return moderation.FrameResult{TimestampSec: ts, Status: moderation.FrameStatusOK, Categories: cats}
+}
+
+// jobMeta carries per-job identity into the frame fan-out so a divert can be
+// attributed without re-threading the whole Source/JobID.
+type jobMeta struct {
+	ID      string
+	AssetID string
+}
+
+// divertPotentialCSAM routes a frame to human review when a SEXUAL category
+// scores at/above thresholds.SEXUAL.potential_csam (§G.8). It is a no-op when
+// no Diverter is configured or the threshold is disabled (<= 0).
+func (p *Pipeline) divertPotentialCSAM(ctx context.Context, meta jobMeta, img moderation.Image, ts *float64, cats []moderation.CategoryResult) {
+	if p.Diverter == nil {
+		return
+	}
+	thr := p.Cfg.Thresholds.SexualPotentialCSAM
+	if thr <= 0 {
+		return
+	}
+	for _, c := range cats {
+		if c.Category != moderation.CategorySexual || c.Score == nil || *c.Score < thr {
+			continue
+		}
+		sum := sha256.Sum256(img.Bytes)
+		score := *c.Score
+		it := review.Item{
+			JobID:        meta.ID,
+			AssetID:      meta.AssetID,
+			FrameSHA256:  hex.EncodeToString(sum[:]),
+			TimestampSec: ts,
+			Category:     string(c.Category),
+			Score:        &score,
+			Reason:       "SEXUAL score >= thresholds.SEXUAL.potential_csam",
+		}
+		if err := p.Diverter.Divert(ctx, it); err != nil {
+			p.Log.Warn("potential-CSAM divert failed", "job_id", meta.ID, "err", err)
+		}
+		return // one divert per frame
+	}
 }
 
 // errorResult builds a single-frame error result (could-not-evaluate).

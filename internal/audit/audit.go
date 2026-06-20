@@ -12,6 +12,7 @@ package audit
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -19,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"sync"
 )
 
@@ -162,12 +164,81 @@ func writeField(h interface{ Write([]byte) (int, error) }, b []byte) {
 	_, _ = h.Write(b)
 }
 
-// canonical serializes the payload deterministically. Go's json.Marshal emits
-// struct fields in declaration order, giving a stable encoding for this fixed
-// struct. (M4 upgrades this to RFC 8785 JCS for cross-implementation parity.)
+// canonical serializes the payload as RFC 8785 JCS (JSON Canonicalization
+// Scheme): object members sorted lexicographically by key, compact (no
+// insignificant whitespace), UTF-8. This makes `audit verify` recompute
+// byte-identical hashes across processes and implementations, independent of
+// Go struct declaration order. The payload is all-string, so JCS number
+// formatting edge cases do not arise.
 func canonical(p Payload) []byte {
 	b, _ := json.Marshal(p)
-	return b
+	out, err := jcs(b)
+	if err != nil {
+		// A struct we just marshalled is always valid JSON; fall back rather
+		// than panic in the hashing path.
+		return b
+	}
+	return out
+}
+
+// jcs re-emits arbitrary JSON in RFC 8785 canonical form: object keys sorted,
+// compact, numbers preserved verbatim via json.Number.
+func jcs(b []byte) ([]byte, error) {
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.UseNumber()
+	var v any
+	if err := dec.Decode(&v); err != nil {
+		return nil, err
+	}
+	var buf bytes.Buffer
+	if err := writeCanonical(&buf, v); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func writeCanonical(buf *bytes.Buffer, v any) error {
+	switch t := v.(type) {
+	case map[string]any:
+		keys := make([]string, 0, len(t))
+		for k := range t {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		buf.WriteByte('{')
+		for i, k := range keys {
+			if i > 0 {
+				buf.WriteByte(',')
+			}
+			ks, _ := json.Marshal(k)
+			buf.Write(ks)
+			buf.WriteByte(':')
+			if err := writeCanonical(buf, t[k]); err != nil {
+				return err
+			}
+		}
+		buf.WriteByte('}')
+	case []any:
+		buf.WriteByte('[')
+		for i, e := range t {
+			if i > 0 {
+				buf.WriteByte(',')
+			}
+			if err := writeCanonical(buf, e); err != nil {
+				return err
+			}
+		}
+		buf.WriteByte(']')
+	case json.Number:
+		buf.WriteString(t.String())
+	default: // string, bool, nil
+		enc, err := json.Marshal(t)
+		if err != nil {
+			return err
+		}
+		buf.Write(enc)
+	}
+	return nil
 }
 
 func readAll(path string) ([]Record, error) {
@@ -195,6 +266,11 @@ func readAll(path string) ([]Record, error) {
 	}
 	return out, sc.Err()
 }
+
+// ReadRecords returns every persisted chain record in order (empty if the log
+// does not exist yet). Intended for inspection/testing — Verify is the
+// integrity check.
+func ReadRecords(path string) ([]Record, error) { return readAll(path) }
 
 // RawSHA256 hashes raw provider output for binding into the chain.
 func RawSHA256(raw []byte) string {

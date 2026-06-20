@@ -45,6 +45,7 @@ func setDefaults(v *viper.Viper) {
 
 	v.SetDefault("log.level", "info")
 	v.SetDefault("metrics.addr", ":9090")
+	v.SetDefault("audit.path", "")
 }
 
 // Load reads config from an optional file plus the VISMOD_ env overlay.
@@ -84,6 +85,7 @@ func Load(path string) (Config, error) {
 	// Fields viper's struct-unmarshal can't reach cleanly.
 	c.LogLevel = v.GetString("log.level")
 	c.MetricsAddr = v.GetString("metrics.addr")
+	c.AuditPath = v.GetString("audit.path")
 	c.Thresholds = resolveThresholds(v)
 
 	if err := c.validate(); err != nil {

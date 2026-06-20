@@ -83,3 +83,22 @@ func indexOf(s, sub string) int {
 	}
 	return -1
 }
+
+func TestCanonicalSortsKeysLexicographically(t *testing.T) {
+	// Payload struct declares fields as job_id, verdict, raw_sha256, adapter,
+	// model_version, config_hash. RFC 8785 JCS requires object members sorted
+	// by key, so the canonical form must NOT follow struct declaration order.
+	p := Payload{
+		JobID:        "j1",
+		Verdict:      "block",
+		RawSHA256:    "abc",
+		Adapter:      "stub",
+		ModelVersion: "1.0",
+		ConfigHash:   "deadbeef",
+	}
+	got := string(canonical(p))
+	want := `{"adapter":"stub","config_hash":"deadbeef","job_id":"j1","model_version":"1.0","raw_sha256":"abc","verdict":"block"}`
+	if got != want {
+		t.Fatalf("canonical not JCS sorted:\n got=%s\nwant=%s", got, want)
+	}
+}
