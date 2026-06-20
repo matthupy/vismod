@@ -1,33 +1,31 @@
 # NOTE: the image is built with the PARENT directory as context (see Dockerfile
-# header) so the `../videosift` replace target resolves. Docker uses the
-# .dockerignore at the context root, i.e. parent/.dockerignore — keep a copy
-# there. This file applies when the context happens to be the vismod dir.
+# header) so the `../videosift` replace target resolves. BuildKit reads the
+# .dockerignore adjacent to the Dockerfile (this file). Patterns are ANCHORED
+# (leading /) so a bare name never matches a same-named SOURCE dir such as
+# cmd/vismod — that footgun is exactly what broke the first image build.
 
-# Binaries / build output
-vismod
-vismod.exe
+# Built binaries / output (repo-root only — never cmd/vismod source).
+/vismod
+/vismod.exe
 /dist/
 /out/
 
 # Local artifacts & secrets
-*.out
-*.err
-*.tmp
-audit.log
-.env
-*.local.yaml
+/*.out
+/*.err
+/*.tmp
+/audit.log
+/.env
 
 # Test/sample media — NEVER ship media into an image layer
 /testmedia/
-sample.*
+/sample.*
 
 # VCS / tooling / agent state
-.git/
-.github/
-.golangci.yml
-.idea/
-.vscode/
-.claude/
-.handoff/
-docs/
-*.md
+/.git/
+/.github/
+/.golangci.yml
+/.idea/
+/.vscode/
+/.claude/
+/.handoff/
