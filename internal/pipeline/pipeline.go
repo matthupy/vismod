@@ -100,10 +100,12 @@ func (p *Pipeline) Process(ctx context.Context, jobID result.JobID, src moderati
 	}
 
 	// Tamper-evident audit (§G.5): bind the decision to its inputs BY HASH after
-	// the Sink commits. Idempotent per JobID (asynq redelivery never double-
-	// appends). Stores SHA-256(Raw) + ModelIdentity + verdict — NEVER Raw itself
-	// (§G.2). An audit failure is an infra error: the job is retried (Sink and
-	// audit are both idempotent per JobID, so retry is safe).
+	// the Sink commits. Idempotent per JobID within one process (in-memory `seen`),
+	// so in-process retry never double-appends. Stores SHA-256(Raw) + ModelIdentity
+	// + verdict — NEVER Raw itself (§G.2). An audit failure is an infra error: the
+	// job is retried (Sink and audit are both idempotent per JobID, so retry is
+	// safe). NOTE: M5 multi-worker asynq breaks this single-writer assumption —
+	// see audit.Log godoc; serialize audit writers before sharing the chain file.
 	if p.Audit != nil {
 		pl := audit.Payload{
 			JobID:        string(jobID),
@@ -304,6 +306,10 @@ func (p *Pipeline) divertPotentialCSAM(ctx context.Context, meta jobMeta, img mo
 			// the one thing §G.8 must not hide, so make the drop observable via a
 			// counter an operator can alert on — log alone is not alertable.
 			p.Log.Warn("potential-CSAM divert failed", "job_id", meta.ID, "err", err)
+			// TODO(v1.1): p.Metrics is nil on the scan path, so a real erroring
+			// Diverter's failure goes uncounted here (only logged). Harmless today
+			// (LogDiverter never errors); wire a Metrics sink on the scan path
+			// before shipping a Diverter that can fail.
 			if r, ok := p.Metrics.(DivertFailureRecorder); ok {
 				r.RecordDivertFailure()
 			}

@@ -45,7 +45,7 @@ type Payload struct {
 // Record is one chain entry as persisted (one JSON object per line).
 type Record struct {
 	Seq       uint64  `json:"seq"`
-	Timestamp string  `json:"timestamp"` // RFC3339 UTC nanoseconds
+	Timestamp string  `json:"timestamp"` // RFC3339 UTC, second precision (pipeline uses time.RFC3339); ordering is by seq, not this field
 	PrevHash  string  `json:"prev_hash"` // hex
 	Payload   Payload `json:"payload"`
 	EntryHash string  `json:"entry_hash"` // hex
@@ -55,6 +55,12 @@ var zeroHash [32]byte
 
 // Log is a file-backed append-only hash chain. Appends are idempotent per
 // JobID (a JobID already in the chain is skipped — no new seq, no gap).
+//
+// SINGLE-WRITER ONLY: idempotency is enforced by the in-memory `seen` map, so it
+// holds only within one process. It does NOT survive a process restart
+// mid-retry, and two Logs over one file (M5 asynq multi-worker) would both
+// O_APPEND and interleave — double-append + a corrupt chain. M5 must serialize
+// writers (single audit-writer goroutine/process) before sharing a chain file.
 type Log struct {
 	mu    sync.Mutex
 	path  string
@@ -188,9 +194,11 @@ func canonical(p Payload) []byte {
 	b, _ := json.Marshal(p)
 	out, err := jcs(b)
 	if err != nil {
-		// A struct we just marshalled is always valid JSON; fall back rather
-		// than panic in the hashing path.
-		return b
+		// UNREACHABLE: b is freshly marshalled from a struct, so it is always
+		// valid JSON. If jcs ever fails here it is a broken invariant, not a
+		// recoverable error — falling back to raw (unsorted) b would silently
+		// produce a different hash and split the chain. Fail loud instead.
+		panic(fmt.Sprintf("audit: canonicalize freshly-marshalled payload: %v", err))
 	}
 	return out
 }

@@ -11,6 +11,10 @@ import (
 // JSONLSink writes one JSON object per line to an io.Writer (stdout or a file).
 // It is idempotent per JobID: a JobID already written is skipped, so
 // at-least-once redelivery never double-writes.
+//
+// SINGLE-WRITER ONLY: the `seen` set is in-memory, so the guarantee holds within
+// one process. It does not survive a restart, nor two sinks over one file (M5
+// multi-worker) — serialize writers before sharing a destination.
 type JSONLSink struct {
 	mu   sync.Mutex
 	w    *bufio.Writer
