@@ -19,11 +19,13 @@ import (
 //   - vismod_adapter_errors_total{adapter,code} counter (per failed call)
 //   - vismod_queue_depth                      gauge (scrape-time, via GaugeFunc)
 //   - vismod_deadletter_depth                 gauge (scrape-time, via GaugeFunc)
+//   - vismod_queue_depth_scrape_errors_total  counter (live-depth read failed)
 type Metrics struct {
-	reg            *prometheus.Registry
-	jobsTotal      *prometheus.CounterVec
-	adapterSeconds *prometheus.HistogramVec
-	adapterErrors  *prometheus.CounterVec
+	reg              *prometheus.Registry
+	jobsTotal        *prometheus.CounterVec
+	adapterSeconds   *prometheus.HistogramVec
+	adapterErrors    *prometheus.CounterVec
+	queueDepthErrors prometheus.Counter
 }
 
 // NewMetrics builds the collectors and registers the job/adapter series. Queue
@@ -50,8 +52,12 @@ func NewMetrics() *Metrics {
 			Name: "vismod_adapter_errors_total",
 			Help: "Total adapter request errors, partitioned by adapter and provider error code.",
 		}, []string{"adapter", "code"}),
+		queueDepthErrors: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "vismod_queue_depth_scrape_errors_total",
+			Help: "Times a scrape-time queue-depth read failed (depth reported as 0 for that scrape).",
+		}),
 	}
-	reg.MustRegister(m.jobsTotal, m.adapterSeconds, m.adapterErrors)
+	reg.MustRegister(m.jobsTotal, m.adapterSeconds, m.adapterErrors, m.queueDepthErrors)
 	return m
 }
 
@@ -65,14 +71,24 @@ func (m *Metrics) RecordJob(verdict moderation.Verdict) {
 }
 
 // RegisterQueueDepth registers scrape-time gauges fed by the live queue. Queue
-// depth (buffered, not-yet-started) comes from Queue.QueueDepth; dead-letter
-// depth from the memq accessor. Both read at scrape time, so they never go stale.
-func (m *Metrics) RegisterQueueDepth(queueDepth, deadLetterDepth func() float64) {
+// depth (buffered, not-yet-started) comes from Queue.QueueDepth, which can fail
+// against a remote driver (redis, M5) — a failed read is reported as depth 0 AND
+// bumps vismod_queue_depth_scrape_errors_total, so an operator can tell a genuine
+// empty queue from a backend that went dark. Dead-letter depth is an in-memory
+// accessor (no error). Both read at scrape time, so they never go stale.
+func (m *Metrics) RegisterQueueDepth(queueDepth func() (float64, error), deadLetterDepth func() float64) {
 	m.reg.MustRegister(
 		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 			Name: "vismod_queue_depth",
 			Help: "Jobs buffered in the queue and not yet started.",
-		}, queueDepth),
+		}, func() float64 {
+			n, err := queueDepth()
+			if err != nil {
+				m.queueDepthErrors.Inc()
+				return 0
+			}
+			return n
+		}),
 		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 			Name: "vismod_deadletter_depth",
 			Help: "Jobs that have been dead-lettered.",
@@ -86,9 +102,19 @@ func (m *Metrics) RegisterQueueDepth(queueDepth, deadLetterDepth func() float64)
 // NOTE (v1 scope): the wrapper deliberately does NOT forward the optional
 // VideoModerator interface. v1 adapters (stub, azure) are not video-native
 // (Caps.SupportsVideo=false), so the pipeline's frame-by-frame path is used and
-// nothing is lost. A future video-native adapter must instrument AnalyzeVideo
-// here and forward the assertion.
+// nothing is lost.
+//
+// GUARD: wrapping a video-native adapter would silently strip its VideoModerator
+// implementation — the pipeline's mod.(VideoModerator) assertion fails and falls
+// back to the frame path with no error. That regression must NOT ship silently,
+// so we panic at wiring time (a programmer error, caught at boot like
+// prometheus MustRegister). A future video adapter must first teach this wrapper
+// to instrument AnalyzeVideo and forward the assertion, then drop this guard.
 func (m *Metrics) Instrument(mod moderation.Moderator) moderation.Moderator {
+	if mod.Capabilities().SupportsVideo {
+		panic("observe.Instrument: adapter " + mod.Name() + " is video-native (SupportsVideo=true) " +
+			"but the instrument wrapper does not forward VideoModerator; teach it AnalyzeVideo before wiring")
+	}
 	return &instrumentedModerator{Moderator: mod, m: m, name: mod.Name()}
 }
 

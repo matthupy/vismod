@@ -76,11 +76,17 @@ func runServe(cmd *cobra.Command, _ []string) error {
 	}
 
 	// Scrape-time depth gauges read live queue state (uniform QueueDepth across
-	// drivers; memq exposes its DLQ depth).
+	// drivers; memq exposes its DLQ depth). The depth read is bounded by a short
+	// timeout: memq is instant, but a future redis driver (M5) on a slow/down
+	// backend must NOT block the /metrics handler (a hung scrape blinds alerting
+	// exactly when the queue is sick). On failure the gauge reports 0 and bumps
+	// vismod_queue_depth_scrape_errors_total.
 	metrics.RegisterQueueDepth(
-		func() float64 {
-			n, _ := q.QueueDepth(context.Background())
-			return float64(n)
+		func() (float64, error) {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			n, err := q.QueueDepth(ctx)
+			return float64(n), err
 		},
 		func() float64 { return float64(q.DeadLetterDepth()) },
 	)

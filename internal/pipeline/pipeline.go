@@ -63,10 +63,6 @@ func (p *Pipeline) Process(ctx context.Context, jobID result.JobID, src moderati
 	p.applyThresholds(&res)
 	res.Overall = p.rollup(res.Frames)
 
-	if p.Metrics != nil {
-		p.Metrics.RecordJob(res.Overall.Verdict)
-	}
-
 	env := result.ResultEnvelope{
 		JobID:  jobID,
 		Source: src,
@@ -85,6 +81,14 @@ func (p *Pipeline) Process(ctx context.Context, jobID result.JobID, src moderati
 
 	if err := p.Sink.Write(ctx, env); err != nil {
 		return fmt.Errorf("sink write: %w", err)
+	}
+
+	// Count only AFTER a successful emit. Counting earlier would (a) inflate
+	// jobs_total for a job whose envelope never reached the sink and (b) double
+	// count on queue retry, since a sink-write failure re-runs Process. Recording
+	// here makes vismod_jobs_total = jobs successfully emitted, once each.
+	if p.Metrics != nil {
+		p.Metrics.RecordJob(res.Overall.Verdict)
 	}
 	return nil
 }
