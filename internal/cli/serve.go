@@ -57,6 +57,16 @@ func runServe(cmd *cobra.Command, _ []string) error {
 	}
 	defer mod.Close()
 
+	// Cross-process dedup gate (§L, issue #9): under the at-least-once redis
+	// driver a redelivery to a fresh process/replica must not double-write the
+	// Sink/audit. Non-nil only for driver=redis; memq is single-process.
+	deduper, closeDedup, err := buildDeduper(cfg)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = closeDedup() }()
+	p.Dedup = deduper
+
 	q, qWarnings, err := buildQueue(cfg, dlqSink, log)
 	if err != nil {
 		return err

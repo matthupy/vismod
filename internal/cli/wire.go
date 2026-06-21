@@ -8,6 +8,7 @@ import (
 
 	"github.com/matthupy/vismod/internal/audit"
 	"github.com/matthupy/vismod/internal/config"
+	"github.com/matthupy/vismod/internal/dedup"
 	"github.com/matthupy/vismod/internal/frames"
 	"github.com/matthupy/vismod/internal/hashmatch"
 	"github.com/matthupy/vismod/internal/moderate"
@@ -17,6 +18,7 @@ import (
 	"github.com/matthupy/vismod/internal/result"
 	"github.com/matthupy/vismod/internal/review"
 	"github.com/matthupy/vismod/pkg/moderation"
+	"github.com/redis/go-redis/v9"
 )
 
 // buildModerator instantiates the single configured adapter, passing an
@@ -93,6 +95,21 @@ func buildPipeline(cfg config.Config, sink result.Sink, log *slog.Logger, metric
 		p.Metrics = metrics
 	}
 	return p, mod, nil
+}
+
+// buildDeduper wires the cross-process dedup gate (§L, issue #9). It returns a
+// non-nil Deduper ONLY for the redis driver — the memory driver is
+// single-process so the in-memory Sink/audit guards already suffice (a nil
+// Deduper). The returned closer releases the Redis client on shutdown.
+func buildDeduper(cfg config.Config) (pipeline.Deduper, func() error, error) {
+	if cfg.Queue.Driver != "redis" {
+		return nil, func() error { return nil }, nil
+	}
+	if cfg.Queue.DedupTTL <= 0 {
+		return nil, nil, fmt.Errorf("serve: queue.dedup_ttl must be > 0 for the redis driver")
+	}
+	client := redis.NewClient(&redis.Options{Addr: cfg.Queue.RedisAddr})
+	return dedup.NewRedisDeduper(client, cfg.Queue.DedupTTL), client.Close, nil
 }
 
 // redisQueueName is the asynq queue namespace. A single logical queue keeps the

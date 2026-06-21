@@ -65,9 +65,13 @@ queue:
   job_timeout: 60s      # per-job processing timeout
   deadletter_max: 1024  # DLQ depth cap; at capacity new enqueues are rejected (memory driver)
   redis_addr: localhost:6379   # REQUIRED when driver=redis; PING-validated at boot AND on /readyz
+  dedup_ttl: 168h       # redis driver only: lifetime of a cross-process dedup claim (§L #9).
+                        # MUST exceed the max redelivery window (asynq retention + retry backoff).
   # redis driver (asynq-backed): durable + at-least-once across restarts and multiple
-  # workers/replicas. At-least-once requires idempotency — the result sink and audit
-  # append dedupe per job_id, so redelivery never double-writes. Job payloads in Redis
+  # workers/replicas. At-least-once requires idempotency — a Redis-backed dedup gate
+  # (key vismod:done:<job_id>, dedup_ttl) records each committed job so a redelivery to a
+  # FRESH process or replica re-uses that fact and never double-writes the sink/audit
+  # (the in-memory per-process guards alone could not span processes). Job payloads in Redis
   # carry only opaque IDs/refs (file paths), never media bytes. A Redis outage flips
   # /readyz to not-ready (backpressure) rather than accepting jobs it cannot hold.
 
