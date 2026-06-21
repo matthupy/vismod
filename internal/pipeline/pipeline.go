@@ -142,6 +142,11 @@ func (p *Pipeline) Process(ctx context.Context, jobID result.JobID, src moderati
 	// after ctx-cancel — both see Done=false). That overlap, like a crash strictly
 	// between the writes and Commit, is an accepted v1 residual; a SETNX claim/lease
 	// (Deduper godoc, design doc) is the future hardening seam if it must close.
+	// SEPARATE CONCERN: the dedup gate only covers SAME-job redelivery. It does
+	// NOT cover DIFFERENT-job concurrent writers across replicas appending to ONE
+	// shared audit chain file — audit.Log idempotency/ordering is a per-process
+	// `mu` only (see audit.Log godoc). Deployment invariant: each replica owns its
+	// own chain file (or audit writers are serialized) before sharing one.
 	if p.Audit != nil {
 		pl := audit.Payload{
 			JobID:        string(jobID),

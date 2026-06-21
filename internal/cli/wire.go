@@ -111,12 +111,16 @@ func buildDeduper(cfg config.Config, log *slog.Logger) (pipeline.Deduper, func()
 	}
 	// Correctness depends on dedup_ttl OUTLIVING the redelivery window: a claim
 	// that expires while the same job can still be redelivered silently reopens
-	// the double-write this gate exists to close. The worst case a retry can span
-	// is MaxRetries * RetryBackoff (asynq's own completed-task retention extends
-	// it further, so this is a floor, not the full budget). Warn loudly rather
-	// than fail — operators may run a shorter TTL deliberately — but make the
-	// invisible failure mode visible at boot, not when it bites in prod.
-	if retryBudget := time.Duration(cfg.Queue.MaxRetries) * cfg.Queue.RetryBackoff; cfg.Queue.DedupTTL <= retryBudget {
+	// the double-write this gate exists to close. Backoff is LINEAR — retryDelay
+	// returns (n+1)*RetryBackoff (queue/asynqq.go) — so the true span across all
+	// M attempts is the triangular sum RetryBackoff * M*(M+1)/2, NOT
+	// MaxRetries*RetryBackoff (which undercounts by a factor of (M+1)/2). M*(M+1)/2
+	// is 0 when M=0, which is correct. asynq's own completed-task retention extends
+	// the window further, so this remains a conservative floor, not the full budget.
+	// Warn loudly rather than fail — operators may run a shorter TTL deliberately —
+	// but make the invisible failure mode visible at boot, not when it bites in prod.
+	m := cfg.Queue.MaxRetries
+	if retryBudget := cfg.Queue.RetryBackoff * time.Duration(m*(m+1)/2); cfg.Queue.DedupTTL <= retryBudget {
 		log.Warn("queue.dedup_ttl is below the retry budget; a redelivery after the claim expires can double-write",
 			"dedup_ttl", cfg.Queue.DedupTTL, "retry_budget", retryBudget)
 	}

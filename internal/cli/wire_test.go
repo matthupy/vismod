@@ -193,6 +193,33 @@ func TestBuildDeduperWarnsOnShortTTL(t *testing.T) {
 	}
 }
 
+// Queue backoff is LINEAR: retryDelay returns (n+1)*RetryBackoff, so the true
+// span across all attempts is the triangular sum RetryBackoff*M*(M+1)/2, not
+// MaxRetries*RetryBackoff. A dedup_ttl above the old (wrong) floor but below the
+// real span must now WARN. M=5, RetryBackoff=1s => true span 15s; ttl 10s clears
+// the old 5s floor but sits inside the real 15s redelivery window.
+func TestBuildDeduperWarnsBelowTriangularSpan(t *testing.T) {
+	mr := miniredis.RunT(t)
+	cfg := config.Config{Queue: config.QueueConfig{
+		Driver:       "redis",
+		RedisAddr:    mr.Addr(),
+		DedupTTL:     10 * time.Second, // > old floor 5s, < true span 15s
+		MaxRetries:   5,
+		RetryBackoff: time.Second,
+	}}
+	var buf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+
+	_, closer, err := buildDeduper(cfg, log)
+	if err != nil {
+		t.Fatalf("buildDeduper: %v", err)
+	}
+	defer closer()
+	if !strings.Contains(buf.String(), "dedup_ttl") {
+		t.Errorf("ttl below the triangular redelivery span must warn; log = %q", buf.String())
+	}
+}
+
 // buildDeduper fails closed when its own redis connection is unreachable: a
 // broken dedup path must surface at boot, not on job #1.
 func TestBuildDeduperPingFailsClosed(t *testing.T) {
