@@ -1,12 +1,15 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/alicebob/miniredis/v2"
 	"github.com/matthupy/videosift"
@@ -129,6 +132,122 @@ func TestBuildQueueRedisDriver(t *testing.T) {
 	}
 	if err := pinger.Ping(context.Background()); err != nil {
 		t.Fatalf("Ping against live miniredis: %v", err)
+	}
+}
+
+// buildDeduper for the redis driver pings its own client at boot (fail-closed)
+// and returns a usable Deduper against live miniredis. A healthy TTL above the
+// retry budget must NOT warn.
+func TestBuildDeduperRedisPingsAndBuilds(t *testing.T) {
+	mr := miniredis.RunT(t)
+	cfg := config.Config{Queue: config.QueueConfig{
+		Driver:       "redis",
+		RedisAddr:    mr.Addr(),
+		DedupTTL:     168 * time.Hour,
+		MaxRetries:   5,
+		RetryBackoff: time.Second,
+	}}
+	var buf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+
+	d, closer, err := buildDeduper(cfg, log)
+	if err != nil {
+		t.Fatalf("buildDeduper(redis): %v", err)
+	}
+	defer closer()
+	if d == nil {
+		t.Fatal("redis driver must return a non-nil Deduper")
+	}
+	if err := d.Commit(context.Background(), "j1"); err != nil {
+		t.Fatalf("Commit against live miniredis: %v", err)
+	}
+	if done, _ := d.Done(context.Background(), "j1"); !done {
+		t.Error("Done should report a committed job")
+	}
+	if strings.Contains(buf.String(), "dedup_ttl") {
+		t.Errorf("healthy TTL must not warn; got %q", buf.String())
+	}
+}
+
+// A dedup_ttl at or below the retry budget must emit a loud boot warning so the
+// silent double-write failure mode is visible before prod.
+func TestBuildDeduperWarnsOnShortTTL(t *testing.T) {
+	mr := miniredis.RunT(t)
+	cfg := config.Config{Queue: config.QueueConfig{
+		Driver:       "redis",
+		RedisAddr:    mr.Addr(),
+		DedupTTL:     2 * time.Second,
+		MaxRetries:   5,
+		RetryBackoff: time.Second, // budget 5s > ttl 2s
+	}}
+	var buf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+
+	_, closer, err := buildDeduper(cfg, log)
+	if err != nil {
+		t.Fatalf("buildDeduper: %v", err)
+	}
+	defer closer()
+	if !strings.Contains(buf.String(), "dedup_ttl") {
+		t.Errorf("short TTL must warn; log = %q", buf.String())
+	}
+}
+
+// Queue backoff is LINEAR: retryDelay returns (n+1)*RetryBackoff, so the true
+// span across all attempts is the triangular sum RetryBackoff*M*(M+1)/2, not
+// MaxRetries*RetryBackoff. A dedup_ttl above the old (wrong) floor but below the
+// real span must now WARN. M=5, RetryBackoff=1s => true span 15s; ttl 10s clears
+// the old 5s floor but sits inside the real 15s redelivery window.
+func TestBuildDeduperWarnsBelowTriangularSpan(t *testing.T) {
+	mr := miniredis.RunT(t)
+	cfg := config.Config{Queue: config.QueueConfig{
+		Driver:       "redis",
+		RedisAddr:    mr.Addr(),
+		DedupTTL:     10 * time.Second, // > old floor 5s, < true span 15s
+		MaxRetries:   5,
+		RetryBackoff: time.Second,
+	}}
+	var buf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+
+	_, closer, err := buildDeduper(cfg, log)
+	if err != nil {
+		t.Fatalf("buildDeduper: %v", err)
+	}
+	defer closer()
+	if !strings.Contains(buf.String(), "dedup_ttl") {
+		t.Errorf("ttl below the triangular redelivery span must warn; log = %q", buf.String())
+	}
+}
+
+// buildDeduper fails closed when its own redis connection is unreachable: a
+// broken dedup path must surface at boot, not on job #1.
+func TestBuildDeduperPingFailsClosed(t *testing.T) {
+	cfg := config.Config{Queue: config.QueueConfig{
+		Driver:    "redis",
+		RedisAddr: "127.0.0.1:1", // nothing listening
+		DedupTTL:  168 * time.Hour,
+	}}
+	log := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
+	if _, _, err := buildDeduper(cfg, log); err == nil {
+		t.Fatal("buildDeduper with an unreachable redis must return a boot error")
+	}
+}
+
+// The memory driver is single-process: buildDeduper returns a nil Deduper (the
+// in-memory guards suffice) and a no-op closer.
+func TestBuildDeduperMemoryIsNil(t *testing.T) {
+	cfg := config.Config{Queue: config.QueueConfig{Driver: "memory"}}
+	log := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
+	d, closer, err := buildDeduper(cfg, log)
+	if err != nil {
+		t.Fatalf("buildDeduper(memory): %v", err)
+	}
+	if d != nil {
+		t.Error("memory driver must return a nil Deduper (single-process)")
+	}
+	if err := closer(); err != nil {
+		t.Errorf("memory closer should be a no-op, got %v", err)
 	}
 }
 

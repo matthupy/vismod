@@ -35,6 +35,19 @@ type JobRecorder interface {
 	RecordJob(verdict moderation.Verdict)
 }
 
+// Deduper provides durable cross-process once-only job recording (§L, issue #9).
+// Optional: a nil Deduper falls back to the in-memory Sink/audit guards — the
+// single-process scan/memq path. The redis-backed impl (internal/dedup) makes
+// dedup survive a restart and span replicas under the at-least-once redis queue.
+//
+// ORDERING: Process checks Done BEFORE the writes and calls Commit only AFTER
+// Sink+audit succeed (write-then-commit) — fail-safe: a crash before Commit
+// redelivers and redoes the job, never a silent loss.
+type Deduper interface {
+	Done(ctx context.Context, jobID string) (bool, error)
+	Commit(ctx context.Context, jobID string) error
+}
+
 // DivertFailureRecorder counts potential-CSAM diverts that failed to reach the
 // review channel (§G.8 vismod_divert_failures_total). It is an OPTIONAL
 // capability discovered by type-asserting the wired Metrics — a recorder that
@@ -56,6 +69,7 @@ type Pipeline struct {
 	Metrics   JobRecorder     // optional; nil = no metrics
 	Audit     *audit.Log      // optional; nil = no audit trail (CLI scan default)
 	Diverter  review.Diverter // optional; nil = no potential-CSAM divert (§G.8)
+	Dedup     Deduper         // optional; nil = in-memory guards only (scan/memq)
 }
 
 // Process handles one job: it builds and writes the ResultEnvelope to the Sink.
@@ -64,6 +78,21 @@ type Pipeline struct {
 // successful write of an error-verdict envelope (fail-safe).
 func (p *Pipeline) Process(ctx context.Context, jobID result.JobID, src moderation.Source) error {
 	started := time.Now().UTC()
+
+	// Cross-process dedup gate (§L, issue #9): skip a job already durably
+	// recorded so a redelivery to a fresh process/replica does not re-analyze or
+	// double-write the Sink/audit. A Done error is an infra failure, not a
+	// verdict — return it so the job is retried/dead-lettered (never auto-allow,
+	// never silently skip).
+	if p.Dedup != nil {
+		done, err := p.Dedup.Done(ctx, string(jobID))
+		if err != nil {
+			return fmt.Errorf("dedup done check: %w", err)
+		}
+		if done {
+			return nil
+		}
+	}
 
 	mediaType := detectMediaType(src)
 	meta := jobMeta{ID: string(jobID), AssetID: assetID(jobID, src)}
@@ -104,8 +133,20 @@ func (p *Pipeline) Process(ctx context.Context, jobID result.JobID, src moderati
 	// so in-process retry never double-appends. Stores SHA-256(Raw) + ModelIdentity
 	// + verdict — NEVER Raw itself (§G.2). An audit failure is an infra error: the
 	// job is retried (Sink and audit are both idempotent per JobID, so retry is
-	// safe). NOTE: M5 multi-worker asynq breaks this single-writer assumption —
-	// see audit.Log godoc; serialize audit writers before sharing the chain file.
+	// safe). SEQUENTIAL cross-process redelivery (a fresh process/replica picking
+	// up the job AFTER the first worker died) is gated earlier by p.Dedup so it
+	// never reaches this append twice (§L, issue #9). KNOWN RESIDUAL: the gate
+	// orders writes vs. the durable claim but provides NO mutual exclusion, so it
+	// does not stop a genuinely CONCURRENT second worker (asynq lease-recovery can
+	// re-queue a job past JobTimeout while the first goroutine is still draining
+	// after ctx-cancel — both see Done=false). That overlap, like a crash strictly
+	// between the writes and Commit, is an accepted v1 residual; a SETNX claim/lease
+	// (Deduper godoc, design doc) is the future hardening seam if it must close.
+	// SEPARATE CONCERN: the dedup gate only covers SAME-job redelivery. It does
+	// NOT cover DIFFERENT-job concurrent writers across replicas appending to ONE
+	// shared audit chain file — audit.Log idempotency/ordering is a per-process
+	// `mu` only (see audit.Log godoc). Deployment invariant: each replica owns its
+	// own chain file (or audit writers are serialized) before sharing one.
 	if p.Audit != nil {
 		pl := audit.Payload{
 			JobID:        string(jobID),
@@ -117,6 +158,16 @@ func (p *Pipeline) Process(ctx context.Context, jobID result.JobID, src moderati
 		}
 		if _, _, err := p.Audit.Append(pl, env.FinishedAt); err != nil {
 			return fmt.Errorf("audit append: %w", err)
+		}
+	}
+
+	// Commit the cross-process dedup claim only AFTER Sink+audit succeed
+	// (write-then-commit, §L). A Commit failure is an infra error: return it so
+	// the job retries; the next attempt re-writes (Sink/audit are idempotent per
+	// JobID within a process) and re-commits. Fail-safe: never auto-allow.
+	if p.Dedup != nil {
+		if err := p.Dedup.Commit(ctx, string(jobID)); err != nil {
+			return fmt.Errorf("dedup commit: %w", err)
 		}
 	}
 

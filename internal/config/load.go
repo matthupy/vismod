@@ -32,6 +32,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("queue.job_timeout", "60s")
 	v.SetDefault("queue.deadletter_max", 1024)
 	v.SetDefault("queue.redis_addr", "localhost:6379")
+	v.SetDefault("queue.dedup_ttl", "168h") // 7d; must exceed the redelivery window
 
 	v.SetDefault("frames.workdir", "")
 	v.SetDefault("frames.max_frames", 64)

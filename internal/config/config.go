@@ -51,6 +51,10 @@ type QueueConfig struct {
 	JobTimeout    time.Duration `mapstructure:"job_timeout"`
 	DeadLetterMax int           `mapstructure:"deadletter_max"`
 	RedisAddr     string        `mapstructure:"redis_addr"`
+	// DedupTTL bounds the lifetime of a cross-process dedup claim (redis driver,
+	// §L issue #9). MUST exceed the maximum redelivery window (asynq retention +
+	// retry backoff). Ignored by the memory driver (single-process).
+	DedupTTL time.Duration `mapstructure:"dedup_ttl"`
 }
 
 // FramesConfig tunes frame extraction and per-job fan-out.

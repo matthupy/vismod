@@ -33,20 +33,13 @@ type jobPayload struct {
 //
 // Unlike memq it is durable, at-least-once and multi-process: a crash redelivers
 // in-flight jobs rather than losing them. At-least-once REQUIRES idempotency to
-// avoid double-writes on redelivery — and that guarantee is currently only
-// PARTIAL:
-//
-//   - Within a single live process the Sink/audit dedupe by JobID via an
-//     in-memory `seen` map (internal/result/jsonl.go, internal/audit/audit.go —
-//     both documented SINGLE-WRITER ONLY).
-//   - Across a crash/restart or a second replica that `seen` map starts empty,
-//     so a redelivered job (e.g. worker died after the Sink write but before the
-//     ack) CAN double-write: a duplicate result line AND a duplicate audit-chain
-//     seq, which breaks the tamper-evident "each job recorded once" property.
-//
-// Cross-process once-only is therefore NOT yet guaranteed. The fix is persistent
-// dedup (a redis SETNX `job:<id>` guard, or asynq Retention + a completed-check)
-// and is tracked with the §L multi-replica work — see the follow-up issue.
+// avoid double-writes on redelivery. The in-memory Sink/audit `seen` maps dedupe
+// only within one live process; cross-process once-only (a redelivery landing on
+// a fresh process or a second replica) is provided by the pipeline's Deduper
+// gate — a Redis SETNX `vismod:done:<id>` claim committed after the Sink+audit
+// writes succeed (internal/dedup, wired for driver=redis in internal/cli). So a
+// redelivery to a fresh process no longer double-writes the result line or the
+// audit-chain seq (§L, issue #9).
 //
 // Per-queue dequeue is FIFO; with >1 worker completion order is not guaranteed
 // (same caveat as memq).

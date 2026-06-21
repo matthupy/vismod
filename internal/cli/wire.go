@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"time"
 
 	"github.com/matthupy/vismod/internal/audit"
 	"github.com/matthupy/vismod/internal/config"
+	"github.com/matthupy/vismod/internal/dedup"
 	"github.com/matthupy/vismod/internal/frames"
 	"github.com/matthupy/vismod/internal/hashmatch"
 	"github.com/matthupy/vismod/internal/moderate"
@@ -17,6 +19,7 @@ import (
 	"github.com/matthupy/vismod/internal/result"
 	"github.com/matthupy/vismod/internal/review"
 	"github.com/matthupy/vismod/pkg/moderation"
+	"github.com/redis/go-redis/v9"
 )
 
 // buildModerator instantiates the single configured adapter, passing an
@@ -93,6 +96,44 @@ func buildPipeline(cfg config.Config, sink result.Sink, log *slog.Logger, metric
 		p.Metrics = metrics
 	}
 	return p, mod, nil
+}
+
+// buildDeduper wires the cross-process dedup gate (§L, issue #9). It returns a
+// non-nil Deduper ONLY for the redis driver — the memory driver is
+// single-process so the in-memory Sink/audit guards already suffice (a nil
+// Deduper). The returned closer releases the Redis client on shutdown.
+func buildDeduper(cfg config.Config, log *slog.Logger) (pipeline.Deduper, func() error, error) {
+	if cfg.Queue.Driver != "redis" {
+		return nil, func() error { return nil }, nil
+	}
+	if cfg.Queue.DedupTTL <= 0 {
+		return nil, nil, fmt.Errorf("serve: queue.dedup_ttl must be > 0 for the redis driver")
+	}
+	// Correctness depends on dedup_ttl OUTLIVING the redelivery window: a claim
+	// that expires while the same job can still be redelivered silently reopens
+	// the double-write this gate exists to close. Backoff is LINEAR — retryDelay
+	// returns (n+1)*RetryBackoff (queue/asynqq.go) — so the true span across all
+	// M attempts is the triangular sum RetryBackoff * M*(M+1)/2, NOT
+	// MaxRetries*RetryBackoff (which undercounts by a factor of (M+1)/2). M*(M+1)/2
+	// is 0 when M=0, which is correct. asynq's own completed-task retention extends
+	// the window further, so this remains a conservative floor, not the full budget.
+	// Warn loudly rather than fail — operators may run a shorter TTL deliberately —
+	// but make the invisible failure mode visible at boot, not when it bites in prod.
+	m := cfg.Queue.MaxRetries
+	if retryBudget := cfg.Queue.RetryBackoff * time.Duration(m*(m+1)/2); cfg.Queue.DedupTTL <= retryBudget {
+		log.Warn("queue.dedup_ttl is below the retry budget; a redelivery after the claim expires can double-write",
+			"dedup_ttl", cfg.Queue.DedupTTL, "retry_budget", retryBudget)
+	}
+	client := redis.NewClient(&redis.Options{Addr: cfg.Queue.RedisAddr})
+	// Validate the deduper's OWN connection at boot. It opens a second pool to the
+	// same Redis the queue uses, but the queue's Pinger does not cover this client
+	// — without this ping a deduper-only connection fault would first surface on
+	// job #1 instead of at startup. Fail closed: a broken dedup path must not run.
+	if err := client.Ping(context.Background()).Err(); err != nil {
+		_ = client.Close()
+		return nil, nil, fmt.Errorf("serve: dedup redis ping: %w", err)
+	}
+	return dedup.NewRedisDeduper(client, cfg.Queue.DedupTTL), client.Close, nil
 }
 
 // redisQueueName is the asynq queue namespace. A single logical queue keeps the
