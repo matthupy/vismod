@@ -34,12 +34,16 @@ type jobPayload struct {
 // Unlike memq it is durable, at-least-once and multi-process: a crash redelivers
 // in-flight jobs rather than losing them. At-least-once REQUIRES idempotency to
 // avoid double-writes on redelivery. The in-memory Sink/audit `seen` maps dedupe
-// only within one live process; cross-process once-only (a redelivery landing on
-// a fresh process or a second replica) is provided by the pipeline's Deduper
-// gate — a Redis SETNX `vismod:done:<id>` claim committed after the Sink+audit
-// writes succeed (internal/dedup, wired for driver=redis in internal/cli). So a
+// only within one live process; cross-process dedup of SEQUENTIAL redelivery (a
+// redelivery landing on a fresh process or a second replica AFTER the first
+// finished) is provided by the pipeline's Deduper gate — a Redis SETNX
+// `vismod:done:<id>` claim committed after the Sink+audit writes succeed
+// (internal/dedup, wired for driver=redis in internal/cli). So a sequential
 // redelivery to a fresh process no longer double-writes the result line or the
-// audit-chain seq (§L, issue #9).
+// audit-chain seq (§L, issue #9). The gate gives ordering, not mutual exclusion:
+// a genuinely CONCURRENT second worker (and a crash strictly between the writes
+// and the claim) is a known, accepted v1 residual — see internal/dedup/redis.go
+// for the SETNX-lease hardening seam that would close it.
 //
 // Per-queue dequeue is FIFO; with >1 worker completion order is not guaranteed
 // (same caveat as memq).
