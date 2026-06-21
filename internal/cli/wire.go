@@ -98,6 +98,10 @@ func buildPipeline(cfg config.Config, sink result.Sink, log *slog.Logger, metric
 	return p, mod, nil
 }
 
+// dedupPingTimeout bounds the deduper's boot ping so a dropped (not refused)
+// Redis connection cannot hang serve startup indefinitely.
+const dedupPingTimeout = 5 * time.Second
+
 // buildDeduper wires the cross-process dedup gate (§L, issue #9). It returns a
 // non-nil Deduper ONLY for the redis driver — the memory driver is
 // single-process so the in-memory Sink/audit guards already suffice (a nil
@@ -129,7 +133,12 @@ func buildDeduper(cfg config.Config, log *slog.Logger) (pipeline.Deduper, func()
 	// same Redis the queue uses, but the queue's Pinger does not cover this client
 	// — without this ping a deduper-only connection fault would first surface on
 	// job #1 instead of at startup. Fail closed: a broken dedup path must not run.
-	if err := client.Ping(context.Background()).Err(); err != nil {
+	// Bound the ping: a REFUSED connection fails fast, but a DROPPED one
+	// (firewall/blackhole) would hang boot indefinitely under context.Background().
+	// A bounded context fails closed within a known window instead of wedging serve.
+	pingCtx, cancel := context.WithTimeout(context.Background(), dedupPingTimeout)
+	defer cancel()
+	if err := client.Ping(pingCtx).Err(); err != nil {
 		_ = client.Close()
 		return nil, nil, fmt.Errorf("serve: dedup redis ping: %w", err)
 	}
