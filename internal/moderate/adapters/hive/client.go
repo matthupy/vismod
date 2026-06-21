@@ -11,6 +11,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 
 	"golang.org/x/time/rate"
@@ -57,7 +58,12 @@ type client struct {
 	limiter    *rate.Limiter
 	maxRetries int
 	backoff    time.Duration
-	rng        *rand.Rand // backoff jitter source; nil disables jitter (tests)
+
+	// rngMu guards rng: one client is shared across worker goroutines and
+	// math/rand/v2 *Rand is not goroutine-safe, so concurrent retries-with-jitter
+	// would race on the PCG state.
+	rngMu sync.Mutex
+	rng   *rand.Rand // backoff jitter source; nil disables jitter (tests)
 }
 
 // newClient constructs a Hive client. A nil rng disables backoff jitter (used by
@@ -230,7 +236,10 @@ func (c *client) applyJitter(d time.Duration) time.Duration {
 		return d
 	}
 	half := d / 2
-	return half + time.Duration(c.rng.Int64N(int64(half)+1))
+	c.rngMu.Lock()
+	j := c.rng.Int64N(int64(half) + 1)
+	c.rngMu.Unlock()
+	return half + time.Duration(j)
 }
 
 // parseRetryAfter reads the Retry-After header (delta-seconds or HTTP-date),

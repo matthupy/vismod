@@ -122,11 +122,13 @@ func (h *hive) AnalyzeImage(ctx context.Context, img moderation.Image) (moderati
 		return moderation.NormalizedResult{}, err
 	}
 
-	// One image -> one status entry -> one output frame. An empty output is an
-	// unexpected provider state: treat as could-not-evaluate (fail-safe), never a
-	// clean frame.
+	// One image -> one status entry -> one output frame. An empty output OR an
+	// empty class list is an unexpected provider state (Hive always returns the
+	// full head bank, even for a clean image): treat as could-not-evaluate
+	// (fail-safe), never a clean frame. Without this, output{classes:[]} would
+	// normalize to zero categories and emit as a clean OK frame.
 	classes, ok := firstOutputClasses(resp)
-	if !ok {
+	if !ok || len(classes) == 0 {
 		return moderation.NormalizedResult{}, fmt.Errorf("hive: empty output (provider returned no analysis)")
 	}
 

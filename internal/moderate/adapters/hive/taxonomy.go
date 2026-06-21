@@ -156,9 +156,13 @@ var classTaxonomy = map[string]classInfo{
 	"yes_emaciated_body":  pos("emaciated", moderation.CategorySelfHarm),
 	"no_emaciated_body":   neg("emaciated"),
 
-	// Child-safety head is a high-level harm flag; route to OTHER's sibling? It is
-	// genuinely harm but has no dedicated canonical category, so it maps to OTHER
-	// (never dropped) with the head's label preserved.
+	// Child-safety is a high-consequence harm flag but the canonical taxonomy has
+	// no dedicated category for it yet (adding one is a cross-adapter contract
+	// change, out of scope here). Intentionally mapped to OTHER: it is preserved
+	// with the head's label, and because OTHER heads are emitted per-head (never
+	// max-collapsed, see normalize.go stage 2) it can never be dropped by a louder
+	// OTHER signal such as gambling. Hash-based CSAM divert (M4) is a separate
+	// pre-stage on CSAM_HASH_MATCH and is unaffected by this classifier mapping.
 	"yes_child_safety": pos("child_safety", moderation.CategoryOther),
 	"no_child_safety":  neg("child_safety"),
 

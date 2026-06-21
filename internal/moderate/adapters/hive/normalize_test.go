@@ -130,6 +130,37 @@ func TestNormalize_UnknownClassFallsBackToOther(t *testing.T) {
 	}
 }
 
+func TestNormalize_DistinctOtherHeadsBothSurvive(t *testing.T) {
+	// OTHER is a catch-all for semantically UNRELATED harms (child_safety vs
+	// gambling). Unlike WEAPONS (gun vs knife = same concept, max is right), OTHER
+	// heads must NOT max-collapse — the lower signal would be silently dropped.
+	// Both must emit their own row, each labeled with its own head.
+	classes := []hiveClass{
+		{Class: "yes_child_safety", Score: 0.40}, {Class: "no_child_safety", Score: 0.60},
+		{Class: "yes_gambling", Score: 0.60}, {Class: "no_gambling", Score: 0.40},
+	}
+	got := normalize(classes)
+
+	child := findCat(got, moderation.CategoryOther, "yes_child_safety")
+	if child == nil || *child.Score != 0.40 {
+		t.Fatalf("child_safety OTHER row must survive at 0.40; got %+v", got)
+	}
+	gambling := findCat(got, moderation.CategoryOther, "yes_gambling")
+	if gambling == nil || *gambling.Score != 0.60 {
+		t.Fatalf("gambling OTHER row must survive at 0.60; got %+v", got)
+	}
+	// Exactly two OTHER rows — neither folded into the other.
+	var others int
+	for _, r := range got {
+		if r.Category == moderation.CategoryOther {
+			others++
+		}
+	}
+	if others != 2 {
+		t.Errorf("want 2 distinct OTHER rows, got %d: %+v", others, got)
+	}
+}
+
 func TestNormalize_OmitsZeroEvidenceCategories(t *testing.T) {
 	// Hive returns EVERY class on every call, so a clean image carries dozens of
 	// positive classes at score ~0. A zero-evidence category ("not present") must

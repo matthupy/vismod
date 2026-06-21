@@ -64,7 +64,11 @@ type catAcc struct {
 //     positive classes are mutually-exclusive sub-states of "the thing is
 //     present", so their probabilities add up to P(present) = 1 - negative.
 //  2. Per category: take the MAX head mass across heads mapping to it (the most
-//     confident independent signal — gun vs knife both say WEAPONS).
+//     confident independent signal — gun vs knife both say WEAPONS). OTHER is
+//     EXEMPT: it is a catch-all for semantically unrelated harms (child_safety
+//     vs gambling vs unknown-future classes), so its heads each emit their own
+//     row rather than max-collapsing — folding them would silently drop the
+//     lower signal.
 //  3. Unknown classes bypass both stages and emit directly as OTHER so a future
 //     Hive class is never silently dropped (spec §E fallback discipline).
 //
@@ -102,14 +106,21 @@ func normalize(classes []hiveClass) []moderation.CategoryResult {
 		}
 	}
 
-	// Stage 2: reduce heads to one row per category by max mass.
+	// Stage 2: reduce heads to one row per category by max mass. OTHER is exempt
+	// (see doc comment): each OTHER head emits its own row so unrelated harms
+	// (child_safety, gambling, ...) never collapse into a single max signal —
+	// parallel to how unknown classes above each emit a distinct OTHER row.
 	perCat := map[moderation.Category]*catAcc{}
 	for key, acc := range headSums {
+		if key.cat == moderation.CategoryOther {
+			if acc.mass > epsilon {
+				out = append(out, categoryResult(moderation.CategoryOther, acc.topLabel, acc.mass))
+			}
+			continue
+		}
 		cur := perCat[key.cat]
 		if cur == nil || acc.mass > cur.mass {
-			// Copy so later mutation of the source map entry can't alias.
-			a := *acc
-			perCat[key.cat] = &a
+			perCat[key.cat] = acc
 		}
 	}
 	for cat, acc := range perCat {

@@ -112,6 +112,23 @@ func TestAnalyzeImage_EmptyOutputIsFailSafeError(t *testing.T) {
 	}
 }
 
+func TestAnalyzeImage_EmptyClassesIsFailSafeError(t *testing.T) {
+	// An output frame present but carrying an empty class list is also an
+	// unexpected state (Hive always returns the full head bank). Without the
+	// len(classes)==0 guard it would normalize to zero categories and leak out as
+	// a clean OK frame instead of could-not-evaluate (fail-safe symmetry).
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"status":[{"response":{"output":[{"time":0,"classes":[]}]}}]}`)
+	}))
+	defer srv.Close()
+
+	m, _ := New(cfgWith(srv.URL, map[string]string{"HIVE_TOKEN": "tok"}))
+	_, err := m.AnalyzeImage(context.Background(), moderation.Image{Bytes: []byte("png"), MIME: "image/png"})
+	if err == nil {
+		t.Fatal("empty class list must yield an error, never an allow")
+	}
+}
+
 func TestAnalyzeImage_RejectsUnsupportedMIME(t *testing.T) {
 	m, _ := New(cfgWith("https://x", map[string]string{"HIVE_TOKEN": "tok"}))
 	_, err := m.AnalyzeImage(context.Background(), moderation.Image{Bytes: []byte("x"), MIME: "image/tiff"})

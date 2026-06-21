@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"io"
+	"math/rand/v2"
 	"mime"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -120,6 +122,22 @@ func TestClient_Analyze_TerminalOn4xxNoRetry(t *testing.T) {
 	if !errors.As(err, &ce) || ce.ErrorCode() == "" {
 		t.Errorf("error must expose a non-empty code, got %v", err)
 	}
+}
+
+func TestClient_ApplyJitter_ConcurrentNoRace(t *testing.T) {
+	// One client is shared across worker goroutines and math/rand/v2 *Rand is not
+	// goroutine-safe, so concurrent retries-with-jitter would race on PCG state.
+	// This test only fails the build under `go test -race` (CI Linux); it locks
+	// the rngMu guard in applyJitter against regression.
+	c := newClient("https://x", "tok", 1, 1, time.Second,
+		rand.New(rand.NewPCG(1, 2)))
+	var wg sync.WaitGroup
+	for range 64 {
+		wg.Go(func() {
+			_ = c.applyJitter(time.Second)
+		})
+	}
+	wg.Wait()
 }
 
 func TestClient_Analyze_ExhaustsRetriesOn5xx(t *testing.T) {
