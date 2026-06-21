@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -196,4 +197,19 @@ func TestApplyJitterWithinBounds(t *testing.T) {
 	if got := c.retryWait(1, &apiError{Retryable: true, retryAfter: 3 * time.Second}); got != 3*time.Second {
 		t.Fatalf("retryWait honoring Retry-After = %v, want exact 3s", got)
 	}
+}
+
+// One client is shared across worker goroutines and math/rand/v2 *Rand is not
+// goroutine-safe, so concurrent retries-with-jitter would race on PCG state.
+// This test only fails the build under `go test -race` (CI Linux); it locks the
+// rngMu guard in applyJitter against regression.
+func TestApplyJitterConcurrentNoRace(t *testing.T) {
+	c := &client{backoff: time.Second, rng: rand.New(rand.NewPCG(1, 2))}
+	var wg sync.WaitGroup
+	for range 64 {
+		wg.Go(func() {
+			_ = c.applyJitter(time.Second)
+		})
+	}
+	wg.Wait()
 }
