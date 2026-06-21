@@ -1,8 +1,11 @@
 package hive
 
 import (
+	"bytes"
+	"encoding/json"
 	"slices"
 	"sort"
+	"strconv"
 
 	"github.com/matthupy/vismod/pkg/moderation"
 )
@@ -16,8 +19,51 @@ type hiveResponse struct {
 }
 
 type hiveStatus struct {
+	// Status is the PER-TASK outcome. Hive can return HTTP 200 with a task-level
+	// failure here (non-zero code, empty output). Decoded best-effort: the error
+	// wire schema is not strongly documented, so an absent/zero code reads as
+	// success and the normal output path runs.
+	Status   hiveTaskStatus    `json:"status"`
 	Response hiveModelResponse `json:"response"`
 }
+
+// hiveTaskStatus is the per-task status object (status[].status). Code 0 (or
+// absent) is success; any non-zero code is a task failure that AnalyzeImage
+// surfaces as a CodedError. Code is decoded leniently (Hive may send it as a
+// JSON number or string).
+type hiveTaskStatus struct {
+	Code    hiveStatusCode `json:"code"`
+	Message string         `json:"message"`
+}
+
+// hiveStatusCode tolerates a numeric or string "code" (or its absence). A failed
+// decode leaves it zero — best-effort, never a hard parse error (mirrors the
+// opportunistic hiveErrorResponse decode in client.go).
+type hiveStatusCode struct {
+	val int
+	set bool
+}
+
+func (c *hiveStatusCode) UnmarshalJSON(b []byte) error {
+	b = bytes.TrimSpace(b)
+	if len(b) == 0 || string(b) == "null" {
+		return nil
+	}
+	s := string(bytes.Trim(b, `"`)) // accept both 3 and "3"
+	if s == "" {
+		return nil
+	}
+	if n, err := strconv.Atoi(s); err == nil {
+		c.val, c.set = n, true
+	}
+	return nil // unparseable -> leave zero (best-effort)
+}
+
+func (c hiveStatusCode) nonZero() bool { return c.set && c.val != 0 }
+
+func (c hiveStatusCode) String() string { return strconv.Itoa(c.val) }
+
+var _ json.Unmarshaler = (*hiveStatusCode)(nil)
 
 type hiveModelResponse struct {
 	Output []hiveOutput `json:"output"`

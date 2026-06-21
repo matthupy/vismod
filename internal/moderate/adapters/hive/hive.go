@@ -17,6 +17,7 @@ import (
 	"context"
 	"fmt"
 	"math/rand/v2"
+	"net/http"
 	"time"
 
 	"github.com/matthupy/vismod/internal/moderate"
@@ -122,6 +123,15 @@ func (h *hive) AnalyzeImage(ctx context.Context, img moderation.Image) (moderati
 		return moderation.NormalizedResult{}, err
 	}
 
+	// HTTP 200 can still carry a PER-TASK failure (non-zero status[].status.code,
+	// empty output). Surface it as a CodedError so observability can label
+	// vismod_adapter_errors_total{code} and tell a provider task failure apart from
+	// a genuinely empty frame — both fail-safe (error, never allow), but they are
+	// different operational events.
+	if err := taskStatusError(resp); err != nil {
+		return moderation.NormalizedResult{}, err
+	}
+
 	// One image -> one status entry -> one output frame. An empty output OR an
 	// empty class list is an unexpected provider state (Hive always returns the
 	// full head bank, even for a clean image): treat as could-not-evaluate
@@ -129,7 +139,7 @@ func (h *hive) AnalyzeImage(ctx context.Context, img moderation.Image) (moderati
 	// normalize to zero categories and emit as a clean OK frame.
 	classes, ok := firstOutputClasses(resp)
 	if !ok || len(classes) == 0 {
-		return moderation.NormalizedResult{}, fmt.Errorf("hive: empty output (provider returned no analysis)")
+		return moderation.NormalizedResult{}, &apiError{Status: http.StatusOK, Code: "empty_output", Message: "provider returned no analysis"}
 	}
 
 	return moderation.NormalizedResult{
@@ -141,6 +151,25 @@ func (h *hive) AnalyzeImage(ctx context.Context, img moderation.Image) (moderati
 			Categories:   normalize(classes),
 		}},
 	}, nil
+}
+
+// taskStatusError returns a coded error when the first status entry reports a
+// non-zero per-task code (an HTTP-200 task failure), else nil. The code is
+// task_<n> so it stays distinct from transport codes (network/decode/http_<n>)
+// and from empty_output in vismod_adapter_errors_total{code}.
+func taskStatusError(resp hiveResponse) error {
+	if len(resp.Status) == 0 {
+		return nil
+	}
+	st := resp.Status[0].Status
+	if !st.Code.nonZero() {
+		return nil
+	}
+	msg := st.Message
+	if msg == "" {
+		msg = "provider task failed"
+	}
+	return &apiError{Status: http.StatusOK, Code: "task_" + st.Code.String(), Message: msg}
 }
 
 // firstOutputClasses extracts the first frame's class list, reporting ok=false

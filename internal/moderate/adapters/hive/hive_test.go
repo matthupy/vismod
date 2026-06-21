@@ -2,6 +2,7 @@ package hive
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -126,6 +127,35 @@ func TestAnalyzeImage_EmptyClassesIsFailSafeError(t *testing.T) {
 	_, err := m.AnalyzeImage(context.Background(), moderation.Image{Bytes: []byte("png"), MIME: "image/png"})
 	if err == nil {
 		t.Fatal("empty class list must yield an error, never an allow")
+	}
+}
+
+func TestAnalyzeImage_TaskErrorCarriesCodedError(t *testing.T) {
+	// Hive /task/sync can return HTTP 200 with a per-task FAILURE: a non-zero
+	// status[].status.code and empty output. This still fail-safes (empty output ->
+	// error), but it must surface a CodedError so vismod_adapter_errors_total{code}
+	// can distinguish a provider task failure from a genuinely empty frame — not
+	// collapse to the generic "empty output" string.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"status":[{"status":{"code":3,"message":"unsupported media"},"response":{"output":[]}}]}`)
+	}))
+	defer srv.Close()
+
+	m, _ := New(cfgWith(srv.URL, map[string]string{"HIVE_TOKEN": "tok"}))
+	_, err := m.AnalyzeImage(context.Background(), moderation.Image{Bytes: []byte("png"), MIME: "image/png"})
+	if err == nil {
+		t.Fatal("non-zero task status must yield an error, never an allow")
+	}
+	var ce moderation.CodedError
+	if !errors.As(err, &ce) {
+		t.Fatalf("task failure must surface a CodedError, got %T: %v", err, err)
+	}
+	if ce.ErrorCode() == "" {
+		t.Error("task-failure code must be non-empty (drives vismod_adapter_errors_total{code})")
+	}
+	// Must be distinguishable from a generic empty-frame state.
+	if ce.ErrorCode() == "empty_output" {
+		t.Errorf("task failure code must differ from a genuine empty frame, got %q", ce.ErrorCode())
 	}
 }
 
