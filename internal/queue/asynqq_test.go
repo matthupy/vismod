@@ -2,6 +2,7 @@ package queue
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
+	"github.com/hibiken/asynq"
 	"github.com/matthupy/vismod/internal/result"
 	"github.com/matthupy/vismod/pkg/moderation"
 )
@@ -259,6 +261,34 @@ func TestAsynqQueue_QueueDepthCountsPending(t *testing.T) {
 	}
 	if n != 3 {
 		t.Fatalf("QueueDepth = %d, want 3", n)
+	}
+}
+
+// QueueDepth counts the whole outstanding backlog, not only Pending. A task
+// scheduled for the future sits in Scheduled (never Pending); counting only
+// Pending would undercount the backlog to 0. Regression guard for the retry-storm
+// undercount fix.
+func TestAsynqQueue_QueueDepthCountsScheduled(t *testing.T) {
+	q := newTestAsynqQueue(t, QueueConfig{Workers: 1, MaxRetries: 1})
+	ctx := context.Background()
+
+	// No Start() => nothing dequeues. Schedule a task into the future so it lands
+	// in the Scheduled state rather than Pending.
+	payload, err := json.Marshal(jobPayload{ID: "sched-1", Source: moderation.Source{Kind: "file", Ref: "x.jpg"}})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if _, err := q.client.EnqueueContext(ctx, asynq.NewTask(taskType, payload),
+		asynq.Queue(q.qname), asynq.TaskID("sched-1"), asynq.ProcessIn(time.Hour)); err != nil {
+		t.Fatalf("schedule enqueue: %v", err)
+	}
+
+	n, err := q.QueueDepth(ctx)
+	if err != nil {
+		t.Fatalf("QueueDepth: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("QueueDepth = %d, want 1 (scheduled task must count toward backlog)", n)
 	}
 }
 

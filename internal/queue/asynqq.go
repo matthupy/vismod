@@ -32,10 +32,24 @@ type jobPayload struct {
 // asynqQueue is the Redis-backed FIFO queue driver (M5).
 //
 // Unlike memq it is durable, at-least-once and multi-process: a crash redelivers
-// in-flight jobs rather than losing them. At-least-once REQUIRES idempotency —
-// the Sink and audit append are idempotent per JobID, so redelivery never
-// double-writes. Per-queue dequeue is FIFO; with >1 worker completion order is
-// not guaranteed (same caveat as memq).
+// in-flight jobs rather than losing them. At-least-once REQUIRES idempotency to
+// avoid double-writes on redelivery — and that guarantee is currently only
+// PARTIAL:
+//
+//   - Within a single live process the Sink/audit dedupe by JobID via an
+//     in-memory `seen` map (internal/result/jsonl.go, internal/audit/audit.go —
+//     both documented SINGLE-WRITER ONLY).
+//   - Across a crash/restart or a second replica that `seen` map starts empty,
+//     so a redelivered job (e.g. worker died after the Sink write but before the
+//     ack) CAN double-write: a duplicate result line AND a duplicate audit-chain
+//     seq, which breaks the tamper-evident "each job recorded once" property.
+//
+// Cross-process once-only is therefore NOT yet guaranteed. The fix is persistent
+// dedup (a redis SETNX `job:<id>` guard, or asynq Retention + a completed-check)
+// and is tracked with the §L multi-replica work — see the follow-up issue.
+//
+// Per-queue dequeue is FIFO; with >1 worker completion order is not guaranteed
+// (same caveat as memq).
 type asynqQueue struct {
 	cfg       QueueConfig
 	log       *slog.Logger
@@ -64,6 +78,15 @@ func NewAsynqQueue(cfg QueueConfig, redisAddr, qname string, log *slog.Logger) (
 	}
 	if log == nil {
 		log = slog.Default()
+	}
+	if cfg.DeadLetterMax > 0 {
+		// memq enforces DeadLetterMax as enqueue backpressure (ErrDeadLetterFull,
+		// never drop). The asynq driver does NOT: archived/dead-lettered tasks
+		// live in Redis and are bounded by asynq Retention + ops, not this cap.
+		// Warn so a configured safety cap is not silently swallowed.
+		log.Warn("queue: deadletter_max is not enforced under the redis driver; "+
+			"archive depth is bounded by asynq retention/ops, not this cap",
+			"deadletter_max", cfg.DeadLetterMax)
 	}
 	opt := asynq.RedisClientOpt{Addr: redisAddr}
 	return &asynqQueue{
@@ -146,7 +169,11 @@ func (q *asynqQueue) Start(ctx context.Context, handler Handler) error {
 		return fmt.Errorf("queue: start server: %w", err)
 	}
 
-	// Cancelling the worker ctx stops pulling new work (drain in-flight via Close).
+	// Cancelling the worker ctx stops pulling new work (drain in-flight via Close),
+	// mirroring memq's start-ctx semantics. This is intentionally redundant with
+	// Close: Close calls srv.Shutdown() (= Stop + wait). asynq's Stop is
+	// idempotent, so whichever fires first, the second is a harmless no-op. If ctx
+	// is never cancelled the goroutine simply blocks until Close stops the server.
 	go func() {
 		<-ctx.Done()
 		q.srv.Stop()
@@ -204,8 +231,8 @@ func (q *asynqQueue) invoke(ctx context.Context, handler Handler, j Job) (disp D
 // (retries exhausted, or SkipRetry) it writes the could-not-evaluate error
 // envelope to the DeadLetter sink — mirroring memq's dead-letter behavior so the
 // driver swap is behavior-preserving. asynq independently archives the task
-// (DeadLetterDepth). The Sink is idempotent per JobID, so a redelivered failure
-// never double-writes.
+// (DeadLetterDepth). The Sink dedupes per JobID within a live process; across a
+// crash/restart or replica that is not yet guaranteed (see asynqQueue doc).
 func (q *asynqQueue) onError(ctx context.Context, t *asynq.Task, err error) {
 	retried, _ := asynq.GetRetryCount(ctx)
 	maxRetry, _ := asynq.GetMaxRetry(ctx)
@@ -275,9 +302,12 @@ func (q *asynqQueue) Close(ctx context.Context) error {
 	return nil
 }
 
-// QueueDepth returns the number of pending (not-yet-started) tasks — the redis
-// analogue of memq's buffered length. A missing queue (nothing enqueued yet)
-// reports 0, not an error.
+// QueueDepth returns the outstanding backlog — the redis analogue of memq's
+// buffered length. It sums every not-yet-completed state (Pending + Active +
+// Scheduled + Retry) so the gauge does not undercount during a retry storm,
+// when work sits in Retry/Scheduled rather than Pending. Archived (dead-lettered)
+// is excluded — that is terminal and reported by DeadLetterDepth. A missing queue
+// (nothing enqueued yet) reports 0, not an error.
 func (q *asynqQueue) QueueDepth(_ context.Context) (int, error) {
 	info, err := q.inspector.GetQueueInfo(q.qname)
 	if err != nil {
@@ -286,7 +316,7 @@ func (q *asynqQueue) QueueDepth(_ context.Context) (int, error) {
 		}
 		return 0, fmt.Errorf("queue: depth: %w", err)
 	}
-	return info.Pending, nil
+	return info.Pending + info.Active + info.Scheduled + info.Retry, nil
 }
 
 // DeadLetterDepth returns the number of archived (dead-lettered) tasks, for the
