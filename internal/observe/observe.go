@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"maps"
 	"net/http"
 	"os"
 	"sync/atomic"
@@ -53,8 +54,17 @@ type ReadyDetail struct {
 type Health struct {
 	ready  atomic.Bool
 	detail atomic.Pointer[ReadyDetail]
+	probe  atomic.Pointer[readinessProbe]
 	srv    *http.Server
 	mux    *http.ServeMux
+}
+
+// readinessProbe is a named live dependency check (e.g. "redis"). When set,
+// /readyz runs it on every request so a dependency outage flips readiness
+// (§F.2/§F.5) rather than reporting a stale boot-time verdict.
+type readinessProbe struct {
+	name string
+	fn   func(context.Context) error
 }
 
 // NewHealth builds the health server bound to addr. If reg is non-nil, /metrics
@@ -68,11 +78,8 @@ func NewHealth(addr string, log *slog.Logger, reg *prometheus.Registry) *Health 
 		_, _ = w.Write([]byte("ok"))
 	})
 
-	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
-		d := h.detail.Load()
-		if d == nil {
-			d = &ReadyDetail{Ready: h.ready.Load()}
-		}
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+		d := h.evaluateReadiness(r.Context())
 		code := http.StatusOK
 		if !d.Ready {
 			code = http.StatusServiceUnavailable
@@ -107,6 +114,44 @@ func (h *Health) SetReady(ready bool) {
 func (h *Health) SetReadyDetail(d ReadyDetail) {
 	h.ready.Store(d.Ready)
 	h.detail.Store(&d)
+}
+
+// SetReadinessProbe registers a named live dependency check that /readyz runs on
+// every request (e.g. a Redis PING). A failing probe forces /readyz to 503 with
+// the failure reason in Checks[name], even if the stored boot detail said ready.
+func (h *Health) SetReadinessProbe(name string, fn func(context.Context) error) {
+	h.probe.Store(&readinessProbe{name: name, fn: fn})
+}
+
+// evaluateReadiness builds the /readyz body: the stored boot detail, overlaid
+// with the live probe result. A nil stored detail falls back to the ready flag.
+func (h *Health) evaluateReadiness(ctx context.Context) ReadyDetail {
+	stored := h.detail.Load()
+	var d ReadyDetail
+	if stored != nil {
+		d = *stored
+	} else {
+		d.Ready = h.ready.Load()
+	}
+
+	p := h.probe.Load()
+	if p == nil {
+		return d
+	}
+
+	// Copy Checks so the live overlay never mutates the stored detail.
+	checks := make(map[string]string, len(d.Checks)+1)
+	maps.Copy(checks, d.Checks)
+	pctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	if err := p.fn(pctx); err != nil {
+		checks[p.name] = err.Error()
+		d.Ready = false
+	} else {
+		checks[p.name] = "ok"
+	}
+	d.Checks = checks
+	return d
 }
 
 // Start serves in a background goroutine.

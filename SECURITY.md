@@ -98,5 +98,14 @@ vismod is security-critical and **fails safe, never silent**:
 
 The Docker image runs **non-root**, ships only `ffmpeg`+`ffprobe` plus the static
 binary, uses a writable ephemeral `frames.workdir` (so a read-only rootfs still
-works), and drains on `SIGTERM`. Durable queue payloads and operator UIs (M5)
-must carry opaque refs only and be access-controlled.
+works), and drains on `SIGTERM`.
+
+## Durable queue payloads (`driver=redis`, §D.3/§G.2)
+
+The Redis (asynq) driver serializes only **opaque IDs/refs** into Redis — the job
+ID, source kind, and source `Ref` (a file path/URI). It **never** writes media
+bytes, `Raw` free-text, OCR, or captions into a task payload. Any operator UI over
+the same Redis (e.g. `asynqmon`) inherits this property but **must still be
+access-controlled** — it exposes source paths and verdict metadata. Redis is the
+durability SPOF: a Redis outage flips `/readyz` to not-ready (backpressure) rather
+than accepting jobs the system cannot durably hold.

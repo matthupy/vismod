@@ -186,3 +186,14 @@ func TestExampleConfigLoads(t *testing.T) {
 		t.Fatalf("config.example.yaml failed to load: %v", err)
 	}
 }
+
+func TestRedisDriverRequiresAddr(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "c.yaml")
+	if err := os.WriteFile(path, []byte("queue:\n  driver: redis\n  redis_addr: \"\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("redis driver with empty redis_addr must fail validation")
+	}
+}

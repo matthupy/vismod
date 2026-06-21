@@ -130,7 +130,11 @@ func (c Config) validate() error {
 		return fmt.Errorf("config: adapter.name is required")
 	}
 	switch c.Queue.Driver {
-	case "memory", "redis":
+	case "memory":
+	case "redis":
+		if c.Queue.RedisAddr == "" {
+			return fmt.Errorf("config: queue.redis_addr is required when queue.driver=redis")
+		}
 	default:
 		return fmt.Errorf("config: queue.driver must be memory|redis, got %q", c.Queue.Driver)
 	}

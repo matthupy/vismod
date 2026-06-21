@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 
@@ -12,6 +13,7 @@ import (
 	"github.com/matthupy/vismod/internal/moderate"
 	"github.com/matthupy/vismod/internal/observe"
 	"github.com/matthupy/vismod/internal/pipeline"
+	"github.com/matthupy/vismod/internal/queue"
 	"github.com/matthupy/vismod/internal/result"
 	"github.com/matthupy/vismod/internal/review"
 	"github.com/matthupy/vismod/pkg/moderation"
@@ -91,6 +93,48 @@ func buildPipeline(cfg config.Config, sink result.Sink, log *slog.Logger, metric
 		p.Metrics = metrics
 	}
 	return p, mod, nil
+}
+
+// redisQueueName is the asynq queue namespace. A single logical queue keeps the
+// FIFO contract simple; per-model-version namespacing is an M5 multi-replica
+// concern (§L).
+const redisQueueName = "vismod"
+
+// memqDurabilityWarning surfaces the memq durability boundary (§D.3) on /readyz
+// and at boot so an operator never mistakes the dev queue for production intake.
+const memqDurabilityWarning = "queue driver=memory is non-durable, single-process (dev/CLI only); use driver=redis for production intake"
+
+// buildQueue constructs the configured queue driver behind the DepthReporter
+// interface (so serve wires depth metrics uniformly) and returns any durability
+// warnings to surface. The memq->asynq swap is behavior-preserving: the same
+// handler Disposition yields the same retry/DLQ outcome on both drivers.
+func buildQueue(cfg config.Config, dlq result.Sink, log *slog.Logger) (queue.DepthReporter, []string, error) {
+	qc := queue.QueueConfig{
+		Workers:       cfg.Queue.Workers,
+		Buffer:        cfg.Queue.Buffer,
+		MaxRetries:    cfg.Queue.MaxRetries,
+		RetryBackoff:  cfg.Queue.RetryBackoff,
+		DrainTimeout:  cfg.Queue.DrainTimeout,
+		JobTimeout:    cfg.Queue.JobTimeout,
+		DeadLetterMax: cfg.Queue.DeadLetterMax,
+		DeadLetter:    dlq,
+	}
+	switch cfg.Queue.Driver {
+	case "memory":
+		q, err := queue.NewMemQueue(qc, log)
+		if err != nil {
+			return nil, nil, err
+		}
+		return q, []string{memqDurabilityWarning}, nil
+	case "redis":
+		q, err := queue.NewAsynqQueue(qc, cfg.Queue.RedisAddr, redisQueueName, log)
+		if err != nil {
+			return nil, nil, err
+		}
+		return q, nil, nil
+	default:
+		return nil, nil, fmt.Errorf("serve: unsupported queue.driver %q", cfg.Queue.Driver)
+	}
 }
 
 // loadConfigAndLogger is the shared command bootstrap.

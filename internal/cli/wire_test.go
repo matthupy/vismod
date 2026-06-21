@@ -8,10 +8,12 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/alicebob/miniredis/v2"
 	"github.com/matthupy/videosift"
 	"github.com/matthupy/vismod/internal/config"
 	"github.com/matthupy/vismod/internal/frames"
 	"github.com/matthupy/vismod/internal/observe"
+	"github.com/matthupy/vismod/internal/queue"
 	"github.com/matthupy/vismod/internal/result"
 	"github.com/matthupy/vismod/pkg/moderation"
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -99,5 +101,49 @@ func TestProbeFrameSourceMissingBinaries(t *testing.T) {
 	}
 	if !errors.Is(err, videosift.ErrNoBinaries) {
 		t.Errorf("err = %v, want errors.Is ErrNoBinaries", err)
+	}
+}
+
+// buildQueue must select the redis driver, returning a Pinger-capable
+// DepthReporter (so serve can boot-validate + register the readiness probe) and
+// NO memq durability warning.
+func TestBuildQueueRedisDriver(t *testing.T) {
+	mr := miniredis.RunT(t)
+	cfg := config.Config{Queue: config.QueueConfig{
+		Driver:    "redis",
+		Workers:   2,
+		RedisAddr: mr.Addr(),
+	}}
+	q, warnings, err := buildQueue(cfg, result.NewJSONLSink(&strings.Builder{}), observe.NewLogger("error"))
+	if err != nil {
+		t.Fatalf("buildQueue(redis): %v", err)
+	}
+	defer q.Close(context.Background())
+
+	if len(warnings) != 0 {
+		t.Errorf("redis driver warnings = %v, want none (durability is the memq concern)", warnings)
+	}
+	pinger, ok := q.(queue.Pinger)
+	if !ok {
+		t.Fatal("redis driver must implement queue.Pinger for boot/readiness validation")
+	}
+	if err := pinger.Ping(context.Background()); err != nil {
+		t.Fatalf("Ping against live miniredis: %v", err)
+	}
+}
+
+// buildQueue memory driver carries the durability warning.
+func TestBuildQueueMemoryDriverWarns(t *testing.T) {
+	cfg := config.Config{Queue: config.QueueConfig{Driver: "memory", Workers: 1}}
+	q, warnings, err := buildQueue(cfg, result.NewJSONLSink(&strings.Builder{}), observe.NewLogger("error"))
+	if err != nil {
+		t.Fatalf("buildQueue(memory): %v", err)
+	}
+	defer q.Close(context.Background())
+	if len(warnings) == 0 {
+		t.Error("memory driver must surface a durability warning")
+	}
+	if _, ok := q.(queue.Pinger); ok {
+		t.Error("memory driver must NOT implement Pinger (it is in-process)")
 	}
 }

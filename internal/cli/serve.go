@@ -37,10 +37,6 @@ func runServe(cmd *cobra.Command, _ []string) error {
 		return err
 	}
 
-	if cfg.Queue.Driver != "memory" {
-		return fmt.Errorf("serve: queue.driver=%q not supported in v1 (redis is M5)", cfg.Queue.Driver)
-	}
-
 	// Boot validation (§F.2): videosift execs ffmpeg+ffprobe for every video
 	// job. Validate once at boot so a missing binary is a clear operator error,
 	// not a per-job failure surfacing as error-verdict envelopes.
@@ -61,16 +57,7 @@ func runServe(cmd *cobra.Command, _ []string) error {
 	}
 	defer mod.Close()
 
-	q, err := queue.NewMemQueue(queue.QueueConfig{
-		Workers:       cfg.Queue.Workers,
-		Buffer:        cfg.Queue.Buffer,
-		MaxRetries:    cfg.Queue.MaxRetries,
-		RetryBackoff:  cfg.Queue.RetryBackoff,
-		DrainTimeout:  cfg.Queue.DrainTimeout,
-		JobTimeout:    cfg.Queue.JobTimeout,
-		DeadLetterMax: cfg.Queue.DeadLetterMax,
-		DeadLetter:    dlqSink,
-	}, log)
+	q, qWarnings, err := buildQueue(cfg, dlqSink, log)
 	if err != nil {
 		return err
 	}
@@ -91,11 +78,28 @@ func runServe(cmd *cobra.Command, _ []string) error {
 		func() float64 { return float64(q.DeadLetterDepth()) },
 	)
 
-	// DURABILITY WARNING: memory driver is non-durable; a crash loses jobs.
-	const memqWarning = "queue driver=memory is non-durable, single-process (dev/CLI only); use driver=redis for production intake"
-	log.Warn(memqWarning)
+	for _, w := range qWarnings {
+		log.Warn(w)
+	}
 
 	health := observe.NewHealth(cfg.MetricsAddr, log, metrics.Registry())
+
+	// Redis driver boot validation (§F.2): PING fails fast so an unreachable
+	// Redis is a clear operator error, not silently black-holed jobs. The same
+	// ping is registered as a live /readyz probe so a Redis outage flips
+	// readiness (backpressure) instead of accepting jobs it cannot durably hold.
+	checks := map[string]string{"ffmpeg": "ok", "adapter": "ok"}
+	if pinger, ok := q.(queue.Pinger); ok {
+		pingCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err := pinger.Ping(pingCtx)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("serve: redis unreachable at boot (driver=redis): %w", err)
+		}
+		checks["redis"] = "ok"
+		health.SetReadinessProbe("redis", pinger.Ping)
+	}
+
 	health.Start()
 
 	workerCtx, cancelWorkers := context.WithCancel(context.Background())
@@ -103,13 +107,13 @@ func runServe(cmd *cobra.Command, _ []string) error {
 	if err := q.Start(workerCtx, jobHandler(p)); err != nil {
 		return err
 	}
-	// Readiness carries boot-validation detail (§F.2): ffmpeg/ffprobe probed
-	// above, plus the memq non-durability warning (§D.3).
+	// Readiness carries boot-validation detail (§F.2): ffmpeg/ffprobe + adapter
+	// (+ redis when applicable), plus any driver durability warnings (§D.3).
 	health.SetReadyDetail(observe.ReadyDetail{
 		Ready:       true,
 		AdapterName: cfg.Adapter.Name,
-		Checks:      map[string]string{"ffmpeg": "ok", "adapter": "ok"},
-		Warnings:    []string{memqWarning},
+		Checks:      checks,
+		Warnings:    qWarnings,
 	})
 	log.Info("serve ready", "workers", cfg.Queue.Workers, "health_addr", cfg.MetricsAddr)
 

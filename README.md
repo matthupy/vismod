@@ -13,7 +13,8 @@ a review console / rules engine downstream.
 > real `videosift` extractor (M2); the worker ships a Docker image, boot
 > validation, and Prometheus metrics + `/healthz`/`/readyz` (M3); and the
 > tamper-evident audit log, responsible-use/security/licensing docs, and the
-> potential-CSAM divert seam land in M4. Redis/scale is M5. **CSAM detection is NOT
+> potential-CSAM divert seam land in M4; a durable, at-least-once Redis queue
+> (`driver=redis`, asynq-backed) lands in M5. **CSAM detection is NOT
 > implemented (v1.1) — read [RESPONSIBLE_USE.md](RESPONSIBLE_USE.md) before any
 > deployment, and never test against real illegal content.**
 
@@ -89,7 +90,10 @@ The container `HEALTHCHECK` uses the self-contained `vismod healthcheck` subcomm
 - **FIFO is a queue property:** dequeue order == enqueue order. With >1 worker,
   **completion order is not guaranteed** — strict ordering needs `workers=1`.
 - **memq is non-durable, single-process (dev/CLI only).** A crash loses jobs.
-  Production intake will require `driver=redis` (M5).
+  Production intake uses `driver=redis` (M5): durable + at-least-once, deduped per
+  `job_id`. The driver swap is behavior-preserving — the same handler `Disposition`
+  yields the same retry/DLQ outcome on both. A Redis outage flips `/readyz` to
+  not-ready (backpressure) rather than accepting jobs it cannot durably hold.
 - **Scores are within-provider comparable only.** A `0.667` threshold means different
   things per provider; thresholds are per-adapter and **not portable**.
 - **CSAM** is handled by a hash-match pre-stage seam (no-op in v1; PDQ/TMK in v1.1),
