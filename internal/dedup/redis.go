@@ -25,10 +25,17 @@ const keyPrefix = "vismod:done:"
 //
 // ORDERING: the pipeline checks Done BEFORE writing and calls Commit AFTER the
 // Sink+audit writes succeed (write-then-commit). This is fail-safe — a crash
-// before Commit redelivers and redoes the job (never a silent loss). The only
-// residual duplicate window is a crash strictly between the writes and Commit,
-// which is far narrower than the status quo (every fresh-process redelivery
-// double-writes today).
+// before Commit redelivers and redoes the job (never a silent loss). It closes
+// SEQUENTIAL redelivery (a fresh process picks the job up after the first died),
+// which is the live hazard and the status quo's double-write (every fresh-process
+// redelivery double-writes today).
+//
+// KNOWN RESIDUALS (both accepted for v1): (1) a crash strictly between the writes
+// and Commit; (2) a genuinely CONCURRENT second worker — the gate gives ordering,
+// not mutual exclusion, so it cannot stop two processors running at once (asynq
+// lease-recovery can re-queue a job past JobTimeout while the first goroutine is
+// still draining after ctx-cancel). Closing (2) needs a SETNX claim/lease with a
+// Retry-on-contention path; deferred as a future hardening seam.
 type RedisDeduper struct {
 	client *redis.Client
 	ttl    time.Duration
@@ -57,6 +64,9 @@ func (d *RedisDeduper) Done(ctx context.Context, jobID string) (bool, error) {
 // Commit durably marks jobID recorded. Idempotent: a repeat Commit (SET NX) is a
 // no-op and not an error, so retrying the commit step is safe.
 func (d *RedisDeduper) Commit(ctx context.Context, jobID string) error {
+	// The SETNX bool (whether THIS call set the key) is intentionally ignored:
+	// dedup cares only that the key is now PRESENT, not who set it. A losing
+	// concurrent/retry Commit is a harmless no-op, so only the error matters.
 	if err := d.client.SetNX(ctx, key(jobID), 1, d.ttl).Err(); err != nil {
 		return fmt.Errorf("dedup: commit: %w", err)
 	}

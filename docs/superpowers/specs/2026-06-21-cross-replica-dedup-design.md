@@ -58,16 +58,23 @@ Fail-safe is the project's #1 principle: never lose a verdict, never auto-allow.
 
 - A crash **before** Commit → redelivery redoes the whole job → never a silent
   loss.
-- Residual duplicate window = a crash strictly **between** the Sink+audit writes
-  and Commit. Strictly narrower than the status quo, where **every**
-  fresh-process redelivery double-writes.
+- Residual duplicate windows, **both accepted for v1**:
+  1. a crash strictly **between** the Sink+audit writes and Commit;
+  2. a genuinely **concurrent** second worker — write-then-commit gives ordering,
+     not mutual exclusion, so it cannot stop two processors running at once.
+  Both are strictly narrower than the status quo, where **every** fresh-process
+  redelivery double-writes.
 
-Rejected: claim-lease-then-commit (SETNX lease + Retry-on-contention). asynq
-delivers a task to one worker at a time, so concurrent-replica double-PROCESSING
-is not the live hazard; sequential redelivery after a death is, and the
-write-then-commit gate covers it. The lease only narrows the already-narrow
-crash window at the cost of a Retry path and lease-expiry tuning — not worth it
-for v1. Documented as a future hardening seam.
+Deferred (not rejected outright): claim-lease-then-commit (SETNX lease +
+Retry-on-contention). The live hazard write-then-commit closes is **sequential**
+redelivery after a death. It does **not** close concurrent overlap: asynq's
+lease-recovery can re-queue a task past `asynq.Timeout(JobTimeout)`
+(`asynqq.go:126`, 60s default) while the first worker's goroutine is still
+draining after ctx-cancel — both see `Done=false`, both write. The window is
+narrow (a handler must run past ctx-cancel into the recovery interval) and the
+SETNX lease is the only thing that would give true mutual exclusion. Accepted as
+a v1 residual to avoid the Retry path + lease-expiry tuning; documented as the
+future hardening seam if concurrent safety is required.
 
 ### Fail-safe on redis error
 

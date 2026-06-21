@@ -133,11 +133,15 @@ func (p *Pipeline) Process(ctx context.Context, jobID result.JobID, src moderati
 	// so in-process retry never double-appends. Stores SHA-256(Raw) + ModelIdentity
 	// + verdict — NEVER Raw itself (§G.2). An audit failure is an infra error: the
 	// job is retried (Sink and audit are both idempotent per JobID, so retry is
-	// safe). Cross-process redelivery (fresh process/replica) is gated earlier by
-	// p.Dedup so it never reaches this append twice (§L, issue #9). A genuinely
-	// CONCURRENT second writer over the SAME chain file still needs serialization
-	// — see audit.Log godoc; asynq delivers a task to one worker at a time, so
-	// that is not the redelivery hazard the Deduper closes.
+	// safe). SEQUENTIAL cross-process redelivery (a fresh process/replica picking
+	// up the job AFTER the first worker died) is gated earlier by p.Dedup so it
+	// never reaches this append twice (§L, issue #9). KNOWN RESIDUAL: the gate
+	// orders writes vs. the durable claim but provides NO mutual exclusion, so it
+	// does not stop a genuinely CONCURRENT second worker (asynq lease-recovery can
+	// re-queue a job past JobTimeout while the first goroutine is still draining
+	// after ctx-cancel — both see Done=false). That overlap, like a crash strictly
+	// between the writes and Commit, is an accepted v1 residual; a SETNX claim/lease
+	// (Deduper godoc, design doc) is the future hardening seam if it must close.
 	if p.Audit != nil {
 		pl := audit.Payload{
 			JobID:        string(jobID),
