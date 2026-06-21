@@ -3,12 +3,14 @@
 # Secrets are NEVER read from this file. They come only from environment
 # variables with the VISMOD_ prefix (dots -> underscores), e.g.:
 #   VISMOD_AZURE_KEY=...        VISMOD_AZURE_ENDPOINT=https://<res>.cognitiveservices.azure.com
+#   VISMOD_HIVE_TOKEN=...
 #
 # Thresholds are PER-ADAPTER and NOT portable: a 0.667 threshold means a
-# different thing for Azure severity/6 than for an AWS confidence/100 score.
+# different thing for Azure severity/6, a Hive per-head probability, and an AWS
+# confidence/100 score. Re-tune thresholds whenever you switch adapters.
 
 adapter:
-  name: stub            # "stub" (no creds) or "azure". Selects the single active model.
+  name: stub            # "stub" (no creds), "azure", or "hive". Selects the single active model.
   options: {}           # adapter-specific, opaque to the core; decoded inside the adapter.
 
   # --- Azure AI Content Safety (image:analyze) ---
@@ -27,6 +29,20 @@ adapter:
   #   retry_backoff: 500ms      # base backoff; doubles per attempt (+jitter), capped 30s, honors Retry-After
   # NOTE: v1 sends inline base64 content ONLY. Remote blobUrl is disabled (SSRF/egress).
   # Azure thresholds are NOT portable to other adapters (severity/6 scale) — re-tune below.
+
+  # --- Hive (thehive.ai) visual moderation (v2 /task/sync, image) ---
+  # Set name: hive and uncomment. The API token is env-ONLY (never in yaml):
+  #   VISMOD_HIVE_TOKEN=...   (sent as "Authorization: Token <token>")
+  # options:
+  #   endpoint: https://api.thehive.ai/api/v2/task/sync  # default; override for a regional host
+  #   rps: 5                  # shared token-bucket rate (tune to your Hive plan)
+  #   max_retries: 3          # transient (429/5xx/net) retries before failing the frame (0 disables)
+  #   retry_backoff: 500ms    # base backoff; doubles per attempt (+jitter), capped 30s, honors Retry-After
+  # Hive returns ~50 per-head class scores per image; the adapter reconstructs heads
+  # and emits one normalized CategoryResult per canonical category (score_origin:
+  # probability). Hive probabilities are NOT comparable to Azure severity/6 — a 0.667
+  # threshold means a different thing per adapter. Image-only in v1 (video is native
+  # to Hive but framed via videosift here, same as Azure).
 
 # Two boundaries per category: flag_at (-> verdict flag) and block_at (-> verdict block).
 # Categories not listed fall back to thresholds.default.

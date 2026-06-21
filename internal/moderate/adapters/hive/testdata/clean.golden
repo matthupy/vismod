@@ -1,0 +1,10 @@
+[
+  {
+    "category": "SUGGESTIVE_RACY",
+    "provider_label": "general_suggestive",
+    "score": 0.01,
+    "score_origin": "probability",
+    "threshold": null,
+    "flagged": false
+  }
+]

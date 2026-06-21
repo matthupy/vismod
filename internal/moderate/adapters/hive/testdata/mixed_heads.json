@@ -1,0 +1,42 @@
+{
+  "status": [
+    {
+      "response": {
+        "output": [
+          {
+            "time": 0,
+            "classes": [
+              { "class": "general_nsfw", "score": 0.88 },
+              { "class": "general_suggestive", "score": 0.10 },
+              { "class": "general_not_nsfw_not_suggestive", "score": 0.02 },
+
+              { "class": "gun_in_hand", "score": 0.40 },
+              { "class": "gun_not_in_hand", "score": 0.10 },
+              { "class": "animated_gun", "score": 0.05 },
+              { "class": "no_gun", "score": 0.45 },
+
+              { "class": "knife_in_hand", "score": 0.20 },
+              { "class": "no_knife", "score": 0.80 },
+
+              { "class": "yes_smoking", "score": 0.30 },
+              { "class": "no_smoking", "score": 0.70 },
+
+              { "class": "illicit_injectables", "score": 0.05 },
+              { "class": "medical_injectables", "score": 0.15 },
+              { "class": "no_injectables", "score": 0.80 },
+
+              { "class": "yes_nazi", "score": 0.02 },
+              { "class": "no_nazi", "score": 0.98 },
+
+              { "class": "text", "score": 0.99 },
+              { "class": "no_text", "score": 0.01 },
+              { "class": "natural", "score": 0.95 },
+
+              { "class": "brand_new_class", "score": 0.33 }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

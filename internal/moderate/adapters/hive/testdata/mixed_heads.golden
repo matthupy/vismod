@@ -1,0 +1,58 @@
+[
+  {
+    "category": "DRUGS",
+    "provider_label": "yes_smoking",
+    "score": 0.3,
+    "score_origin": "probability",
+    "threshold": null,
+    "flagged": false
+  },
+  {
+    "category": "HATE",
+    "provider_label": "yes_nazi",
+    "score": 0.02,
+    "score_origin": "probability",
+    "threshold": null,
+    "flagged": false
+  },
+  {
+    "category": "MEDICAL",
+    "provider_label": "medical_injectables",
+    "score": 0.15,
+    "score_origin": "probability",
+    "threshold": null,
+    "flagged": false
+  },
+  {
+    "category": "OTHER",
+    "provider_label": "brand_new_class",
+    "score": 0.33,
+    "score_origin": "probability",
+    "threshold": null,
+    "flagged": false
+  },
+  {
+    "category": "SEXUAL",
+    "provider_label": "general_nsfw",
+    "score": 0.88,
+    "score_origin": "probability",
+    "threshold": null,
+    "flagged": false
+  },
+  {
+    "category": "SUGGESTIVE_RACY",
+    "provider_label": "general_suggestive",
+    "score": 0.1,
+    "score_origin": "probability",
+    "threshold": null,
+    "flagged": false
+  },
+  {
+    "category": "WEAPONS",
+    "provider_label": "gun_in_hand",
+    "score": 0.55,
+    "score_origin": "probability",
+    "threshold": null,
+    "flagged": false
+  }
+]
