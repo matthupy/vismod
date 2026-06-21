@@ -38,6 +38,40 @@ bucket, a softmax mass, a confidence percentage, and a likelihood bucket are not
 interchangeable. **Thresholds must be re-tuned per adapter and are not
 portable.** vismod does **not** claim cross-provider verdict equivalence.
 
+## Hive normalization specifics
+
+Hive's visual model is a bank of independent **heads** (sub-classifiers). The
+`/task/sync` API flattens every head's classes into one list of `{class, score}`
+with **no head grouping in the wire format**. The adapter reconstructs structure
+from a static taxonomy table (`internal/moderate/adapters/hive/taxonomy.go`) and
+reduces it:
+
+- **Per head, positive classes that share a canonical category are summed** —
+  they are mutually-exclusive sub-states of "the thing is present"
+  (e.g. `gun_in_hand + gun_not_in_hand + animated_gun` = P(gun) for WEAPONS).
+- **Across heads, a category takes the max** head mass (gun vs knife both →
+  WEAPONS; the more confident wins).
+- **One head can map to two categories.** `general_nsfw → SEXUAL` and
+  `general_suggestive → SUGGESTIVE_RACY` come from the *same* NSFW head;
+  `medical_injectables → MEDICAL` and `illicit_injectables → DRUGS` from the
+  injectables head.
+- **Negative ("safe complement") classes are dropped.** `no_gun`,
+  `general_not_nsfw_not_suggestive`, etc. exist only so a head's scores sum to 1.
+  They are structural, **not** harm labels.
+- **Descriptive heads are deliberately not emitted as harm.** Image type
+  (`natural`/`animated`/`hybrid`), `text`, `qr_code`, `child_present`,
+  `religious_icon`, `drawing` carry no harm meaning. This is a documented
+  provenance decision, parallel to MEDICAL/SPOOF — not a silent drop.
+- **Zero-evidence categories are omitted, never emitted as score 0** (absence ==
+  not-detected; see "`nil` is not `0`").
+- **Unknown future classes fall back to `OTHER`** with the raw label preserved
+  and the score carried — never dropped.
+
+Hive coverage is image-only in v1. Hive's API is video-native (it can sample
+frames itself), but the adapter operates on a single image and the pipeline
+frames video via videosift, identical to Azure. Native video is a documented
+future step via the optional `VideoModerator` interface.
+
 ## `nil` is not `0`
 
 A missing or unsupported score serializes as JSON **`null`**, never `0.0`. An
