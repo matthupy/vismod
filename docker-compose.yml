@@ -24,9 +24,16 @@
 #   curl -sf localhost:9090/readyz       # readiness (boot validation + redis PING)
 #   curl -s  localhost:9090/metrics      # Prometheus exposition
 #   # one-shot scan (memory driver, bypasses the queue/redis):
-#   docker compose run --rm vismod scan /data/clip.mp4
-#   # enqueue into the running redis worker: pipe newline-delimited paths to a serve stdin
-#   echo /data/x.jpg | docker compose run --rm -T vismod serve
+#   #   VISMOD_AUDIT_PATH= disables audit for the run container: a one-shot `run`
+#   #   must NOT O_APPEND the SAME hash-chained audit.log the live `serve` holds on
+#   #   the shared vismod-state volume (concurrent cross-process writers corrupt the
+#   #   chain — see internal/audit Log "SINGLE-WRITER ONLY").
+#   docker compose run --rm -e VISMOD_AUDIT_PATH= vismod scan /data/clip.mp4
+#   # enqueue into the running redis worker: there is no clean one-shot CLI enqueue
+#   # path. `serve` reads stdin but then blocks for SIGTERM (it would boot a second
+#   # worker pool and hang). Production enqueues come from an external asynq producer
+#   # writing the `vismod` queue on redis; for local single-file testing use the
+#   # one-shot `scan` above (memory driver, bypasses redis).
 
 name: vismod
 
