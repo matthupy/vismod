@@ -60,6 +60,44 @@ func TestNewBearerAuthRequiresToken(t *testing.T) {
 	}
 }
 
+// TestNewAuthModeFromSecret proves VISMOD_AZURE_AUTH_MODE switches the adapter
+// into bearer mode with no config.yaml auth_mode option (the env-only compose
+// flow). bearer then requires VISMOD_AZURE_TOKEN, so the failure on the missing
+// token confirms the env override actually selected the bearer scheme.
+func TestNewAuthModeFromSecret(t *testing.T) {
+	_, err := New(moderate.AdapterConfig{
+		Name:    "azure",
+		Options: map[string]any{"endpoint": "https://x.cognitiveservices.azure.com"},
+		Secret: secretFunc(map[string]string{
+			"AZURE_KEY":       "k",
+			"AZURE_AUTH_MODE": "bearer",
+		}),
+	})
+	if err == nil || !strings.Contains(err.Error(), "VISMOD_AZURE_TOKEN") {
+		t.Fatalf("want env auth_mode=bearer to require token, got %v", err)
+	}
+}
+
+// TestNewAuthModeOptionWinsOverSecret confirms the config.yaml option takes
+// precedence over the env override (option is read first; env is only a fallback
+// when the option is empty).
+func TestNewAuthModeOptionWinsOverSecret(t *testing.T) {
+	m, err := New(moderate.AdapterConfig{
+		Name:    "azure",
+		Options: map[string]any{"endpoint": "https://x.cognitiveservices.azure.com", "auth_mode": "apikey"},
+		Secret: secretFunc(map[string]string{
+			"AZURE_KEY":       "k",
+			"AZURE_AUTH_MODE": "bearer",
+		}),
+	})
+	if err != nil {
+		t.Fatalf("option auth_mode=apikey should construct with AZURE_KEY: %v", err)
+	}
+	if m.Name() != "azure" {
+		t.Errorf("Name = %q", m.Name())
+	}
+}
+
 func TestNewEndpointFromSecret(t *testing.T) {
 	m, err := New(moderate.AdapterConfig{
 		Name: "azure",

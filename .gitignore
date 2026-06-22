@@ -10,6 +10,10 @@
 audit.log
 *.tmp
 
+# Docker-compose secrets + mounted media (.env.example IS tracked)
+.env
+/data/
+
 # Test/sample media — NEVER commit media (esp. potential illegal content)
 /testmedia/
 sample.*

@@ -70,7 +70,8 @@ type azure struct {
 //	retry_backoff string time.Duration base backoff, default "500ms"
 //
 // Secrets (env-only, VISMOD_ prefix): VISMOD_AZURE_KEY (apikey),
-// VISMOD_AZURE_TOKEN (bearer). Endpoint may also come from VISMOD_AZURE_ENDPOINT.
+// VISMOD_AZURE_TOKEN (bearer). Endpoint may also come from VISMOD_AZURE_ENDPOINT,
+// and auth_mode from VISMOD_AZURE_AUTH_MODE (env-only compose flow).
 func New(cfg moderate.AdapterConfig) (moderation.Moderator, error) {
 	opts := decodeOptions(cfg.Options)
 
@@ -82,7 +83,14 @@ func New(cfg moderate.AdapterConfig) (moderation.Moderator, error) {
 		return nil, fmt.Errorf("azure: endpoint required (adapter.options.endpoint or VISMOD_AZURE_ENDPOINT)")
 	}
 
-	auth, err := newAuth(opts.authMode, cfg.Secret)
+	// auth_mode is a non-secret option, but it also accepts an env override
+	// (VISMOD_AZURE_AUTH_MODE) so the env-only compose flow can reach bearer mode
+	// without a config.yaml — mirroring the endpoint fallback above.
+	authMode := opts.authMode
+	if authMode == "" {
+		authMode = cfg.Secret("AZURE_AUTH_MODE")
+	}
+	auth, err := newAuth(authMode, cfg.Secret)
 	if err != nil {
 		return nil, err
 	}
