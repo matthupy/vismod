@@ -71,7 +71,8 @@ services:
       VISMOD_QUEUE_WORKERS: "4"
       VISMOD_QUEUE_DEDUP_TTL: 168h     # must outlive the redelivery window (§L #9)
       # --- adapter: stub by default (no creds). Set azure/hive + the matching
-      #     secret env below to switch the single active model. ---
+      #     secret env below to switch the single active model. For azure bearer
+      #     auth, also set VISMOD_AZURE_AUTH_MODE=bearer (default is apikey). ---
       VISMOD_ADAPTER_NAME: stub
       # --- observability + storage ---
       VISMOD_METRICS_ADDR: ":9090"
@@ -82,6 +83,10 @@ services:
       #     Unset -> empty (fine for the stub adapter). ---
       VISMOD_AZURE_KEY: ${VISMOD_AZURE_KEY:-}
       VISMOD_AZURE_ENDPOINT: ${VISMOD_AZURE_ENDPOINT:-}
+      # auth_mode is a non-secret option but forwarded here so the env-only flow
+      # can reach bearer without a config.yaml (empty -> apikey default).
+      VISMOD_AZURE_AUTH_MODE: ${VISMOD_AZURE_AUTH_MODE:-}
+      VISMOD_AZURE_TOKEN: ${VISMOD_AZURE_TOKEN:-}    # auth_mode: bearer (set VISMOD_AZURE_AUTH_MODE=bearer)
       VISMOD_HIVE_TOKEN: ${VISMOD_HIVE_TOKEN:-}
     ports:
       # Bind localhost only: /healthz /readyz /metrics are ops endpoints, not public.
