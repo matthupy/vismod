@@ -27,6 +27,10 @@ type jobPayload struct {
 	ID          result.JobID      `json:"id"`
 	Source      moderation.Source `json:"source"`
 	SubmittedAt time.Time         `json:"submitted_at"`
+	// ModelFingerprint mirrors Job.ModelFingerprint (§L deploy guard). It is an
+	// opaque hash, so it is payload-hygiene safe in Redis + asynqmon. Field order
+	// must stay aligned with Job for the Job<->jobPayload struct conversions.
+	ModelFingerprint string `json:"model_fingerprint,omitempty"`
 }
 
 // asynqQueue is the Redis-backed FIFO queue driver (M5).

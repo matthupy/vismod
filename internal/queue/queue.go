@@ -44,6 +44,13 @@ type Job struct {
 	ID          result.JobID
 	Source      moderation.Source
 	SubmittedAt time.Time
+	// ModelFingerprint is the boot-knowable identity of the model that enqueued
+	// the job (config.ModelFingerprint, §L). The worker dead-letters a job whose
+	// fingerprint != its own loaded model instead of silently moderating with the
+	// wrong model under a rolling deploy. It is an opaque hash => payload-hygiene
+	// safe (§D.3/§G.2: no media/PII). Empty only for a pre-feature (older-binary)
+	// job, since all enqueues go through the single stamping helper.
+	ModelFingerprint string
 }
 
 // Handler processes a job and reports a Disposition. A returned error is

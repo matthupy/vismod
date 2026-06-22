@@ -3,6 +3,7 @@ package config
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"sort"
@@ -153,6 +154,55 @@ func (c Config) ConfigHash(modelVersion string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "adapter=%s\n", c.Adapter.Name)
 	fmt.Fprintf(&b, "model_version=%s\n", modelVersion)
+	fmt.Fprintf(&b, "default=flag:%g,block:%g\n", c.Thresholds.Default.FlagAt, c.Thresholds.Default.BlockAt)
+	fmt.Fprintf(&b, "sexual_potential_csam=%g\n", c.Thresholds.SexualPotentialCSAM)
+
+	cats := make([]string, 0, len(c.Thresholds.PerCategory))
+	for cat := range c.Thresholds.PerCategory {
+		cats = append(cats, string(cat))
+	}
+	sort.Strings(cats)
+	for _, cat := range cats {
+		ct := c.Thresholds.PerCategory[moderation.Category(cat)]
+		fmt.Fprintf(&b, "cat=%s,flag:%g,block:%g\n", cat, ct.FlagAt, ct.BlockAt)
+	}
+
+	sum := sha256.Sum256([]byte(b.String()))
+	return hex.EncodeToString(sum[:])
+}
+
+// ModelFingerprint is a SHA-256 over the canonicalized DEPLOY-affecting config:
+// the adapter name + adapter.options + the resolved per-category threshold map.
+// It is the boot-knowable identity of the loaded model (§L), stamped on every
+// enqueued job so a worker running a different model can dead-letter (not
+// silently process) a job that requires another model under a rolling deploy.
+//
+// Distinct from ConfigHash — do NOT merge the two:
+//   - ConfigHash: per-job audit provenance; folds in the adapter's RUNTIME-reported
+//     ModelVersion; excludes adapter.options.
+//   - ModelFingerprint: boot-time deploy guard; folds in adapter.options (where the
+//     api_version/model-id/endpoint live); no runtime model version.
+//
+// CANONICALIZATION (the #1 correctness landmine): adapter.options is a
+// map[string]any from viper. Naive fmt formatting over a Go map yields random key
+// order => a non-deterministic hash => replicas with identical config compute
+// different fingerprints and dead-letter each other. json.Marshal sorts map keys
+// lexicographically AND recursively (Go stdlib guarantee), so json.Marshal(options)
+// is already a deterministic canonical encoding — no custom encoder, no JCS dep.
+func (c Config) ModelFingerprint() string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "adapter=%s\n", c.Adapter.Name)
+
+	// The deploy surface. json.Marshal of a map[string]any is key-sorted and
+	// recursive, so this is order-invariant. A nil/empty map marshals to "null"/"{}"
+	// deterministically. The error path is unreachable for viper-sourced scalar
+	// maps; fall back to a stable sentinel rather than a nondeterministic Sprintf.
+	optJSON, err := json.Marshal(c.Adapter.Options)
+	if err != nil {
+		optJSON = []byte("null")
+	}
+	fmt.Fprintf(&b, "options=%s\n", optJSON)
+
 	fmt.Fprintf(&b, "default=flag:%g,block:%g\n", c.Thresholds.Default.FlagAt, c.Thresholds.Default.BlockAt)
 	fmt.Fprintf(&b, "sexual_potential_csam=%g\n", c.Thresholds.SexualPotentialCSAM)
 

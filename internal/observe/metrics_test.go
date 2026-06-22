@@ -42,6 +42,30 @@ vismod_divert_failures_total 2
 	}
 }
 
+func TestRecordModelMismatchCountsByReason(t *testing.T) {
+	m := NewMetrics()
+	m.RecordModelMismatch("mismatch")
+	m.RecordModelMismatch("mismatch")
+	m.RecordModelMismatch("unstamped")
+
+	want := `
+# HELP vismod_jobs_model_mismatch_total Jobs whose stamped model fingerprint did not match the worker's loaded model (reason=mismatch) or carried no fingerprint (reason=unstamped).
+# TYPE vismod_jobs_model_mismatch_total counter
+vismod_jobs_model_mismatch_total{reason="mismatch"} 2
+vismod_jobs_model_mismatch_total{reason="unstamped"} 1
+`
+	if err := testutil.GatherAndCompare(m.Registry(), strings.NewReader(want), "vismod_jobs_model_mismatch_total"); err != nil {
+		t.Errorf("model_mismatch_total mismatch: %v", err)
+	}
+}
+
+// A nil *Metrics must be a safe no-op so the queue/handler stay decoupled from a
+// metrics instance in tests and in a CLI run without /metrics.
+func TestRecordModelMismatchNilSafe(t *testing.T) {
+	var m *Metrics
+	m.RecordModelMismatch("mismatch") // must not panic
+}
+
 func TestRegisterQueueDepthExposesGaugesAtScrapeTime(t *testing.T) {
 	m := NewMetrics()
 	qd, dlq := 7.0, 3.0

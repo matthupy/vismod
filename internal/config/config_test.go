@@ -180,6 +180,73 @@ func TestConfigHashDeterministicAndSensitive(t *testing.T) {
 	}
 }
 
+func TestModelFingerprintDeterministicAndSensitive(t *testing.T) {
+	c, _ := Load("")
+	base := c.ModelFingerprint()
+
+	if base != c.ModelFingerprint() {
+		t.Fatal("ModelFingerprint not deterministic for identical inputs")
+	}
+
+	// Sensitive to the adapter name (the deployed model).
+	cName, _ := Load("")
+	cName.Adapter.Name = "azure"
+	if base == cName.ModelFingerprint() {
+		t.Fatal("ModelFingerprint must change when adapter.name changes")
+	}
+
+	// Sensitive to adapter.options (api_version/model-id/endpoint live here, so a
+	// model change => different fingerprint).
+	cOpt, _ := Load("")
+	cOpt.Adapter.Options = map[string]any{"api_version": "2024-09-01"}
+	if base == cOpt.ModelFingerprint() {
+		t.Fatal("ModelFingerprint must change when adapter.options changes")
+	}
+
+	// Sensitive to a verdict-affecting threshold.
+	cThr, _ := Load("")
+	cThr.Thresholds.Default.BlockAt = 0.99
+	if base == cThr.ModelFingerprint() {
+		t.Fatal("ModelFingerprint must change when a threshold changes")
+	}
+
+	// Distinct purpose from ConfigHash — do NOT collapse the two.
+	if c.ModelFingerprint() == c.ConfigHash("v1") {
+		t.Fatal("ModelFingerprint and ConfigHash must be distinct hashes")
+	}
+}
+
+// The #1 correctness landmine: adapter.options is a map[string]any, and naive Go
+// map formatting yields random key order => a non-deterministic hash => replicas
+// with identical config dead-letter each other. json.Marshal sorts keys
+// recursively, so the fingerprint must be invariant to map insertion order, even
+// for nested maps.
+func TestModelFingerprintStableAcrossOptionMapOrder(t *testing.T) {
+	mk := func(build func(m map[string]any)) Config {
+		c, _ := Load("")
+		opts := map[string]any{}
+		build(opts)
+		c.Adapter.Options = opts
+		return c
+	}
+
+	// Same logical options, keys inserted in two different orders, with a nested map.
+	a := mk(func(m map[string]any) {
+		m["api_version"] = "2024-09-01"
+		m["endpoint"] = "https://x.cognitiveservices.azure.com"
+		m["retry"] = map[string]any{"max": 3, "backoff": "500ms"}
+	})
+	b := mk(func(m map[string]any) {
+		m["retry"] = map[string]any{"backoff": "500ms", "max": 3}
+		m["endpoint"] = "https://x.cognitiveservices.azure.com"
+		m["api_version"] = "2024-09-01"
+	})
+
+	if a.ModelFingerprint() != b.ModelFingerprint() {
+		t.Fatal("ModelFingerprint must be invariant to adapter.options map key order (incl. nested)")
+	}
+}
+
 func TestExampleConfigLoads(t *testing.T) {
 	// The shipped example must be valid.
 	if _, err := Load(filepath.Join("..", "..", "config.example.yaml")); err != nil {

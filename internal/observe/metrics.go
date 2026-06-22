@@ -28,6 +28,7 @@ type Metrics struct {
 	adapterErrors    *prometheus.CounterVec
 	queueDepthErrors prometheus.Counter
 	divertFailures   prometheus.Counter
+	modelMismatch    *prometheus.CounterVec
 }
 
 // NewMetrics builds the collectors and registers the job/adapter series. Queue
@@ -62,8 +63,12 @@ func NewMetrics() *Metrics {
 			Name: "vismod_divert_failures_total",
 			Help: "Total potential-CSAM diverts that failed to reach the review channel (frame may never reach a human).",
 		}),
+		modelMismatch: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "vismod_jobs_model_mismatch_total",
+			Help: "Jobs whose stamped model fingerprint did not match the worker's loaded model (reason=mismatch) or carried no fingerprint (reason=unstamped).",
+		}, []string{"reason"}),
 	}
-	reg.MustRegister(m.jobsTotal, m.adapterSeconds, m.adapterErrors, m.queueDepthErrors, m.divertFailures)
+	reg.MustRegister(m.jobsTotal, m.adapterSeconds, m.adapterErrors, m.queueDepthErrors, m.divertFailures, m.modelMismatch)
 	return m
 }
 
@@ -74,6 +79,19 @@ func (m *Metrics) Registry() *prometheus.Registry { return m.reg }
 // pipeline after the asset rollup.
 func (m *Metrics) RecordJob(verdict moderation.Verdict) {
 	m.jobsTotal.WithLabelValues(string(verdict)).Inc()
+}
+
+// RecordModelMismatch counts one job the worker could not safely process under
+// its loaded model (§L). reason="mismatch" => the job's stamped fingerprint != the
+// worker's (wrong model deployed; the job is dead-lettered, never silently
+// processed). reason="unstamped" => the job carried no fingerprint (a pre-feature
+// older-binary job; processed but surfaced, never silent). Nil-safe so the queue
+// handler stays decoupled from a metrics instance.
+func (m *Metrics) RecordModelMismatch(reason string) {
+	if m == nil {
+		return
+	}
+	m.modelMismatch.WithLabelValues(reason).Inc()
 }
 
 // RecordDivertFailure counts one potential-CSAM divert that failed to reach its
