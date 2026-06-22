@@ -74,7 +74,15 @@ docker run --rm -v "$PWD/data:/data" vismod:dev scan /data/clip.mp4
 
 Metrics: `vismod_jobs_total{verdict}`, `vismod_adapter_request_seconds{adapter}`,
 `vismod_adapter_errors_total{adapter,code}`, `vismod_queue_depth`,
-`vismod_deadletter_depth`. Adapter latency/errors are recorded by an instrumenting
+`vismod_deadletter_depth`, `vismod_jobs_active`, `vismod_jobs_completed_total`,
+`vismod_jobs_failed_total`, `vismod_jobs_model_mismatch_total{reason}`. The
+`vismod_jobs_*` family is queue-layer and driver-uniform: `active` is in-flight
+(pulled, not yet acked — surfaces a stuck/slow worker that `queue_depth` can't, as
+backlog reads 0 while a job is wedged); `completed_total`/`failed_total` count
+acks vs dead-letters (a dead-lettered job carries no verdict, so it is invisible in
+`jobs_total`); `model_mismatch_total{reason}` counts the §L deploy guard firing
+(`reason=mismatch` wrong model deployed, `reason=unstamped` pre-feature job).
+Adapter latency/errors are recorded by an instrumenting
 decorator that wraps the active `Moderator`, so the pipeline stays adapter-agnostic.
 The container `HEALTHCHECK` uses the self-contained `vismod healthcheck` subcommand
 (no curl/wget in the image).
@@ -94,6 +102,16 @@ The container `HEALTHCHECK` uses the self-contained `vismod healthcheck` subcomm
   `job_id`. The driver swap is behavior-preserving — the same handler `Disposition`
   yields the same retry/DLQ outcome on both. A Redis outage flips `/readyz` to
   not-ready (backpressure) rather than accepting jobs it cannot durably hold.
+- **One model cluster-wide (§L deploy guard).** Each enqueued job is stamped with a
+  boot-knowable **model fingerprint** (`config.ModelFingerprint`: a hash over adapter
+  name + `adapter.options` + thresholds). A worker dequeuing a job whose fingerprint
+  ≠ its own loaded model **dead-letters it** instead of silently moderating with the
+  wrong model during a rolling deploy. It is a **misconfiguration / rollout-skew
+  guard, not authentication** — a malicious enqueuer can stamp any value (same honest
+  scope as the audit-log threat model). memq is single-process so the guard is a
+  no-op there. See [deploy strategy](MODEL_AND_HASH_LIMITATIONS.md#multi-replica-deploys-l)
+  for the safe rollout paths (drain-first or per-model-version queue namespacing) — a
+  naive requeue of mismatches onto the shared queue re-archives in a loop.
 - **Scores are within-provider comparable only.** A `0.667` threshold means different
   things per provider; thresholds are per-adapter and **not portable**.
 - **CSAM** is handled by a hash-match pre-stage seam (no-op in v1; PDQ/TMK in v1.1),
