@@ -68,6 +68,32 @@ type QueueConfig struct {
 	JobTimeout    time.Duration // per-job processing timeout (0 = none)
 	DeadLetterMax int           // DLQ depth cap; at capacity reject enqueues + alert
 	DeadLetter    result.Sink   // where dead-lettered jobs go (exists in the prototype)
+	// Metrics receives terminal-disposition counts (optional; nil => no-op). It
+	// keeps the queue package decoupled from prometheus — observe.Metrics
+	// implements queue.Recorder.
+	Metrics Recorder
+}
+
+// Recorder receives queue-layer terminal-disposition counts so success/failure
+// is observable uniformly across drivers (asynq's info.Processed/Failed are
+// daily-resetting and absent on memq; emitting our own at the driver gives proper
+// monotonic counters with identical semantics on both). Optional: a nil
+// QueueConfig.Metrics is a no-op (see recordCompleted/recordFailed).
+type Recorder interface {
+	RecordJobCompleted() // a job was acked (successfully processed)
+	RecordJobFailed()    // a job was dead-lettered (retry-exhausted / terminal / panic / mismatch)
+}
+
+func recordCompleted(r Recorder) {
+	if r != nil {
+		r.RecordJobCompleted()
+	}
+}
+
+func recordFailed(r Recorder) {
+	if r != nil {
+		r.RecordJobFailed()
+	}
 }
 
 // DepthReporter is a Queue that also exposes DLQ depth for metrics. Both the
@@ -76,6 +102,10 @@ type QueueConfig struct {
 type DepthReporter interface {
 	Queue
 	DeadLetterDepth() int
+	// ActiveDepth reports jobs pulled by a worker and not yet acked/dead-lettered
+	// (in-flight). Backlog (QueueDepth) can be 0 while jobs are wedged in
+	// processing, so this is the stuck/slow-worker signal.
+	ActiveDepth() int
 }
 
 // Pinger is implemented by drivers backed by an external dependency (the redis

@@ -67,7 +67,7 @@ func runServe(cmd *cobra.Command, _ []string) error {
 	defer func() { _ = closeDedup() }()
 	p.Dedup = deduper
 
-	q, qWarnings, err := buildQueue(cfg, dlqSink, log)
+	q, qWarnings, err := buildQueue(cfg, dlqSink, metrics, log)
 	if err != nil {
 		return err
 	}
@@ -86,6 +86,7 @@ func runServe(cmd *cobra.Command, _ []string) error {
 			return float64(n), err
 		},
 		func() float64 { return float64(q.DeadLetterDepth()) },
+		func() float64 { return float64(q.ActiveDepth()) },
 	)
 
 	for _, w := range qWarnings {

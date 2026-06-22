@@ -203,6 +203,7 @@ func (q *asynqQueue) processor(handler Handler) func(context.Context, *asynq.Tas
 		disp, herr := q.invoke(ctx, handler, j)
 		switch disp {
 		case Ack:
+			recordCompleted(q.cfg.Metrics)
 			return nil
 		case DeadLetter:
 			return fmt.Errorf("dead-letter: %v: %w", errString(herr), asynq.SkipRetry)
@@ -263,6 +264,10 @@ func (q *asynqQueue) onError(ctx context.Context, t *asynq.Task, err error) {
 	if werr := q.cfg.DeadLetter.Write(ctx, env); werr != nil {
 		q.log.Error("dead-letter sink write failed", "job_id", p.ID, "err", werr)
 	}
+	// Terminal failure (retries exhausted or SkipRetry) — count it once here, the
+	// same branch that writes the DLQ envelope. Intermediate retry attempts above
+	// returned early and are NOT counted (attempts, not terminal failures).
+	recordFailed(q.cfg.Metrics)
 	q.log.Warn("job dead-lettered", "job_id", p.ID, "cause", err)
 }
 
@@ -328,6 +333,19 @@ func (q *asynqQueue) DeadLetterDepth() int {
 		return 0
 	}
 	return info.Archived
+}
+
+// ActiveDepth returns the number of tasks currently being processed (asynq
+// Active = leased to a worker, not yet acked/archived), for the vismod_jobs_active
+// gauge. A missing queue reports 0. Under at-least-once, a crashed worker holding
+// an unacked job keeps it Active until its lease expires — exactly the wedged-job
+// signal this gauge exists to surface.
+func (q *asynqQueue) ActiveDepth() int {
+	info, err := q.inspector.GetQueueInfo(q.qname)
+	if err != nil {
+		return 0
+	}
+	return info.Active
 }
 
 // Ping verifies Redis reachability (§F.2). Used at boot and by the /readyz
