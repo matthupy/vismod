@@ -171,33 +171,65 @@ func (c Config) ConfigHash(modelVersion string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// The adapter-option registry is the SINGLE SOURCE OF TRUTH that classifies
+// every known adapter.options key into exactly one of two partitions:
+// verdict-affecting (hashed into ModelFingerprint) or operational-only (never
+// hashed). The keys mirror what the adapters actually decode today (see
+// internal/moderate/adapters/{azure,hive}/options.go): azure reads endpoint,
+// auth_mode, api_version, rps, max_retries, retry_backoff; hive reads endpoint,
+// rps, max_retries, retry_backoff. model/model_id are forward-looking verdict
+// selectors no adapter sets yet; timeout is a documented operational knob.
+//
+// 🔴 MAINTENANCE — FAIL-OPEN WARNING: ModelFingerprint hashes ONLY
+// verdictAffectingOptionKeys. A new adapter.options key that is absent from this
+// registry is SILENTLY un-guarded — a rolling deploy could swap the model via
+// that key WITHOUT dead-lettering (§L). So any NEW key an adapter decodes MUST be
+// added to one partition below, classified by the single question "does this
+// change the score a model returns?" — yes → verdictAffectingOptionKeys, no →
+// operationalOptionKeys. This is not advisory: TestKnownOptionKeysPinned pins the
+// exact union, so an unclassified key fails CI instead of going unguarded.
+
 // verdictAffectingOptionKeys is the WHITELIST of adapter.options keys that
-// participate in ModelFingerprint. These select the model / API contract whose
+// participate in ModelFingerprint. Each selects the model / API contract whose
 // scores the verdict is computed from, so changing one means "a different model"
 // and MUST trip the §L deploy guard:
 //
-//   - endpoint    — which resource/region/host (and thus which deployed model) answers
-//   - auth_mode   — auth path can route to a different model deployment
 //   - api_version — pins the provider's model/behavior version (azure §D contract)
+//   - auth_mode   — auth path can route to a different model deployment
+//   - endpoint    — which resource/region/host (and thus which deployed model) answers
 //   - model       — explicit model selector (forward-looking; no adapter sets it yet)
 //   - model_id    — explicit model-deployment id (forward-looking)
-//
-// Operational knobs are DELIBERATELY EXCLUDED — rps, max_retries, timeout, and
-// retry/backoff tune throughput and resilience, NOT the verdict. Folding them in
-// made a rolling deploy that merely retuned rps/max_retries compute a different
-// fingerprint and spuriously dead-letter in-flight jobs (§L). They never change
-// what score a model returns, so they never belong in the model identity.
-//
-// 🔴 MAINTENANCE: any NEW adapter.options key that changes the verdict / model
-// identity MUST be added here — otherwise changing it will NOT be guarded and a
-// rolling deploy can silently moderate with a different model. When in doubt, ask
-// "does this change the score a model returns?" — if yes, whitelist it.
 var verdictAffectingOptionKeys = []string{
 	"api_version",
 	"auth_mode",
 	"endpoint",
 	"model",
 	"model_id",
+}
+
+// operationalOptionKeys are DELIBERATELY EXCLUDED from ModelFingerprint — they
+// tune throughput and resilience, NOT the verdict. Folding them in made a rolling
+// deploy that merely retuned rps/max_retries compute a different fingerprint and
+// spuriously dead-letter in-flight jobs (§L). They never change what score a model
+// returns, so they never belong in the model identity. Listed here (not just
+// "everything not whitelisted") so a new operational key is still a DELIBERATE,
+// test-pinned classification — see the 🔴 MAINTENANCE note above.
+var operationalOptionKeys = []string{
+	"max_retries",
+	"retry_backoff",
+	"rps",
+	"timeout",
+}
+
+// knownOptionKeys returns every classified adapter.options key (both partitions).
+// It exists so a test can pin the FULL known set: a new key that an adapter reads
+// but no one classified will not appear here, failing the pin and forcing a
+// deliberate verdict-vs-operational decision before the key can ship unguarded.
+func knownOptionKeys() []string {
+	keys := make([]string, 0, len(verdictAffectingOptionKeys)+len(operationalOptionKeys))
+	keys = append(keys, verdictAffectingOptionKeys...)
+	keys = append(keys, operationalOptionKeys...)
+	return keys
 }
 
 // ModelFingerprint is a SHA-256 over the canonicalized DEPLOY-affecting config:

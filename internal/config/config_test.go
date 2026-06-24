@@ -305,6 +305,91 @@ func TestModelFingerprintStableAcrossOptionMapOrder(t *testing.T) {
 	}
 }
 
+// --- Adapter-option registry guard (PR #14 issue 5: whitelist fail-open) ---
+//
+// verdictAffectingOptionKeys is FAIL-OPEN: an adapter.options key absent from it
+// is silently un-guarded by ModelFingerprint, so a model swap via that key could
+// slip a rolling deploy without dead-lettering (§L). The registry below is the
+// single source of truth that partitions EVERY known adapter.options key into
+// verdict-affecting vs operational-only; these tests back the 🔴 MAINTENANCE
+// comment in load.go with a mechanical check so adding a key without classifying
+// it fails CI instead of going unguarded.
+
+// TestOptionRegistryPartitionWellFormed asserts the two partitions of the
+// registry are internally consistent: each is sorted with no duplicates, and no
+// key is classified as BOTH verdict-affecting and operational (which would make
+// the classification ambiguous). verdictAffectingOptionKeys must equal the
+// verdict partition so ModelFingerprint stays derived from — not divergent
+// from — the registry.
+func TestOptionRegistryPartitionWellFormed(t *testing.T) {
+	assertSortedUnique := func(name string, keys []string) {
+		t.Helper()
+		seen := map[string]bool{}
+		for i, k := range keys {
+			if seen[k] {
+				t.Errorf("%s contains duplicate key %q", name, k)
+			}
+			seen[k] = true
+			if i > 0 && keys[i-1] > k {
+				t.Errorf("%s is not sorted: %q before %q", name, keys[i-1], k)
+			}
+		}
+	}
+	assertSortedUnique("verdictAffectingOptionKeys", verdictAffectingOptionKeys)
+	assertSortedUnique("operationalOptionKeys", operationalOptionKeys)
+
+	verdict := map[string]bool{}
+	for _, k := range verdictAffectingOptionKeys {
+		verdict[k] = true
+	}
+	for _, k := range operationalOptionKeys {
+		if verdict[k] {
+			t.Errorf("key %q is classified as BOTH verdict-affecting and operational", k)
+		}
+	}
+}
+
+// TestKnownOptionKeysPinned pins the EXACT full set of classified adapter.options
+// keys. This is the mechanical guard the 🔴 MAINTENANCE comment relies on: adding
+// a new key that an adapter reads (see internal/moderate/adapters/*/options.go)
+// without adding it to the registry — i.e. without DELIBERATELY classifying it as
+// verdict-affecting or operational — fails here. The fix is never to edit this
+// expectation blindly; it is to decide "does this key change the score a model
+// returns?" and put it in the right partition, then update this pin in the SAME
+// commit. The keys mirror what azure/hive decodeOptions actually read today:
+// azure → endpoint, auth_mode, api_version, rps, max_retries, retry_backoff;
+// hive → endpoint, rps, max_retries, retry_backoff; plus the forward-looking
+// verdict selectors model/model_id and the documented operational knob timeout.
+func TestKnownOptionKeysPinned(t *testing.T) {
+	want := map[string]bool{
+		// verdict-affecting
+		"api_version": true,
+		"auth_mode":   true,
+		"endpoint":    true,
+		"model":       true,
+		"model_id":    true,
+		// operational-only
+		"max_retries":   true,
+		"retry_backoff": true,
+		"rps":           true,
+		"timeout":       true,
+	}
+	got := map[string]bool{}
+	for _, k := range knownOptionKeys() {
+		got[k] = true
+	}
+	for k := range want {
+		if !got[k] {
+			t.Errorf("known option key %q missing from registry — classify it in load.go", k)
+		}
+	}
+	for k := range got {
+		if !want[k] {
+			t.Errorf("registry has unpinned key %q — add it here and confirm its partition", k)
+		}
+	}
+}
+
 func TestExampleConfigLoads(t *testing.T) {
 	// The shipped example must be valid.
 	if _, err := Load(filepath.Join("..", "..", "config.example.yaml")); err != nil {
