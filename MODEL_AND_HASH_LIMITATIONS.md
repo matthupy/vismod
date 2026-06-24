@@ -72,6 +72,35 @@ frames itself), but the adapter operates on a single image and the pipeline
 frames video via videosift, identical to Azure. Native video is a documented
 future step via the optional `VideoModerator` interface.
 
+## Google SafeSearch normalization specifics
+
+Google Cloud Vision SafeSearch (`images:annotate` with `SAFE_SEARCH_DETECTION`)
+returns five **ordinal likelihood** fields, not numeric scores. The adapter
+(`internal/moderate/adapters/google/`) maps them as follows:
+
+- **Likelihood → score is a fixed lookup** (spec §E): `VERY_UNLIKELY=0.0`,
+  `UNLIKELY=0.25`, `POSSIBLE=0.5`, `LIKELY=0.75`, `VERY_LIKELY=1.0`. These are
+  **evenly-spaced bucket midpoints assigned by vismod, not calibrated
+  probabilities** — Google publishes no numeric confidence behind the enum. The
+  lookup is fixed in v1 (not a per-deploy option); a configurable table is a
+  documented future step.
+- **`UNKNOWN` (and a missing/unrecognized enum) → `Score=nil`**, distinct from
+  `VERY_UNLIKELY=0.0`. `UNKNOWN` means *could-not-evaluate this category*; `0.0`
+  means *evaluated, very unlikely*. An all-`UNKNOWN` annotation rolls up to
+  `Verdict=error`, never `allow`.
+- **Category mapping:** `adult → SEXUAL`, `racy → SUGGESTIVE_RACY`,
+  `violence → VIOLENCE`, `medical → MEDICAL`, `spoof → SPOOF`.
+- **`MEDICAL` and `SPOOF` are provenance-only, NOT harm signals.** They exist to
+  carry SafeSearch's `medical`/`spoof` fields without discarding them; do not
+  treat a high `SPOOF` (meme/altered image) or `MEDICAL` score as harmful.
+- **All five fields are emitted every time** (including `0.0`), so the envelope
+  records exactly what SafeSearch evaluated. This differs from Hive, which omits
+  zero-evidence categories — for SafeSearch `VERY_UNLIKELY` is a real signal.
+
+Coverage is image-only in v1. Cloud Video Intelligence is a separate API; video
+is framed via videosift here, identical to Azure/Hive. Native video is a
+documented future step via the optional `VideoModerator` interface.
+
 ## `nil` is not `0`
 
 A missing or unsupported score serializes as JSON **`null`**, never `0.0`. An

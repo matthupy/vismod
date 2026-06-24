@@ -1,0 +1,42 @@
+[
+  {
+    "category": "MEDICAL",
+    "provider_label": "medical",
+    "score": 0.25,
+    "score_origin": "likelihood_enum",
+    "threshold": null,
+    "flagged": false
+  },
+  {
+    "category": "SEXUAL",
+    "provider_label": "adult",
+    "score": 1,
+    "score_origin": "likelihood_enum",
+    "threshold": null,
+    "flagged": false
+  },
+  {
+    "category": "SPOOF",
+    "provider_label": "spoof",
+    "score": 0,
+    "score_origin": "likelihood_enum",
+    "threshold": null,
+    "flagged": false
+  },
+  {
+    "category": "SUGGESTIVE_RACY",
+    "provider_label": "racy",
+    "score": 0.75,
+    "score_origin": "likelihood_enum",
+    "threshold": null,
+    "flagged": false
+  },
+  {
+    "category": "VIOLENCE",
+    "provider_label": "violence",
+    "score": 0.5,
+    "score_origin": "likelihood_enum",
+    "threshold": null,
+    "flagged": false
+  }
+]
