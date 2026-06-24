@@ -76,9 +76,12 @@ Metrics: `vismod_jobs_total{verdict}`, `vismod_adapter_request_seconds{adapter}`
 `vismod_adapter_errors_total{adapter,code}`, `vismod_queue_depth`,
 `vismod_deadletter_depth`, `vismod_jobs_active`, `vismod_jobs_completed_total`,
 `vismod_jobs_failed_total`, `vismod_jobs_model_mismatch_total{reason}`. The
-`vismod_jobs_*` family is queue-layer and driver-uniform: `active` is in-flight
+`vismod_jobs_*` family is queue-layer and largely driver-uniform: `active` is in-flight
 (pulled, not yet acked — surfaces a stuck/slow worker that `queue_depth` can't, as
-backlog reads 0 while a job is wedged); `completed_total`/`failed_total` count
+backlog reads 0 while a job is wedged), but diverges by driver for jobs in retry-backoff —
+memq counts a backing-off job as active, the redis/asynq driver does not (asynq's
+retry state ≠ active), so a backoff-driven dip in this gauge is expected, not a leak;
+`completed_total`/`failed_total` count
 acks vs dead-letters (a dead-lettered job carries no verdict, so it is invisible in
 `jobs_total`); `model_mismatch_total{reason}` counts the §L deploy guard firing
 (`reason=mismatch` wrong model deployed, `reason=unstamped` pre-feature job).
@@ -104,7 +107,7 @@ The container `HEALTHCHECK` uses the self-contained `vismod healthcheck` subcomm
   not-ready (backpressure) rather than accepting jobs it cannot durably hold.
 - **One model cluster-wide (§L deploy guard).** Each enqueued job is stamped with a
   boot-knowable **model fingerprint** (`config.ModelFingerprint`: a hash over adapter
-  name + `adapter.options` + thresholds). A worker dequeuing a job whose fingerprint
+  name + verdict-affecting `adapter.options` keys + thresholds). A worker dequeuing a job whose fingerprint
   ≠ its own loaded model **dead-letters it** instead of silently moderating with the
   wrong model during a rolling deploy. It is a **misconfiguration / rollout-skew
   guard, not authentication** — a malicious enqueuer can stamp any value (same honest

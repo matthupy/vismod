@@ -171,12 +171,23 @@ func runServe(cmd *cobra.Command, _ []string) error {
 //     misconfiguration / rollout-skew guard, not an anti-adversary control.
 //   - empty : a pre-feature (older-binary) job. Process it, but surface it
 //     (WARN + metric) — never silently process an unknown identity unbounded.
+//
+// Counting semantics: the mismatch path returns DeadLetter (terminal — fires
+// exactly once). The unstamped path falls through to Process, which returns Retry
+// on an infra failure, so the SAME job is re-dequeued and this handler re-runs.
+// To keep vismod_jobs_model_mismatch_total{reason="unstamped"} counting DISTINCT
+// jobs (not retry-dequeue attempts), the unstamped accounting + WARN are gated to
+// the first attempt (j.Attempt == 0), the driver-uniform first-dequeue signal set
+// by both memq and asynq. (The mismatch path needs no gate: DeadLetter never
+// retries.)
 func jobHandler(p *pipeline.Pipeline, workerFP string, m *observe.Metrics, log *slog.Logger) queue.Handler {
 	return func(ctx context.Context, j queue.Job) (queue.Disposition, error) {
 		switch {
 		case j.ModelFingerprint == "":
-			m.RecordModelMismatch("unstamped")
-			log.Warn("job has no model fingerprint; processing (pre-feature job?)", "job_id", j.ID)
+			if j.Attempt == 0 {
+				m.RecordModelMismatch("unstamped")
+				log.Warn("job has no model fingerprint; processing (pre-feature job?)", "job_id", j.ID)
+			}
 		case j.ModelFingerprint != workerFP:
 			m.RecordModelMismatch("mismatch")
 			err := fmt.Errorf("model fingerprint mismatch: job=%s worker=%s", fpPrefix(j.ModelFingerprint), fpPrefix(workerFP))

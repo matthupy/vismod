@@ -153,6 +153,10 @@ func (q *memQueue) process(handler Handler, j Job) {
 
 	attempts := 0
 	for {
+		// Thread the 0-based attempt into the Job so the handler can gate
+		// per-job-once side effects (e.g. §L "unstamped" accounting) to the first
+		// dequeue. attempts == 0 on the first call, then 1/2/… on each retry.
+		j.Attempt = attempts
 		disp, err := q.invoke(handler, j)
 		switch disp {
 		case Ack:

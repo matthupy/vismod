@@ -108,13 +108,27 @@ func (m *Metrics) RecordModelMismatch(reason string) {
 // RecordJobCompleted counts one job acked (successfully processed) at the queue
 // layer. Emitted by the driver at its terminal Ack disposition (driver-uniform,
 // unlike asynq's daily-resetting info.Processed). It implements queue.Recorder.
-func (m *Metrics) RecordJobCompleted() { m.jobsCompleted.Inc() }
+// Nil-safe (mirrors RecordModelMismatch) so a direct call on a nil *Metrics is a
+// no-op rather than a panic; the queue.recordCompleted wrapper also nil-checks.
+func (m *Metrics) RecordJobCompleted() {
+	if m == nil {
+		return
+	}
+	m.jobsCompleted.Inc()
+}
 
 // RecordJobFailed counts one job dead-lettered (retry-exhausted / terminal /
 // panic / model mismatch). These produce no verdict envelope, so they are
 // invisible in vismod_jobs_total — this is the queue-layer failure signal. It
 // implements queue.Recorder.
-func (m *Metrics) RecordJobFailed() { m.jobsFailed.Inc() }
+// Nil-safe (mirrors RecordModelMismatch) so a direct call on a nil *Metrics is a
+// no-op rather than a panic; the queue.recordFailed wrapper also nil-checks.
+func (m *Metrics) RecordJobFailed() {
+	if m == nil {
+		return
+	}
+	m.jobsFailed.Inc()
+}
 
 // RecordDivertFailure counts one potential-CSAM divert that failed to reach its
 // review channel (§G.8). The pipeline stays fail-safe — a dropped divert never

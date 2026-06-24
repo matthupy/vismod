@@ -147,6 +147,39 @@ func TestMemQueueRetryExhaustionDeadLetters(t *testing.T) {
 	}
 }
 
+// The driver threads a 0-based attempt counter into Job.Attempt so a handler can
+// distinguish a first dequeue from a retry re-dispatch. memq increments it across
+// its in-process retry loop: first attempt = 0, then 1, 2, ...
+func TestMemQueueThreadsAttemptAcrossRetries(t *testing.T) {
+	q, _ := newTestQueue(t, QueueConfig{
+		Workers: 1, Buffer: 8, MaxRetries: 2, RetryBackoff: time.Millisecond, DrainTimeout: 2 * time.Second,
+	})
+
+	var mu sync.Mutex
+	var seen []int
+	handler := func(_ context.Context, j Job) (Disposition, error) {
+		mu.Lock()
+		seen = append(seen, j.Attempt)
+		mu.Unlock()
+		return Retry, nil // always transient => exhausts retries
+	}
+	_ = q.Start(context.Background(), handler)
+	_, _ = q.Enqueue(context.Background(), Job{Source: moderation.Source{Ref: "x"}})
+	_ = q.Close(context.Background())
+
+	mu.Lock()
+	defer mu.Unlock()
+	want := []int{0, 1, 2} // 1 initial + 2 retries
+	if len(seen) != len(want) {
+		t.Fatalf("attempts seen = %v, want %v", seen, want)
+	}
+	for i := range want {
+		if seen[i] != want[i] {
+			t.Fatalf("attempt[%d] = %d, want %d (full=%v)", i, seen[i], want[i], seen)
+		}
+	}
+}
+
 func TestMemQueueDeadLetterImmediate(t *testing.T) {
 	q, dlq := newTestQueue(t, QueueConfig{Workers: 1, Buffer: 4, MaxRetries: 5, DrainTimeout: time.Second})
 	handler := func(_ context.Context, _ Job) (Disposition, error) { return DeadLetter, nil }

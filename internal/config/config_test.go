@@ -195,12 +195,12 @@ func TestModelFingerprintDeterministicAndSensitive(t *testing.T) {
 		t.Fatal("ModelFingerprint must change when adapter.name changes")
 	}
 
-	// Sensitive to adapter.options (api_version/model-id/endpoint live here, so a
-	// model change => different fingerprint).
+	// Sensitive to a verdict-affecting adapter.options key (api_version/endpoint/
+	// auth_mode/model live here, so a model change => different fingerprint).
 	cOpt, _ := Load("")
 	cOpt.Adapter.Options = map[string]any{"api_version": "2024-09-01"}
 	if base == cOpt.ModelFingerprint() {
-		t.Fatal("ModelFingerprint must change when adapter.options changes")
+		t.Fatal("ModelFingerprint must change when a verdict-affecting adapter.options key changes")
 	}
 
 	// Sensitive to a verdict-affecting threshold.
@@ -213,6 +213,64 @@ func TestModelFingerprintDeterministicAndSensitive(t *testing.T) {
 	// Distinct purpose from ConfigHash — do NOT collapse the two.
 	if c.ModelFingerprint() == c.ConfigHash("v1") {
 		t.Fatal("ModelFingerprint and ConfigHash must be distinct hashes")
+	}
+}
+
+// Each verdict-affecting key, changed in isolation, must move the fingerprint.
+// Guards against a whitelist that silently drops a key (e.g. endpoint/auth_mode/
+// model) and stops guarding a real model swap.
+func TestModelFingerprintSensitiveToEachVerdictKey(t *testing.T) {
+	for _, key := range []string{"api_version", "model", "model_id", "endpoint", "auth_mode"} {
+		base, _ := Load("")
+		baseFP := base.ModelFingerprint()
+
+		c, _ := Load("")
+		c.Adapter.Options = map[string]any{key: "changed-value"}
+		if baseFP == c.ModelFingerprint() {
+			t.Errorf("ModelFingerprint must change when verdict key %q is set", key)
+		}
+	}
+}
+
+// Operational-only knobs (rps, max_retries, timeout, retry/backoff) have no
+// verdict impact. Tuning them in a rolling deploy must NOT change the fingerprint,
+// or it would spuriously trip the §L dead-letter guard.
+func TestModelFingerprintIgnoresOperationalKeys(t *testing.T) {
+	base, _ := Load("")
+	baseFP := base.ModelFingerprint()
+
+	for _, kv := range []map[string]any{
+		{"rps": 50.0},
+		{"max_retries": 7},
+		{"timeout": "30s"},
+		{"retry_backoff": "500ms"},
+	} {
+		c, _ := Load("")
+		c.Adapter.Options = kv
+		if baseFP != c.ModelFingerprint() {
+			t.Errorf("ModelFingerprint must NOT change for operational-only option %v", kv)
+		}
+	}
+}
+
+// A verdict key must dominate: even alongside operational noise, only the
+// verdict key's value drives the fingerprint, and operational churn around a
+// fixed verdict key leaves it stable.
+func TestModelFingerprintScopesToVerdictKeysOnly(t *testing.T) {
+	withNoise := func(rps float64, retries int) Config {
+		c, _ := Load("")
+		c.Adapter.Options = map[string]any{
+			"endpoint":    "https://x.cognitiveservices.azure.com",
+			"api_version": "2024-09-01",
+			"rps":         rps,
+			"max_retries": retries,
+		}
+		return c
+	}
+	a := withNoise(10, 3)
+	b := withNoise(99, 1) // same verdict keys, different operational knobs
+	if a.ModelFingerprint() != b.ModelFingerprint() {
+		t.Fatal("ModelFingerprint must ignore operational knobs when verdict keys match")
 	}
 }
 

@@ -51,6 +51,17 @@ type Job struct {
 	// safe (§D.3/§G.2: no media/PII). Empty only for a pre-feature (older-binary)
 	// job, since all enqueues go through the single stamping helper.
 	ModelFingerprint string
+
+	// Attempt is the 0-based dequeue attempt for THIS job: 0 on the first
+	// dequeue, 1/2/… on each retry re-dispatch. Both drivers set it before
+	// invoking the handler (memq from its in-process retry loop; asynq from
+	// asynq.GetRetryCount), giving a driver-uniform "is this the first attempt?"
+	// signal. It is queue-RUNTIME metadata, not durable job data: it is
+	// deliberately NOT part of jobPayload, so it is never serialized into Redis
+	// (the count is recovered per-dispatch on the worker side instead). A handler
+	// uses it to make per-job-once side effects idempotent across retries (e.g.
+	// the §L "unstamped" accounting fires only on Attempt==0).
+	Attempt int
 }
 
 // Handler processes a job and reports a Disposition. A returned error is

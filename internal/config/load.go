@@ -171,37 +171,84 @@ func (c Config) ConfigHash(modelVersion string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// verdictAffectingOptionKeys is the WHITELIST of adapter.options keys that
+// participate in ModelFingerprint. These select the model / API contract whose
+// scores the verdict is computed from, so changing one means "a different model"
+// and MUST trip the §L deploy guard:
+//
+//   - endpoint    — which resource/region/host (and thus which deployed model) answers
+//   - auth_mode   — auth path can route to a different model deployment
+//   - api_version — pins the provider's model/behavior version (azure §D contract)
+//   - model       — explicit model selector (forward-looking; no adapter sets it yet)
+//   - model_id    — explicit model-deployment id (forward-looking)
+//
+// Operational knobs are DELIBERATELY EXCLUDED — rps, max_retries, timeout, and
+// retry/backoff tune throughput and resilience, NOT the verdict. Folding them in
+// made a rolling deploy that merely retuned rps/max_retries compute a different
+// fingerprint and spuriously dead-letter in-flight jobs (§L). They never change
+// what score a model returns, so they never belong in the model identity.
+//
+// 🔴 MAINTENANCE: any NEW adapter.options key that changes the verdict / model
+// identity MUST be added here — otherwise changing it will NOT be guarded and a
+// rolling deploy can silently moderate with a different model. When in doubt, ask
+// "does this change the score a model returns?" — if yes, whitelist it.
+var verdictAffectingOptionKeys = []string{
+	"api_version",
+	"auth_mode",
+	"endpoint",
+	"model",
+	"model_id",
+}
+
 // ModelFingerprint is a SHA-256 over the canonicalized DEPLOY-affecting config:
-// the adapter name + adapter.options + the resolved per-category threshold map.
-// It is the boot-knowable identity of the loaded model (§L), stamped on every
-// enqueued job so a worker running a different model can dead-letter (not
-// silently process) a job that requires another model under a rolling deploy.
+// the adapter name + the VERDICT-AFFECTING adapter.options keys + the resolved
+// per-category threshold map. It is the boot-knowable identity of the loaded
+// model (§L), stamped on every enqueued job so a worker running a different model
+// can dead-letter (not silently process) a job that requires another model under
+// a rolling deploy.
 //
 // Distinct from ConfigHash — do NOT merge the two:
 //   - ConfigHash: per-job audit provenance; folds in the adapter's RUNTIME-reported
 //     ModelVersion; excludes adapter.options.
-//   - ModelFingerprint: boot-time deploy guard; folds in adapter.options (where the
-//     api_version/model-id/endpoint live); no runtime model version.
+//   - ModelFingerprint: boot-time deploy guard; folds in the WHITELISTED
+//     adapter.options keys (api_version/model/model_id/endpoint/auth_mode); no
+//     runtime model version.
+//
+// SCOPING: only verdictAffectingOptionKeys are hashed, NOT the whole options map.
+// Operational knobs (rps/max_retries/timeout/retry_backoff) have no verdict impact,
+// so tuning them in a rolling deploy must not change the fingerprint — otherwise it
+// spuriously trips the dead-letter guard.
 //
 // CANONICALIZATION (the #1 correctness landmine): adapter.options is a
 // map[string]any from viper. Naive fmt formatting over a Go map yields random key
 // order => a non-deterministic hash => replicas with identical config compute
-// different fingerprints and dead-letter each other. json.Marshal sorts map keys
-// lexicographically AND recursively (Go stdlib guarantee), so json.Marshal(options)
-// is already a deterministic canonical encoding — no custom encoder, no JCS dep.
+// different fingerprints and dead-letter each other. We iterate the whitelist in a
+// FIXED (sorted) order and json.Marshal each present value individually; json.Marshal
+// sorts map keys lexicographically AND recursively (Go stdlib guarantee), so nested
+// values stay canonical and map-order-invariant — no custom encoder, no JCS dep.
 func (c Config) ModelFingerprint() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "adapter=%s\n", c.Adapter.Name)
 
-	// The deploy surface. json.Marshal of a map[string]any is key-sorted and
-	// recursive, so this is order-invariant. A nil/empty map marshals to "null"/"{}"
-	// deterministically. The error path is unreachable for viper-sourced scalar
-	// maps; fall back to a stable sentinel rather than a nondeterministic Sprintf.
-	optJSON, err := json.Marshal(c.Adapter.Options)
-	if err != nil {
-		optJSON = []byte("null")
+	// The deploy surface, scoped to verdict-affecting keys in a fixed order. Each
+	// present value is marshaled individually so nested maps stay key-sorted and
+	// order-invariant. An absent key contributes nothing (so adding an unrelated
+	// operational key never moves the hash). The error path is unreachable for
+	// viper-sourced scalar values; fall back to a stable sentinel rather than a
+	// nondeterministic Sprintf.
+	keys := append([]string(nil), verdictAffectingOptionKeys...)
+	sort.Strings(keys)
+	for _, k := range keys {
+		val, ok := c.Adapter.Options[k]
+		if !ok {
+			continue
+		}
+		valJSON, err := json.Marshal(val)
+		if err != nil {
+			valJSON = []byte("null")
+		}
+		fmt.Fprintf(&b, "opt.%s=%s\n", k, valJSON)
 	}
-	fmt.Fprintf(&b, "options=%s\n", optJSON)
 
 	fmt.Fprintf(&b, "default=flag:%g,block:%g\n", c.Thresholds.Default.FlagAt, c.Thresholds.Default.BlockAt)
 	fmt.Fprintf(&b, "sexual_potential_csam=%g\n", c.Thresholds.SexualPotentialCSAM)

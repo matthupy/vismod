@@ -66,6 +66,12 @@ func TestRecordModelMismatchNilSafe(t *testing.T) {
 	m.RecordModelMismatch("mismatch") // must not panic
 }
 
+func TestRecordJobLifecycleCountersNilSafe(t *testing.T) {
+	var m *Metrics
+	m.RecordJobCompleted() // must not panic
+	m.RecordJobFailed()    // must not panic
+}
+
 func TestRecordJobLifecycleCounters(t *testing.T) {
 	m := NewMetrics()
 	m.RecordJobCompleted()

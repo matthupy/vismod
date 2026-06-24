@@ -113,10 +113,20 @@ rolling deploy can briefly run two model/config versions against the **same**
 queue: replica A (model X) enqueues a job, replica B (model Y) dequeues it. To
 stop B silently moderating with the wrong model, every job is stamped with a
 boot-knowable **model fingerprint** (`config.ModelFingerprint`: a SHA-256 over
-adapter name + `adapter.options` + the resolved threshold map). A worker whose
-loaded fingerprint ≠ the job's **dead-letters the job** (never processes it; the
-DLQ envelope records `model fingerprint mismatch: job=… worker=…`), and
+adapter name + the **verdict-affecting `adapter.options` keys**
+(`model`/`model_id`/`endpoint`/`api_version`/`auth_mode` — **NOT** `rps`/
+`max_retries`/`timeout`/retry-backoff) + the resolved threshold map). A worker
+whose loaded fingerprint ≠ the job's **dead-letters the job** (never processes it;
+the DLQ envelope records `model fingerprint mismatch: job=… worker=…`), and
 `vismod_jobs_model_mismatch_total{reason="mismatch"}` increments.
+
+The fingerprint is **scoped to verdict-affecting option keys** on purpose:
+operational-only knobs (`rps`, `max_retries`, `timeout`, retry/backoff) tune
+throughput and resilience, not the score a model returns. Retuning them in a
+rolling deploy therefore **no longer trips the guard** — only an actual model /
+endpoint / API-contract change does. (Any *new* verdict-affecting option key must
+be added to the `verdictAffectingOptionKeys` whitelist in `internal/config/load.go`
+or it won't be guarded.)
 
 **Honest scope:** this is a **misconfiguration / rollout-skew guard, not
 authentication.** A malicious enqueuer can stamp any fingerprint — the guard
