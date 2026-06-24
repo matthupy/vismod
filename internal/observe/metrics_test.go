@@ -42,14 +42,69 @@ vismod_divert_failures_total 2
 	}
 }
 
+func TestRecordModelMismatchCountsByReason(t *testing.T) {
+	m := NewMetrics()
+	m.RecordModelMismatch("mismatch")
+	m.RecordModelMismatch("mismatch")
+	m.RecordModelMismatch("unstamped")
+
+	want := `
+# HELP vismod_jobs_model_mismatch_total Jobs whose stamped model fingerprint did not match the worker's loaded model (reason=mismatch) or carried no fingerprint (reason=unstamped).
+# TYPE vismod_jobs_model_mismatch_total counter
+vismod_jobs_model_mismatch_total{reason="mismatch"} 2
+vismod_jobs_model_mismatch_total{reason="unstamped"} 1
+`
+	if err := testutil.GatherAndCompare(m.Registry(), strings.NewReader(want), "vismod_jobs_model_mismatch_total"); err != nil {
+		t.Errorf("model_mismatch_total mismatch: %v", err)
+	}
+}
+
+// A nil *Metrics must be a safe no-op so the queue/handler stay decoupled from a
+// metrics instance in tests and in a CLI run without /metrics.
+func TestRecordModelMismatchNilSafe(t *testing.T) {
+	var m *Metrics
+	m.RecordModelMismatch("mismatch") // must not panic
+}
+
+func TestRecordJobLifecycleCountersNilSafe(t *testing.T) {
+	var m *Metrics
+	m.RecordJobCompleted() // must not panic
+	m.RecordJobFailed()    // must not panic
+}
+
+func TestRecordJobLifecycleCounters(t *testing.T) {
+	m := NewMetrics()
+	m.RecordJobCompleted()
+	m.RecordJobCompleted()
+	m.RecordJobCompleted()
+	m.RecordJobFailed()
+
+	want := `
+# HELP vismod_jobs_completed_total Jobs acked (successfully processed) at the queue layer, driver-uniform.
+# TYPE vismod_jobs_completed_total counter
+vismod_jobs_completed_total 3
+# HELP vismod_jobs_failed_total Jobs dead-lettered (retry-exhausted / terminal / panic / model mismatch); these never carry a verdict.
+# TYPE vismod_jobs_failed_total counter
+vismod_jobs_failed_total 1
+`
+	if err := testutil.GatherAndCompare(m.Registry(), strings.NewReader(want),
+		"vismod_jobs_completed_total", "vismod_jobs_failed_total"); err != nil {
+		t.Errorf("job lifecycle counters mismatch: %v", err)
+	}
+}
+
 func TestRegisterQueueDepthExposesGaugesAtScrapeTime(t *testing.T) {
 	m := NewMetrics()
-	qd, dlq := 7.0, 3.0
-	m.RegisterQueueDepth(func() (float64, error) { return qd, nil }, func() float64 { return dlq })
+	qd, dlq, active := 7.0, 3.0, 2.0
+	m.RegisterQueueDepth(func() (float64, error) { return qd, nil }, func() float64 { return dlq }, func() float64 { return active })
 
 	// Mutate the source AFTER registration: a GaugeFunc reads at scrape time.
 	qd = 9
+	active = 5
 	want := `
+# HELP vismod_jobs_active Jobs pulled by a worker and not yet acked or dead-lettered (in-flight).
+# TYPE vismod_jobs_active gauge
+vismod_jobs_active 5
 # HELP vismod_queue_depth Jobs buffered in the queue and not yet started.
 # TYPE vismod_queue_depth gauge
 vismod_queue_depth 9
@@ -58,7 +113,7 @@ vismod_queue_depth 9
 vismod_deadletter_depth 3
 `
 	if err := testutil.GatherAndCompare(m.Registry(), strings.NewReader(want),
-		"vismod_queue_depth", "vismod_deadletter_depth"); err != nil {
+		"vismod_queue_depth", "vismod_deadletter_depth", "vismod_jobs_active"); err != nil {
 		t.Errorf("depth gauges mismatch: %v", err)
 	}
 }
@@ -69,6 +124,7 @@ func TestRegisterQueueDepthSurfacesScrapeError(t *testing.T) {
 	m := NewMetrics()
 	m.RegisterQueueDepth(
 		func() (float64, error) { return 0, errors.New("backend down") },
+		func() float64 { return 0 },
 		func() float64 { return 0 },
 	)
 

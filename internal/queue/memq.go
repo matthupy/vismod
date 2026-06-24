@@ -39,9 +39,10 @@ type memQueue struct {
 	cfg QueueConfig
 	log *slog.Logger
 
-	ch     chan Job // buffered => FIFO by construction (dequeue order == enqueue order)
-	seq    atomic.Uint64
-	dlqLen atomic.Int64
+	ch       chan Job // buffered => FIFO by construction (dequeue order == enqueue order)
+	seq      atomic.Uint64
+	dlqLen   atomic.Int64
+	inflight atomic.Int64 // jobs currently in process() (in-flight, incl. retry backoff)
 
 	mu     sync.Mutex
 	states map[result.JobID]jobState
@@ -146,14 +147,21 @@ func (q *memQueue) worker(handler Handler) {
 // A retry-exhausted, terminal, or panicked job is dead-lettered with an error
 // envelope (Verdict could-not-evaluate — never allow).
 func (q *memQueue) process(handler Handler, j Job) {
+	q.inflight.Add(1)
+	defer q.inflight.Add(-1)
 	q.setState(j.ID, stateProcessing)
 
 	attempts := 0
 	for {
+		// Thread the 0-based attempt into the Job so the handler can gate
+		// per-job-once side effects (e.g. §L "unstamped" accounting) to the first
+		// dequeue. attempts == 0 on the first call, then 1/2/… on each retry.
+		j.Attempt = attempts
 		disp, err := q.invoke(handler, j)
 		switch disp {
 		case Ack:
 			q.setState(j.ID, stateAcked)
+			recordCompleted(q.cfg.Metrics)
 			return
 		case DeadLetter:
 			q.deadLetter(j, err)
@@ -206,6 +214,7 @@ func (q *memQueue) backoff(attempt int) {
 func (q *memQueue) deadLetter(j Job, cause error) {
 	q.setState(j.ID, stateDeadLetter)
 	q.dlqLen.Add(1)
+	recordFailed(q.cfg.Metrics)
 
 	msg := "dead-lettered"
 	if cause != nil {
@@ -232,6 +241,11 @@ func (q *memQueue) QueueDepth(_ context.Context) (int, error) {
 
 // DeadLetterDepth returns the number of dead-lettered jobs (for metrics).
 func (q *memQueue) DeadLetterDepth() int { return int(q.dlqLen.Load()) }
+
+// ActiveDepth returns jobs currently in process() — in-flight, not yet acked or
+// dead-lettered. memq is at-most-once, so this includes retry-backoff sleeps (the
+// job is still held). Read live at scrape time.
+func (q *memQueue) ActiveDepth() int { return int(q.inflight.Load()) }
 
 // Close stops intake and gracefully drains in-flight work within DrainTimeout.
 // Buffered-but-unstarted jobs are logged at WARN (not silently dropped).

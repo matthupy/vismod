@@ -3,12 +3,19 @@ package queue
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/matthupy/vismod/internal/result"
 	"github.com/matthupy/vismod/pkg/moderation"
 )
+
+// fakeRecorder counts terminal-disposition calls (queue.Recorder).
+type fakeRecorder struct{ completed, failed atomic.Int64 }
+
+func (r *fakeRecorder) RecordJobCompleted() { r.completed.Add(1) }
+func (r *fakeRecorder) RecordJobFailed()    { r.failed.Add(1) }
 
 // captureSink records envelopes written to it (used as a DLQ sink).
 type captureSink struct {
@@ -140,6 +147,39 @@ func TestMemQueueRetryExhaustionDeadLetters(t *testing.T) {
 	}
 }
 
+// The driver threads a 0-based attempt counter into Job.Attempt so a handler can
+// distinguish a first dequeue from a retry re-dispatch. memq increments it across
+// its in-process retry loop: first attempt = 0, then 1, 2, ...
+func TestMemQueueThreadsAttemptAcrossRetries(t *testing.T) {
+	q, _ := newTestQueue(t, QueueConfig{
+		Workers: 1, Buffer: 8, MaxRetries: 2, RetryBackoff: time.Millisecond, DrainTimeout: 2 * time.Second,
+	})
+
+	var mu sync.Mutex
+	var seen []int
+	handler := func(_ context.Context, j Job) (Disposition, error) {
+		mu.Lock()
+		seen = append(seen, j.Attempt)
+		mu.Unlock()
+		return Retry, nil // always transient => exhausts retries
+	}
+	_ = q.Start(context.Background(), handler)
+	_, _ = q.Enqueue(context.Background(), Job{Source: moderation.Source{Ref: "x"}})
+	_ = q.Close(context.Background())
+
+	mu.Lock()
+	defer mu.Unlock()
+	want := []int{0, 1, 2} // 1 initial + 2 retries
+	if len(seen) != len(want) {
+		t.Fatalf("attempts seen = %v, want %v", seen, want)
+	}
+	for i := range want {
+		if seen[i] != want[i] {
+			t.Fatalf("attempt[%d] = %d, want %d (full=%v)", i, seen[i], want[i], seen)
+		}
+	}
+}
+
 func TestMemQueueDeadLetterImmediate(t *testing.T) {
 	q, dlq := newTestQueue(t, QueueConfig{Workers: 1, Buffer: 4, MaxRetries: 5, DrainTimeout: time.Second})
 	handler := func(_ context.Context, _ Job) (Disposition, error) { return DeadLetter, nil }
@@ -149,6 +189,58 @@ func TestMemQueueDeadLetterImmediate(t *testing.T) {
 	if len(dlq.ids()) != 1 {
 		t.Fatalf("DeadLetter disposition must dead-letter immediately, got %d", len(dlq.ids()))
 	}
+}
+
+func TestMemQueueActiveDepthAndLifecycleCounters(t *testing.T) {
+	rec := &fakeRecorder{}
+	q, _ := newTestQueue(t, QueueConfig{
+		Workers: 1, Buffer: 8, MaxRetries: 0, DrainTimeout: 2 * time.Second, Metrics: rec,
+	})
+
+	release := make(chan struct{})
+	_ = q.Start(context.Background(), func(_ context.Context, j Job) (Disposition, error) {
+		if j.Source.Ref == "fail" {
+			return DeadLetter, nil
+		}
+		<-release // block so the job stays in-flight (Active)
+		return Ack, nil
+	})
+
+	// Enqueue a job that blocks in the handler => ActiveDepth rises to 1.
+	if _, err := q.Enqueue(context.Background(), Job{Source: moderation.Source{Ref: "ok"}}); err != nil {
+		t.Fatal(err)
+	}
+	waitForInt(t, func() int { return q.ActiveDepth() }, 1, "ActiveDepth should be 1 while a job is in-flight")
+
+	// Release it => acked => ActiveDepth back to 0, completed counter == 1.
+	close(release)
+	waitForInt(t, func() int { return q.ActiveDepth() }, 0, "ActiveDepth should return to 0 after ack")
+	waitForInt(t, func() int { return int(rec.completed.Load()) }, 1, "completed counter should be 1 after ack")
+
+	// A dead-lettered job bumps the failed counter and never the completed one.
+	if _, err := q.Enqueue(context.Background(), Job{Source: moderation.Source{Ref: "fail"}}); err != nil {
+		t.Fatal(err)
+	}
+	waitForInt(t, func() int { return int(rec.failed.Load()) }, 1, "failed counter should be 1 after dead-letter")
+	if got := rec.completed.Load(); got != 1 {
+		t.Fatalf("completed counter must stay 1 (dead-letter is not a completion), got %d", got)
+	}
+	waitForInt(t, func() int { return q.ActiveDepth() }, 0, "ActiveDepth should be 0 after the dead-lettered job finishes")
+
+	_ = q.Close(context.Background())
+}
+
+// waitForInt polls f until it equals want or a short deadline passes.
+func waitForInt(t *testing.T, f func() int, want int, msg string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if f() == want {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("%s (last=%d, want=%d)", msg, f(), want)
 }
 
 func TestMemQueueRejectsAfterClose(t *testing.T) {

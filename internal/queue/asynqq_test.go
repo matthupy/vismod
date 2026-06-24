@@ -102,6 +102,90 @@ func TestAsynqQueue_ProcessesAndAcks(t *testing.T) {
 	}
 }
 
+// The driver emits queue-layer lifecycle counts at terminal disposition: Ack =>
+// RecordJobCompleted, final dead-letter => RecordJobFailed. Intermediate retry
+// attempts are NOT counted.
+func TestAsynqQueue_RecorderCountsTerminalDispositions(t *testing.T) {
+	rec := &fakeRecorder{}
+	q := newTestAsynqQueue(t, QueueConfig{
+		Workers: 1, MaxRetries: 1, RetryBackoff: 10 * time.Millisecond, Metrics: rec,
+	})
+
+	ctx := context.Background()
+	if err := q.Start(ctx, func(_ context.Context, j Job) (Disposition, error) {
+		if j.Source.Ref == "fail" {
+			return Retry, errors.New("boom") // exhausts to a final dead-letter
+		}
+		return Ack, nil
+	}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	if _, err := q.Enqueue(ctx, Job{Source: moderation.Source{Kind: "file", Ref: "ok.jpg"}}); err != nil {
+		t.Fatalf("Enqueue ok: %v", err)
+	}
+	if !waitFor(func() bool { return rec.completed.Load() == 1 }, 10*time.Second) {
+		t.Fatalf("completed counter = %d, want 1 after ack", rec.completed.Load())
+	}
+
+	if _, err := q.Enqueue(ctx, Job{Source: moderation.Source{Kind: "file", Ref: "fail"}}); err != nil {
+		t.Fatalf("Enqueue fail: %v", err)
+	}
+	if !waitFor(func() bool { return rec.failed.Load() == 1 }, 12*time.Second) {
+		t.Fatalf("failed counter = %d, want 1 after final dead-letter", rec.failed.Load())
+	}
+	// The retry attempt before the final failure must NOT have been counted.
+	if got := rec.failed.Load(); got != 1 {
+		t.Fatalf("failed counter = %d, want exactly 1 (intermediate retries are not terminal)", got)
+	}
+	if got := rec.completed.Load(); got != 1 {
+		t.Fatalf("completed counter = %d, want 1 (the dead-lettered job is not a completion)", got)
+	}
+}
+
+// The driver threads a 0-based attempt counter into Job.Attempt (mirroring memq)
+// so a handler can distinguish a first dequeue from a retry re-dispatch. asynq
+// re-dispatches the task on retry; Attempt is sourced from asynq.GetRetryCount.
+func TestAsynqQueue_ThreadsAttemptAcrossRetries(t *testing.T) {
+	q := newTestAsynqQueue(t, QueueConfig{
+		Workers: 1, MaxRetries: 2, RetryBackoff: 10 * time.Millisecond,
+	})
+
+	var mu sync.Mutex
+	var seen []int
+	ctx := context.Background()
+	if err := q.Start(ctx, func(_ context.Context, j Job) (Disposition, error) {
+		mu.Lock()
+		seen = append(seen, j.Attempt)
+		mu.Unlock()
+		return Retry, errors.New("boom") // always transient => exhausts retries
+	}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if _, err := q.Enqueue(ctx, Job{Source: moderation.Source{Kind: "file", Ref: "x.jpg"}}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	// 1 initial + 2 retries = 3 dispatches with attempts 0,1,2.
+	if !waitFor(func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(seen) >= 3
+	}, 15*time.Second) {
+		mu.Lock()
+		got := append([]int(nil), seen...)
+		mu.Unlock()
+		t.Fatalf("expected 3 dispatches, saw %v", got)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for i, want := range []int{0, 1, 2} {
+		if seen[i] != want {
+			t.Fatalf("attempt[%d] = %d, want %d (full=%v)", i, seen[i], want, seen)
+		}
+	}
+}
+
 // A retry-exhausted job lands in the DLQ sink as an error envelope (never allow)
 // and is archived in asynq (DeadLetterDepth == 1).
 func TestAsynqQueue_RetryExhaustedDeadLetters(t *testing.T) {

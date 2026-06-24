@@ -158,7 +158,7 @@ const memqDurabilityWarning = "queue driver=memory is non-durable, single-proces
 // interface (so serve wires depth metrics uniformly) and returns any durability
 // warnings to surface. The memq->asynq swap is behavior-preserving: the same
 // handler Disposition yields the same retry/DLQ outcome on both drivers.
-func buildQueue(cfg config.Config, dlq result.Sink, log *slog.Logger) (queue.DepthReporter, []string, error) {
+func buildQueue(cfg config.Config, dlq result.Sink, metrics *observe.Metrics, log *slog.Logger) (queue.DepthReporter, []string, error) {
 	qc := queue.QueueConfig{
 		Workers:       cfg.Queue.Workers,
 		Buffer:        cfg.Queue.Buffer,
@@ -168,6 +168,12 @@ func buildQueue(cfg config.Config, dlq result.Sink, log *slog.Logger) (queue.Dep
 		JobTimeout:    cfg.Queue.JobTimeout,
 		DeadLetterMax: cfg.Queue.DeadLetterMax,
 		DeadLetter:    dlq,
+	}
+	// Wire queue-layer lifecycle counters (vismod_jobs_completed_total /
+	// _failed_total). Guarded so a nil metrics leaves QueueConfig.Metrics a true
+	// nil interface (a typed-nil *observe.Metrics would defeat the nil-safe guard).
+	if metrics != nil {
+		qc.Metrics = metrics
 	}
 	switch cfg.Queue.Driver {
 	case "memory":

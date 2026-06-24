@@ -44,6 +44,24 @@ type Job struct {
 	ID          result.JobID
 	Source      moderation.Source
 	SubmittedAt time.Time
+	// ModelFingerprint is the boot-knowable identity of the model that enqueued
+	// the job (config.ModelFingerprint, §L). The worker dead-letters a job whose
+	// fingerprint != its own loaded model instead of silently moderating with the
+	// wrong model under a rolling deploy. It is an opaque hash => payload-hygiene
+	// safe (§D.3/§G.2: no media/PII). Empty only for a pre-feature (older-binary)
+	// job, since all enqueues go through the single stamping helper.
+	ModelFingerprint string
+
+	// Attempt is the 0-based dequeue attempt for THIS job: 0 on the first
+	// dequeue, 1/2/… on each retry re-dispatch. Both drivers set it before
+	// invoking the handler (memq from its in-process retry loop; asynq from
+	// asynq.GetRetryCount), giving a driver-uniform "is this the first attempt?"
+	// signal. It is queue-RUNTIME metadata, not durable job data: it is
+	// deliberately NOT part of jobPayload, so it is never serialized into Redis
+	// (the count is recovered per-dispatch on the worker side instead). A handler
+	// uses it to make per-job-once side effects idempotent across retries (e.g.
+	// the §L "unstamped" accounting fires only on Attempt==0).
+	Attempt int
 }
 
 // Handler processes a job and reports a Disposition. A returned error is
@@ -61,6 +79,32 @@ type QueueConfig struct {
 	JobTimeout    time.Duration // per-job processing timeout (0 = none)
 	DeadLetterMax int           // DLQ depth cap; at capacity reject enqueues + alert
 	DeadLetter    result.Sink   // where dead-lettered jobs go (exists in the prototype)
+	// Metrics receives terminal-disposition counts (optional; nil => no-op). It
+	// keeps the queue package decoupled from prometheus — observe.Metrics
+	// implements queue.Recorder.
+	Metrics Recorder
+}
+
+// Recorder receives queue-layer terminal-disposition counts so success/failure
+// is observable uniformly across drivers (asynq's info.Processed/Failed are
+// daily-resetting and absent on memq; emitting our own at the driver gives proper
+// monotonic counters with identical semantics on both). Optional: a nil
+// QueueConfig.Metrics is a no-op (see recordCompleted/recordFailed).
+type Recorder interface {
+	RecordJobCompleted() // a job was acked (successfully processed)
+	RecordJobFailed()    // a job was dead-lettered (retry-exhausted / terminal / panic / mismatch)
+}
+
+func recordCompleted(r Recorder) {
+	if r != nil {
+		r.RecordJobCompleted()
+	}
+}
+
+func recordFailed(r Recorder) {
+	if r != nil {
+		r.RecordJobFailed()
+	}
 }
 
 // DepthReporter is a Queue that also exposes DLQ depth for metrics. Both the
@@ -69,6 +113,10 @@ type QueueConfig struct {
 type DepthReporter interface {
 	Queue
 	DeadLetterDepth() int
+	// ActiveDepth reports jobs pulled by a worker and not yet acked/dead-lettered
+	// (in-flight). Backlog (QueueDepth) can be 0 while jobs are wedged in
+	// processing, so this is the stuck/slow-worker signal.
+	ActiveDepth() int
 }
 
 // Pinger is implemented by drivers backed by an external dependency (the redis

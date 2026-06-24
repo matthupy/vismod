@@ -117,7 +117,7 @@ func TestBuildQueueRedisDriver(t *testing.T) {
 		Workers:   2,
 		RedisAddr: mr.Addr(),
 	}}
-	q, warnings, err := buildQueue(cfg, result.NewJSONLSink(&strings.Builder{}), observe.NewLogger("error"))
+	q, warnings, err := buildQueue(cfg, result.NewJSONLSink(&strings.Builder{}), observe.NewMetrics(), observe.NewLogger("error"))
 	if err != nil {
 		t.Fatalf("buildQueue(redis): %v", err)
 	}
@@ -254,7 +254,7 @@ func TestBuildDeduperMemoryIsNil(t *testing.T) {
 // buildQueue memory driver carries the durability warning.
 func TestBuildQueueMemoryDriverWarns(t *testing.T) {
 	cfg := config.Config{Queue: config.QueueConfig{Driver: "memory", Workers: 1}}
-	q, warnings, err := buildQueue(cfg, result.NewJSONLSink(&strings.Builder{}), observe.NewLogger("error"))
+	q, warnings, err := buildQueue(cfg, result.NewJSONLSink(&strings.Builder{}), observe.NewMetrics(), observe.NewLogger("error"))
 	if err != nil {
 		t.Fatalf("buildQueue(memory): %v", err)
 	}

@@ -28,6 +28,9 @@ type Metrics struct {
 	adapterErrors    *prometheus.CounterVec
 	queueDepthErrors prometheus.Counter
 	divertFailures   prometheus.Counter
+	modelMismatch    *prometheus.CounterVec
+	jobsCompleted    prometheus.Counter
+	jobsFailed       prometheus.Counter
 }
 
 // NewMetrics builds the collectors and registers the job/adapter series. Queue
@@ -62,8 +65,21 @@ func NewMetrics() *Metrics {
 			Name: "vismod_divert_failures_total",
 			Help: "Total potential-CSAM diverts that failed to reach the review channel (frame may never reach a human).",
 		}),
+		modelMismatch: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "vismod_jobs_model_mismatch_total",
+			Help: "Jobs whose stamped model fingerprint did not match the worker's loaded model (reason=mismatch) or carried no fingerprint (reason=unstamped).",
+		}, []string{"reason"}),
+		jobsCompleted: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "vismod_jobs_completed_total",
+			Help: "Jobs acked (successfully processed) at the queue layer, driver-uniform.",
+		}),
+		jobsFailed: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "vismod_jobs_failed_total",
+			Help: "Jobs dead-lettered (retry-exhausted / terminal / panic / model mismatch); these never carry a verdict.",
+		}),
 	}
-	reg.MustRegister(m.jobsTotal, m.adapterSeconds, m.adapterErrors, m.queueDepthErrors, m.divertFailures)
+	reg.MustRegister(m.jobsTotal, m.adapterSeconds, m.adapterErrors, m.queueDepthErrors,
+		m.divertFailures, m.modelMismatch, m.jobsCompleted, m.jobsFailed)
 	return m
 }
 
@@ -74,6 +90,44 @@ func (m *Metrics) Registry() *prometheus.Registry { return m.reg }
 // pipeline after the asset rollup.
 func (m *Metrics) RecordJob(verdict moderation.Verdict) {
 	m.jobsTotal.WithLabelValues(string(verdict)).Inc()
+}
+
+// RecordModelMismatch counts one job the worker could not safely process under
+// its loaded model (§L). reason="mismatch" => the job's stamped fingerprint != the
+// worker's (wrong model deployed; the job is dead-lettered, never silently
+// processed). reason="unstamped" => the job carried no fingerprint (a pre-feature
+// older-binary job; processed but surfaced, never silent). Nil-safe so the queue
+// handler stays decoupled from a metrics instance.
+func (m *Metrics) RecordModelMismatch(reason string) {
+	if m == nil {
+		return
+	}
+	m.modelMismatch.WithLabelValues(reason).Inc()
+}
+
+// RecordJobCompleted counts one job acked (successfully processed) at the queue
+// layer. Emitted by the driver at its terminal Ack disposition (driver-uniform,
+// unlike asynq's daily-resetting info.Processed). It implements queue.Recorder.
+// Nil-safe (mirrors RecordModelMismatch) so a direct call on a nil *Metrics is a
+// no-op rather than a panic; the queue.recordCompleted wrapper also nil-checks.
+func (m *Metrics) RecordJobCompleted() {
+	if m == nil {
+		return
+	}
+	m.jobsCompleted.Inc()
+}
+
+// RecordJobFailed counts one job dead-lettered (retry-exhausted / terminal /
+// panic / model mismatch). These produce no verdict envelope, so they are
+// invisible in vismod_jobs_total — this is the queue-layer failure signal. It
+// implements queue.Recorder.
+// Nil-safe (mirrors RecordModelMismatch) so a direct call on a nil *Metrics is a
+// no-op rather than a panic; the queue.recordFailed wrapper also nil-checks.
+func (m *Metrics) RecordJobFailed() {
+	if m == nil {
+		return
+	}
+	m.jobsFailed.Inc()
 }
 
 // RecordDivertFailure counts one potential-CSAM divert that failed to reach its
@@ -90,7 +144,7 @@ func (m *Metrics) RecordDivertFailure() {
 // bumps vismod_queue_depth_scrape_errors_total, so an operator can tell a genuine
 // empty queue from a backend that went dark. Dead-letter depth is an in-memory
 // accessor (no error). Both read at scrape time, so they never go stale.
-func (m *Metrics) RegisterQueueDepth(queueDepth func() (float64, error), deadLetterDepth func() float64) {
+func (m *Metrics) RegisterQueueDepth(queueDepth func() (float64, error), deadLetterDepth func() float64, active func() float64) {
 	m.reg.MustRegister(
 		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 			Name: "vismod_queue_depth",
@@ -107,6 +161,14 @@ func (m *Metrics) RegisterQueueDepth(queueDepth func() (float64, error), deadLet
 			Name: "vismod_deadletter_depth",
 			Help: "Jobs that have been dead-lettered.",
 		}, deadLetterDepth),
+		// vismod_jobs_active: in-flight == pulled-by-a-worker == unacked are one
+		// state, so one gauge (not three). Backlog (queue_depth) can read 0 while
+		// jobs are wedged in processing — this is the signal for a stuck/slow worker
+		// (or, under at-least-once redis, a crashed worker holding an unacked job).
+		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+			Name: "vismod_jobs_active",
+			Help: "Jobs pulled by a worker and not yet acked or dead-lettered (in-flight).",
+		}, active),
 	)
 }
 

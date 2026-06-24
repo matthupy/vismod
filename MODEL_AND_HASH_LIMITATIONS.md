@@ -105,3 +105,48 @@ The default rollup flags on **any** flagged frame; a configurable
 extraction failure or zero-frames result is **could-not-evaluate → `error`**,
 never `allow` (a static/looping harmful video must not pass by producing no
 frames).
+
+## Multi-replica deploys (§L)
+
+v1 targets a single `serve` replica. Under the redis driver a multi-replica
+rolling deploy can briefly run two model/config versions against the **same**
+queue: replica A (model X) enqueues a job, replica B (model Y) dequeues it. To
+stop B silently moderating with the wrong model, every job is stamped with a
+boot-knowable **model fingerprint** (`config.ModelFingerprint`: a SHA-256 over
+adapter name + the **verdict-affecting `adapter.options` keys**
+(`model`/`model_id`/`endpoint`/`api_version`/`auth_mode` — **NOT** `rps`/
+`max_retries`/`timeout`/retry-backoff) + the resolved threshold map). A worker
+whose loaded fingerprint ≠ the job's **dead-letters the job** (never processes it;
+the DLQ envelope records `model fingerprint mismatch: job=… worker=…`), and
+`vismod_jobs_model_mismatch_total{reason="mismatch"}` increments.
+
+The fingerprint is **scoped to verdict-affecting option keys** on purpose:
+operational-only knobs (`rps`, `max_retries`, `timeout`, retry/backoff) tune
+throughput and resilience, not the score a model returns. Retuning them in a
+rolling deploy therefore **no longer trips the guard** — only an actual model /
+endpoint / API-contract change does. (Any *new* verdict-affecting option key must
+be added to the `verdictAffectingOptionKeys` whitelist in `internal/config/load.go`
+or it won't be guarded.)
+
+**Honest scope:** this is a **misconfiguration / rollout-skew guard, not
+authentication.** A malicious enqueuer can stamp any fingerprint — the guard
+mirrors the audit-log threat model (§G.5): it catches operational skew, not an
+adversary. memq is single-process (enqueuer == worker == same config), so the
+guard is a no-op there.
+
+**Safe deploy strategies — do NOT naively requeue mismatches.** Re-enqueuing an
+archived mismatch onto the shared `vismod` queue re-hits the wrong replica and
+**re-archives in a loop.** Use one of:
+
+1. **Drain-first rolling deploy.** Stop intake, let the old queue drain (the
+   existing §D.3 graceful drain), then cut over replicas to the new model.
+   Simplest for a single shared queue.
+2. **Per-model-version queue namespacing** (`vismod:<fp-prefix>`). Each replica
+   consumes only its own model's queue, so a mismatch is structurally impossible
+   and old jobs drain on old-model replicas. Recommended for zero-downtime;
+   architected-for via `redisQueueName` but **not implemented in v1** (the
+   dead-letter guard is the shipped safety net).
+
+A pre-feature (older-binary) job carries no fingerprint: it is processed but
+surfaced via `vismod_jobs_model_mismatch_total{reason="unstamped"}` and a WARN
+log — never silently, and bounded to the introducing rollout.

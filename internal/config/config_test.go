@@ -180,6 +180,216 @@ func TestConfigHashDeterministicAndSensitive(t *testing.T) {
 	}
 }
 
+func TestModelFingerprintDeterministicAndSensitive(t *testing.T) {
+	c, _ := Load("")
+	base := c.ModelFingerprint()
+
+	if base != c.ModelFingerprint() {
+		t.Fatal("ModelFingerprint not deterministic for identical inputs")
+	}
+
+	// Sensitive to the adapter name (the deployed model).
+	cName, _ := Load("")
+	cName.Adapter.Name = "azure"
+	if base == cName.ModelFingerprint() {
+		t.Fatal("ModelFingerprint must change when adapter.name changes")
+	}
+
+	// Sensitive to a verdict-affecting adapter.options key (api_version/endpoint/
+	// auth_mode/model live here, so a model change => different fingerprint).
+	cOpt, _ := Load("")
+	cOpt.Adapter.Options = map[string]any{"api_version": "2024-09-01"}
+	if base == cOpt.ModelFingerprint() {
+		t.Fatal("ModelFingerprint must change when a verdict-affecting adapter.options key changes")
+	}
+
+	// Sensitive to a verdict-affecting threshold.
+	cThr, _ := Load("")
+	cThr.Thresholds.Default.BlockAt = 0.99
+	if base == cThr.ModelFingerprint() {
+		t.Fatal("ModelFingerprint must change when a threshold changes")
+	}
+
+	// Distinct purpose from ConfigHash — do NOT collapse the two.
+	if c.ModelFingerprint() == c.ConfigHash("v1") {
+		t.Fatal("ModelFingerprint and ConfigHash must be distinct hashes")
+	}
+}
+
+// Each verdict-affecting key, changed in isolation, must move the fingerprint.
+// Guards against a whitelist that silently drops a key (e.g. endpoint/auth_mode/
+// model) and stops guarding a real model swap.
+func TestModelFingerprintSensitiveToEachVerdictKey(t *testing.T) {
+	for _, key := range []string{"api_version", "model", "model_id", "endpoint", "auth_mode"} {
+		base, _ := Load("")
+		baseFP := base.ModelFingerprint()
+
+		c, _ := Load("")
+		c.Adapter.Options = map[string]any{key: "changed-value"}
+		if baseFP == c.ModelFingerprint() {
+			t.Errorf("ModelFingerprint must change when verdict key %q is set", key)
+		}
+	}
+}
+
+// Operational-only knobs (rps, max_retries, timeout, retry/backoff) have no
+// verdict impact. Tuning them in a rolling deploy must NOT change the fingerprint,
+// or it would spuriously trip the §L dead-letter guard.
+func TestModelFingerprintIgnoresOperationalKeys(t *testing.T) {
+	base, _ := Load("")
+	baseFP := base.ModelFingerprint()
+
+	for _, kv := range []map[string]any{
+		{"rps": 50.0},
+		{"max_retries": 7},
+		{"timeout": "30s"},
+		{"retry_backoff": "500ms"},
+	} {
+		c, _ := Load("")
+		c.Adapter.Options = kv
+		if baseFP != c.ModelFingerprint() {
+			t.Errorf("ModelFingerprint must NOT change for operational-only option %v", kv)
+		}
+	}
+}
+
+// A verdict key must dominate: even alongside operational noise, only the
+// verdict key's value drives the fingerprint, and operational churn around a
+// fixed verdict key leaves it stable.
+func TestModelFingerprintScopesToVerdictKeysOnly(t *testing.T) {
+	withNoise := func(rps float64, retries int) Config {
+		c, _ := Load("")
+		c.Adapter.Options = map[string]any{
+			"endpoint":    "https://x.cognitiveservices.azure.com",
+			"api_version": "2024-09-01",
+			"rps":         rps,
+			"max_retries": retries,
+		}
+		return c
+	}
+	a := withNoise(10, 3)
+	b := withNoise(99, 1) // same verdict keys, different operational knobs
+	if a.ModelFingerprint() != b.ModelFingerprint() {
+		t.Fatal("ModelFingerprint must ignore operational knobs when verdict keys match")
+	}
+}
+
+// The #1 correctness landmine: adapter.options is a map[string]any, and naive Go
+// map formatting yields random key order => a non-deterministic hash => replicas
+// with identical config dead-letter each other. json.Marshal sorts keys
+// recursively, so the fingerprint must be invariant to map insertion order, even
+// for nested maps.
+func TestModelFingerprintStableAcrossOptionMapOrder(t *testing.T) {
+	mk := func(build func(m map[string]any)) Config {
+		c, _ := Load("")
+		opts := map[string]any{}
+		build(opts)
+		c.Adapter.Options = opts
+		return c
+	}
+
+	// Same logical options, keys inserted in two different orders, with a nested map.
+	a := mk(func(m map[string]any) {
+		m["api_version"] = "2024-09-01"
+		m["endpoint"] = "https://x.cognitiveservices.azure.com"
+		m["retry"] = map[string]any{"max": 3, "backoff": "500ms"}
+	})
+	b := mk(func(m map[string]any) {
+		m["retry"] = map[string]any{"backoff": "500ms", "max": 3}
+		m["endpoint"] = "https://x.cognitiveservices.azure.com"
+		m["api_version"] = "2024-09-01"
+	})
+
+	if a.ModelFingerprint() != b.ModelFingerprint() {
+		t.Fatal("ModelFingerprint must be invariant to adapter.options map key order (incl. nested)")
+	}
+}
+
+// --- Adapter-option registry guard (PR #14 issue 5: whitelist fail-open) ---
+//
+// verdictAffectingOptionKeys is FAIL-OPEN: an adapter.options key absent from it
+// is silently un-guarded by ModelFingerprint, so a model swap via that key could
+// slip a rolling deploy without dead-lettering (§L). The registry below is the
+// single source of truth that partitions EVERY known adapter.options key into
+// verdict-affecting vs operational-only; these tests back the 🔴 MAINTENANCE
+// comment in load.go with a mechanical check so adding a key without classifying
+// it fails CI instead of going unguarded.
+
+// TestOptionRegistryPartitionWellFormed asserts the two partitions of the
+// registry are internally consistent: each is sorted with no duplicates, and no
+// key is classified as BOTH verdict-affecting and operational (which would make
+// the classification ambiguous). verdictAffectingOptionKeys must equal the
+// verdict partition so ModelFingerprint stays derived from — not divergent
+// from — the registry.
+func TestOptionRegistryPartitionWellFormed(t *testing.T) {
+	assertSortedUnique := func(name string, keys []string) {
+		t.Helper()
+		seen := map[string]bool{}
+		for i, k := range keys {
+			if seen[k] {
+				t.Errorf("%s contains duplicate key %q", name, k)
+			}
+			seen[k] = true
+			if i > 0 && keys[i-1] > k {
+				t.Errorf("%s is not sorted: %q before %q", name, keys[i-1], k)
+			}
+		}
+	}
+	assertSortedUnique("verdictAffectingOptionKeys", verdictAffectingOptionKeys)
+	assertSortedUnique("operationalOptionKeys", operationalOptionKeys)
+
+	verdict := map[string]bool{}
+	for _, k := range verdictAffectingOptionKeys {
+		verdict[k] = true
+	}
+	for _, k := range operationalOptionKeys {
+		if verdict[k] {
+			t.Errorf("key %q is classified as BOTH verdict-affecting and operational", k)
+		}
+	}
+}
+
+// TestKnownOptionKeysPinned pins the EXACT full set of classified adapter.options
+// keys. This is the mechanical guard the 🔴 MAINTENANCE comment relies on: adding
+// a new key that an adapter reads (see internal/moderate/adapters/*/options.go)
+// without adding it to the registry — i.e. without DELIBERATELY classifying it as
+// verdict-affecting or operational — fails here. The fix is never to edit this
+// expectation blindly; it is to decide "does this key change the score a model
+// returns?" and put it in the right partition, then update this pin in the SAME
+// commit. The keys mirror what azure/hive decodeOptions actually read today:
+// azure → endpoint, auth_mode, api_version, rps, max_retries, retry_backoff;
+// hive → endpoint, rps, max_retries, retry_backoff; plus the forward-looking
+// verdict selectors model/model_id and the documented operational knob timeout.
+func TestKnownOptionKeysPinned(t *testing.T) {
+	want := map[string]bool{
+		// verdict-affecting
+		"api_version": true,
+		"auth_mode":   true,
+		"endpoint":    true,
+		"model":       true,
+		"model_id":    true,
+		// operational-only
+		"max_retries":   true,
+		"retry_backoff": true,
+		"rps":           true,
+		"timeout":       true,
+	}
+	got := map[string]bool{}
+	for _, k := range knownOptionKeys() {
+		got[k] = true
+	}
+	for k := range want {
+		if !got[k] {
+			t.Errorf("known option key %q missing from registry — classify it in load.go", k)
+		}
+	}
+	for k := range got {
+		if !want[k] {
+			t.Errorf("registry has unpinned key %q — add it here and confirm its partition", k)
+		}
+	}
+}
+
 func TestExampleConfigLoads(t *testing.T) {
 	// The shipped example must be valid.
 	if _, err := Load(filepath.Join("..", "..", "config.example.yaml")); err != nil {
