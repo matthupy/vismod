@@ -9,7 +9,8 @@ Hash Matching → Classification → Review → Investigation taxonomy (cf. ROOS
 a review console / rules engine downstream.
 
 > **Status: M4 (responsible-use & docs).** The full pipeline runs end-to-end with
-> the credential-free `stub` adapter, Azure (M1), or Hive (M5); video inputs are framed by the
+> the credential-free `stub` adapter, Azure (M1), Hive (M5), or Google Cloud Vision
+> SafeSearch (M5); video inputs are framed by the
 > real `videosift` extractor (M2); the worker ships a Docker image, boot
 > validation, and Prometheus metrics + `/healthz`/`/readyz` (M3); and the
 > tamper-evident audit log, responsible-use/security/licensing docs, and the

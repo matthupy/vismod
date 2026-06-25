@@ -4,13 +4,15 @@
 # variables with the VISMOD_ prefix (dots -> underscores), e.g.:
 #   VISMOD_AZURE_KEY=...        VISMOD_AZURE_ENDPOINT=https://<res>.cognitiveservices.azure.com
 #   VISMOD_HIVE_TOKEN=...
+#   VISMOD_GOOGLE_API_KEY=...   (or VISMOD_GOOGLE_TOKEN=... for auth_mode: bearer)
 #
 # Thresholds are PER-ADAPTER and NOT portable: a 0.667 threshold means a
-# different thing for Azure severity/6, a Hive per-head probability, and an AWS
-# confidence/100 score. Re-tune thresholds whenever you switch adapters.
+# different thing for Azure severity/6, a Hive per-head probability, a Google
+# SafeSearch likelihood bucket, and an AWS confidence/100 score. Re-tune
+# thresholds whenever you switch adapters.
 
 adapter:
-  name: stub            # "stub" (no creds), "azure", or "hive". Selects the single active model.
+  name: stub            # "stub" (no creds), "azure", "hive", or "google". Selects the single active model.
   options: {}           # adapter-specific, opaque to the core; decoded inside the adapter.
 
   # --- Azure AI Content Safety (image:analyze) ---
@@ -43,6 +45,27 @@ adapter:
   # probability). Hive probabilities are NOT comparable to Azure severity/6 — a 0.667
   # threshold means a different thing per adapter. Image-only in v1 (video is native
   # to Hive but framed via videosift here, same as Azure).
+
+  # --- Google Cloud Vision SafeSearch (images:annotate, image) ---
+  # Set name: google and uncomment. Credentials are env-ONLY (never in yaml):
+  #   VISMOD_GOOGLE_API_KEY=...   (auth_mode: apikey, the default — sent as ?key=)
+  #   VISMOD_GOOGLE_TOKEN=...     (auth_mode: bearer — OAuth2/ADC access token acquired
+  #                                out-of-band, e.g. `gcloud auth print-access-token`)
+  #   VISMOD_GOOGLE_PROJECT=...   (optional, bearer only — sent as x-goog-user-project
+  #                                for billing/quota attribution)
+  # options:
+  #   endpoint: https://vision.googleapis.com/v1/images:annotate  # default; override for a test host
+  #   auth_mode: apikey       # apikey (default) | bearer
+  #   rps: 5                  # shared token-bucket rate (tune to your Vision quota)
+  #   max_retries: 3          # transient (429/5xx/net) retries before failing the frame (0 disables)
+  #   retry_backoff: 500ms    # base backoff; doubles per attempt (+jitter), capped 30s, honors Retry-After
+  # SafeSearch returns five ORDINAL likelihood enums (adult/spoof/medical/violence/racy),
+  # each UNKNOWN/VERY_UNLIKELY..VERY_LIKELY. The adapter maps them to a fixed [0,1] lookup
+  # (VERY_UNLIKELY=0.0 .. VERY_LIKELY=1.0; UNKNOWN -> score null = could-not-evaluate) with
+  # score_origin: likelihood_enum. Mapping: adult->SEXUAL, racy->SUGGESTIVE_RACY,
+  # violence->VIOLENCE, medical->MEDICAL, spoof->SPOOF. MEDICAL/SPOOF are provenance-only,
+  # NOT harm signals. These likelihood buckets are NOT comparable to Azure severity/6 or
+  # Hive probabilities — re-tune thresholds. v1 sends inline base64 content only (no gcsImageUri).
 
 # Two boundaries per category: flag_at (-> verdict flag) and block_at (-> verdict block).
 # Categories not listed fall back to thresholds.default.
