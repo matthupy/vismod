@@ -2,6 +2,8 @@ package google
 
 import (
 	"context"
+	"encoding/base64"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -30,7 +32,8 @@ func TestNewRequiresSecret(t *testing.T) {
 }
 
 // TestNewAndCapabilities: a valid apikey config builds, and Caps advertises the
-// five SafeSearch categories, the 20 MB image cap, and no video support.
+// five SafeSearch categories, the derived raw-image cap (so the pre-flight gate
+// matches Vision's 10 MB inline-request limit), and no video support.
 func TestNewAndCapabilities(t *testing.T) {
 	m, err := New(cfgWith(nil, map[string]string{"GOOGLE_API_KEY": "k"}))
 	if err != nil {
@@ -43,8 +46,8 @@ func TestNewAndCapabilities(t *testing.T) {
 	if caps.SupportsVideo {
 		t.Error("SafeSearch is image-only")
 	}
-	if caps.MaxImageBytes != maxImageBytes {
-		t.Errorf("MaxImageBytes = %d, want %d", caps.MaxImageBytes, maxImageBytes)
+	if caps.MaxImageBytes != maxRawImageBytes {
+		t.Errorf("MaxImageBytes = %d, want %d", caps.MaxImageBytes, maxRawImageBytes)
 	}
 	want := map[moderation.Category]bool{
 		moderation.CategorySexual: true, moderation.CategorySuggestiveRacy: true,
@@ -127,18 +130,49 @@ func TestAnalyzeImageMissingAnnotation(t *testing.T) {
 	}
 }
 
+// codeOf extracts the CodedError code, failing the test if err does not
+// implement moderation.CodedError (every terminal validateInput failure must,
+// so it lands in vismod_adapter_errors_total{code} with a label).
+func codeOf(t *testing.T, err error) string {
+	t.Helper()
+	if err == nil {
+		t.Fatal("expected an error, got nil")
+	}
+	var ce moderation.CodedError
+	if !errors.As(err, &ce) {
+		t.Fatalf("error %T does not implement moderation.CodedError: %v", err, err)
+	}
+	return ce.ErrorCode()
+}
+
 func TestValidateInput(t *testing.T) {
-	if err := validateInput(moderation.Image{}); err == nil {
-		t.Error("empty bytes must error")
+	if got := codeOf(t, validateInput(moderation.Image{})); got != "input_empty" {
+		t.Errorf("empty bytes code = %q, want input_empty", got)
 	}
-	if err := validateInput(moderation.Image{Bytes: make([]byte, maxImageBytes+1), MIME: "image/png"}); err == nil {
-		t.Error("oversize must error")
+	// Raw bytes over the derived raw ceiling -> input_oversize.
+	if got := codeOf(t, validateInput(moderation.Image{Bytes: make([]byte, maxRawImageBytes+1), MIME: "image/png"})); got != "input_oversize" {
+		t.Errorf("oversize code = %q, want input_oversize", got)
 	}
-	if err := validateInput(moderation.Image{Bytes: []byte("x"), MIME: "application/zip"}); err == nil {
-		t.Error("unsupported MIME must error")
+	if got := codeOf(t, validateInput(moderation.Image{Bytes: []byte("x"), MIME: "application/zip"})); got != "input_mime" {
+		t.Errorf("unsupported MIME code = %q, want input_mime", got)
 	}
 	if err := validateInput(moderation.Image{Bytes: []byte("x"), MIME: "image/png"}); err != nil {
 		t.Errorf("valid png rejected: %v", err)
+	}
+}
+
+// TestValidateInputBase64Inflation proves issue 1: an image whose RAW size sat
+// under the old 20 MB image cap but whose base64-ENCODED form exceeds Vision's
+// 10 MB JSON request limit is now rejected. 8 MB raw inflates to ~10.67 MB
+// encoded (> 10 MB), so it must be a terminal input_oversize, not slip through
+// to a Vision 400.
+func TestValidateInputBase64Inflation(t *testing.T) {
+	raw := make([]byte, 8*1024*1024) // 8 MB: under the old 20 MB image cap...
+	if base64.StdEncoding.EncodedLen(len(raw)) <= maxRequestBytes {
+		t.Fatalf("test premise broken: 8 MB encodes to %d, want > %d", base64.StdEncoding.EncodedLen(len(raw)), maxRequestBytes)
+	}
+	if got := codeOf(t, validateInput(moderation.Image{Bytes: raw, MIME: "image/png"})); got != "input_oversize" {
+		t.Errorf("base64-inflated image code = %q, want input_oversize", got)
 	}
 }
 

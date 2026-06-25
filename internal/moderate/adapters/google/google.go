@@ -17,6 +17,7 @@ package google
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"math/rand/v2"
 	"time"
@@ -36,9 +37,35 @@ const modelVersion = "v1"
 // (e.g. a regional host or a test server).
 const defaultEndpoint = "https://vision.googleapis.com/v1/images:annotate"
 
-// maxImageBytes is Vision's documented per-image limit (20 MB). Surfaced via
-// Caps so the pipeline pre-flights oversize images before calling AnalyzeImage.
-const maxImageBytes = 20 * 1024 * 1024
+// Vision enforces TWO independent size limits on images:annotate, and for the
+// inline base64 path we send (client.go encodes img into requests[].image.content)
+// the SMALLER one binds. Docs (cloud.google.com/vision/docs/supported-files,
+// /vision/quotas): "Image files ... shouldn't exceed 20 MB" AND "The Vision API
+// imposes a 10 MB JSON request size limit", with the explicit warning that
+// "base64-encoded images may exceed the JSON size limit, even if they are within
+// the image file size limit." base64 inflates raw bytes by 4*ceil(n/3) (~+33%),
+// so the 20 MB image limit is NOT the pre-flight gate for inline content — the
+// 10 MB request limit is. A ~19 MB raw frame that clears a 20 MB check becomes a
+// ~25 MB body and earns a terminal 400 from Vision.
+const (
+	// maxRequestBytes is Vision's 10 MB JSON request limit — the limit that binds
+	// inline base64 content (vs the looser 20 MB per-image file limit, which only
+	// governs a future Cloud-Storage URI path). The base64 content plus the
+	// (small) JSON envelope must fit under it.
+	maxRequestBytes = 10 * 1024 * 1024
+
+	// requestEnvelopeBytes reserves headroom for the JSON wrapper around the
+	// base64 content (requests/image/content/features keys, feature type,
+	// brackets). A few hundred bytes is ample; 1 KiB is a safe margin.
+	requestEnvelopeBytes = 1024
+
+	// maxRawImageBytes is the largest RAW image whose base64 encoding still fits
+	// the request limit: floor of the raw size whose EncodedLen <= the budget.
+	// EncodedLen(n) = 4*ceil(n/3), so the inverse budget is (budget/4)*3. This is
+	// what Caps advertises, so the pipeline pre-flights against the limit that
+	// actually binds inline requests rather than the looser 20 MB image limit.
+	maxRawImageBytes = ((maxRequestBytes - requestEnvelopeBytes) / 4) * 3
+)
 
 // defaultRPS is a conservative default for the shared limiter; tune per the
 // project's Vision quota via options.rps.
@@ -122,7 +149,10 @@ func (g *google) Name() string { return adapterName }
 func (g *google) Capabilities() moderation.Caps {
 	return moderation.Caps{
 		SupportsVideo: false, // SafeSearch is single-image; video framing is one layer up
-		MaxImageBytes: maxImageBytes,
+		// Advertise the derived raw ceiling, not the 20 MB image limit: inline
+		// base64 requests are bound by Vision's 10 MB JSON request limit (see
+		// maxRawImageBytes), so the pre-flight gate must use it.
+		MaxImageBytes: maxRawImageBytes,
 		Categories: []moderation.Category{
 			moderation.CategorySexual,
 			moderation.CategorySuggestiveRacy,
@@ -190,17 +220,28 @@ func responseError(resp annotateResponse) error {
 	return &apiError{Status: 200, Code: fmt.Sprintf("response_%d", e.Code), Message: msg}
 }
 
-// validateInput enforces the 20 MB cap and the format allow-list. Both are
-// terminal (a retry won't fix oversize or an unsupported type).
+// validateInput enforces the inline size budget and the format allow-list. All
+// failures are terminal (a retry won't fix empty/oversize/unsupported input), so
+// each returns a coded *apiError (Status 0 == local, pre-transport) and thus
+// lands in vismod_adapter_errors_total{code} with a label, consistent with
+// transport/HTTP/decode errors.
+//
+// The size check is against the base64-ENCODED length vs Vision's 10 MB JSON
+// request limit, not the raw byte count: client.go sends the image as inline
+// base64, which inflates ~33%, so a raw image under 20 MB can still overflow the
+// request limit (see maxRawImageBytes).
 func validateInput(img moderation.Image) error {
 	if len(img.Bytes) == 0 {
-		return fmt.Errorf("google: empty image")
+		return &apiError{Code: "input_empty", Message: "empty image"}
 	}
-	if int64(len(img.Bytes)) > maxImageBytes {
-		return fmt.Errorf("google: image %d bytes exceeds 20 MB cap", len(img.Bytes))
+	if base64.StdEncoding.EncodedLen(len(img.Bytes)) > maxRequestBytes-requestEnvelopeBytes {
+		return &apiError{Code: "input_oversize", Message: fmt.Sprintf(
+			"image %d bytes exceeds inline budget (base64 must fit Vision's 10 MB request limit; raw cap ~%d bytes)",
+			len(img.Bytes), maxRawImageBytes)}
 	}
 	if img.MIME != "" && !allowedMIME[img.MIME] {
-		return fmt.Errorf("google: unsupported MIME %q (allowed: jpeg/png/gif/bmp/webp/tiff/ico)", img.MIME)
+		return &apiError{Code: "input_mime", Message: fmt.Sprintf(
+			"unsupported MIME %q (allowed: jpeg/png/gif/bmp/webp/tiff/ico)", img.MIME)}
 	}
 	return nil
 }
