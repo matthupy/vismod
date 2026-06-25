@@ -66,6 +66,20 @@ type FramesConfig struct {
 	Keyframe    bool   `mapstructure:"keyframe"`
 	Temporal    bool   `mapstructure:"temporal"`
 	MPDecimate  bool   `mapstructure:"mpdecimate"`
+	// videosift extraction tuning. These are NOT verdict-affecting (consistent
+	// with the scene/keyframe/temporal/mpdecimate toggles) and are intentionally
+	// excluded from ConfigHash/ModelFingerprint. Defaults mirror
+	// videosift.DefaultConfig(); an absent key resolves to that default via
+	// setDefaults so it never zeroes a meaningful value.
+	SceneThreshold       float64 `mapstructure:"scene_threshold"`
+	TemporalInterval     float64 `mapstructure:"temporal_interval"`
+	MPDecimateHi         int     `mapstructure:"mpdecimate_hi"`
+	MPDecimateLo         int     `mapstructure:"mpdecimate_lo"`
+	MPDecimateFrac       float64 `mapstructure:"mpdecimate_frac"`
+	HashAlgo             string  `mapstructure:"hash_algo"` // "phash" | "dhash"
+	HammingThreshold     int     `mapstructure:"hamming_threshold"`
+	HashResizeWidth      int     `mapstructure:"hash_resize_width"`
+	VideosiftConcurrency int     `mapstructure:"videosift_concurrency"`
 	// Binary overrides for the videosift extractor; empty => discovered on PATH.
 	FFmpegPath  string `mapstructure:"ffmpeg_path"`
 	FFprobePath string `mapstructure:"ffprobe_path"`

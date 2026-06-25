@@ -42,6 +42,17 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("frames.keyframe", true)
 	v.SetDefault("frames.temporal", true)
 	v.SetDefault("frames.mpdecimate", true)
+	// videosift extraction tuning; defaults mirror videosift.DefaultConfig() so an
+	// absent key resolves to the upstream default rather than a zero value.
+	v.SetDefault("frames.scene_threshold", 0.4)
+	v.SetDefault("frames.temporal_interval", 2.0)
+	v.SetDefault("frames.mpdecimate_hi", 768)
+	v.SetDefault("frames.mpdecimate_lo", 320)
+	v.SetDefault("frames.mpdecimate_frac", 0.33)
+	v.SetDefault("frames.hash_algo", "phash")
+	v.SetDefault("frames.hamming_threshold", 8)
+	v.SetDefault("frames.hash_resize_width", 256)
+	v.SetDefault("frames.videosift_concurrency", 0) // 0 => videosift uses #enabled strategies
 	v.SetDefault("frames.ffmpeg_path", "")
 	v.SetDefault("frames.ffprobe_path", "")
 

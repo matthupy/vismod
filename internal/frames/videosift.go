@@ -30,6 +30,20 @@ type VideosiftOptions struct {
 	Temporal   bool
 	MPDecimate bool
 
+	// Extraction tuning. The composition root passes the resolved config defaults
+	// (which mirror videosift.DefaultConfig()); a zero numeric here would override
+	// the upstream default, so config.setDefaults seeds non-zero values. HashAlgo
+	// is empty-guarded below so "" keeps the DefaultConfig algorithm.
+	SceneThreshold       float64
+	TemporalInterval     float64
+	MPDecimateHi         int
+	MPDecimateLo         int
+	MPDecimateFrac       float64
+	HashAlgo             string // "phash" | "dhash"; empty => videosift default
+	HammingThreshold     int
+	HashResizeWidth      int
+	VideosiftConcurrency int
+
 	// Binary overrides; empty => "ffmpeg"/"ffprobe" discovered on PATH.
 	FFmpegPath  string
 	FFprobePath string
@@ -122,6 +136,18 @@ func (s *VideosiftSource) Frames(ctx context.Context, videoPath string) ([]Frame
 	cfg.Keyframe = s.opts.Keyframe
 	cfg.Temporal = s.opts.Temporal
 	cfg.MPDecimate = s.opts.MPDecimate
+	cfg.SceneThreshold = s.opts.SceneThreshold
+	cfg.TemporalInterval = s.opts.TemporalInterval
+	cfg.MPDecimateHi = s.opts.MPDecimateHi
+	cfg.MPDecimateLo = s.opts.MPDecimateLo
+	cfg.MPDecimateFrac = s.opts.MPDecimateFrac
+	cfg.HammingThreshold = s.opts.HammingThreshold
+	cfg.HashResizeWidth = s.opts.HashResizeWidth
+	cfg.Concurrency = s.opts.VideosiftConcurrency
+	// Empty => keep DefaultConfig's HashAlgo (a zero-value "" is not a valid algo).
+	if s.opts.HashAlgo != "" {
+		cfg.HashAlgo = videosift.HashAlgo(s.opts.HashAlgo)
+	}
 	cfg.FFmpegPath = s.ffmpegPath()
 	cfg.FFprobePath = s.ffprobePath()
 

@@ -38,6 +38,69 @@ func TestLoadDefaults(t *testing.T) {
 	if c.Thresholds.SexualPotentialCSAM != 0.667 {
 		t.Errorf("SEXUAL potential_csam = %v, want 0.667", c.Thresholds.SexualPotentialCSAM)
 	}
+	// frames moderation fan-out (pipeline concurrency) is wired with a non-zero default.
+	if c.Frames.Concurrency != 4 {
+		t.Errorf("default frames.concurrency = %d, want 4", c.Frames.Concurrency)
+	}
+	// videosift extraction tuning defaults mirror videosift.DefaultConfig().
+	if c.Frames.SceneThreshold != 0.4 {
+		t.Errorf("default scene_threshold = %v, want 0.4", c.Frames.SceneThreshold)
+	}
+	if c.Frames.TemporalInterval != 2.0 {
+		t.Errorf("default temporal_interval = %v, want 2.0", c.Frames.TemporalInterval)
+	}
+	if c.Frames.MPDecimateHi != 768 || c.Frames.MPDecimateLo != 320 {
+		t.Errorf("default mpdecimate_hi/lo = %d/%d, want 768/320", c.Frames.MPDecimateHi, c.Frames.MPDecimateLo)
+	}
+	if c.Frames.MPDecimateFrac != 0.33 {
+		t.Errorf("default mpdecimate_frac = %v, want 0.33", c.Frames.MPDecimateFrac)
+	}
+	if c.Frames.HashAlgo != "phash" {
+		t.Errorf("default hash_algo = %q, want phash", c.Frames.HashAlgo)
+	}
+	if c.Frames.HammingThreshold != 8 {
+		t.Errorf("default hamming_threshold = %d, want 8", c.Frames.HammingThreshold)
+	}
+	if c.Frames.HashResizeWidth != 256 {
+		t.Errorf("default hash_resize_width = %d, want 256", c.Frames.HashResizeWidth)
+	}
+}
+
+// A config file that sets only an unrelated frames key (max_frames) must still
+// resolve every videosift tuning knob to its videosift.DefaultConfig() value —
+// an absent key must never zero a meaningful default.
+func TestLoadFramesTuningDefaultsWhenAbsent(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "c.yaml")
+	if err := os.WriteFile(path, []byte("frames:\n  max_frames: 7\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.Frames.MaxFrames != 7 {
+		t.Errorf("max_frames = %d, want 7", c.Frames.MaxFrames)
+	}
+	if c.Frames.SceneThreshold != 0.4 {
+		t.Errorf("absent scene_threshold = %v, want videosift default 0.4", c.Frames.SceneThreshold)
+	}
+	if c.Frames.TemporalInterval != 2.0 {
+		t.Errorf("absent temporal_interval = %v, want 2.0", c.Frames.TemporalInterval)
+	}
+	if c.Frames.HashAlgo != "phash" {
+		t.Errorf("absent hash_algo = %q, want phash", c.Frames.HashAlgo)
+	}
+	if c.Frames.HammingThreshold != 8 {
+		t.Errorf("absent hamming_threshold = %d, want 8", c.Frames.HammingThreshold)
+	}
+	if c.Frames.HashResizeWidth != 256 {
+		t.Errorf("absent hash_resize_width = %d, want 256", c.Frames.HashResizeWidth)
+	}
+	if c.Frames.MPDecimateHi != 768 || c.Frames.MPDecimateLo != 320 || c.Frames.MPDecimateFrac != 0.33 {
+		t.Errorf("absent mpdecimate hi/lo/frac = %d/%d/%v, want 768/320/0.33",
+			c.Frames.MPDecimateHi, c.Frames.MPDecimateLo, c.Frames.MPDecimateFrac)
+	}
 }
 
 func TestLoadFileOverride(t *testing.T) {
