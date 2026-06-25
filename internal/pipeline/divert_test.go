@@ -48,14 +48,14 @@ func sexualFrame(score float64) moderation.NormalizedResult {
 	return moderation.NormalizedResult{Frames: []moderation.FrameResult{okFrame(scoreCat(moderation.CategorySexual, score))}}
 }
 
-func TestProcessDivertsPotentialCSAM(t *testing.T) {
+func TestProcessDivertsFlaggedBand(t *testing.T) {
 	dir := t.TempDir()
 	img := filepath.Join(dir, "x.jpg")
 	if err := os.WriteFile(img, []byte("data"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	// SEXUAL score 0.7 >= default potential_csam 0.667 => divert.
-	mod := &fakeMod{caps: moderation.Caps{MaxImageBytes: 1024}, result: sexualFrame(0.7)}
+	// SEXUAL score 0.6 in [flag_at 0.5, block_at 0.667) => flag => divert.
+	mod := &fakeMod{caps: moderation.Caps{MaxImageBytes: 1024}, result: sexualFrame(0.6)}
 	div := &fakeDiverter{}
 	p := newPipe(t, mod, &frames.FakeFrameSource{}, &capSink{})
 	p.Diverter = div
@@ -75,31 +75,48 @@ func TestProcessDivertsPotentialCSAM(t *testing.T) {
 	}
 }
 
-func TestProcessBelowPotentialCSAMNoDivert(t *testing.T) {
+func TestProcessBelowFlagNoDivert(t *testing.T) {
 	dir := t.TempDir()
 	img := filepath.Join(dir, "x.jpg")
 	_ = os.WriteFile(img, []byte("data"), 0o600)
-	// SEXUAL score 0.5 < 0.667 => no divert.
-	mod := &fakeMod{caps: moderation.Caps{MaxImageBytes: 1024}, result: sexualFrame(0.5)}
+	// SEXUAL score 0.4 < flag_at 0.5 => allow => no divert.
+	mod := &fakeMod{caps: moderation.Caps{MaxImageBytes: 1024}, result: sexualFrame(0.4)}
 	div := &fakeDiverter{}
 	p := newPipe(t, mod, &frames.FakeFrameSource{}, &capSink{})
 	p.Diverter = div
 
 	_ = p.Process(context.Background(), "job-1", moderation.Source{Kind: "file", Ref: img})
 	if len(div.items) != 0 {
-		t.Fatalf("below-threshold must not divert, got %d", len(div.items))
+		t.Fatalf("below flag_at must not divert, got %d", len(div.items))
+	}
+}
+
+func TestProcessAtBlockNoDivert(t *testing.T) {
+	dir := t.TempDir()
+	img := filepath.Join(dir, "x.jpg")
+	_ = os.WriteFile(img, []byte("data"), 0o600)
+	// SEXUAL score 0.7 >= block_at 0.667 => auto-block, NOT diverted.
+	mod := &fakeMod{caps: moderation.Caps{MaxImageBytes: 1024}, result: sexualFrame(0.7)}
+	div := &fakeDiverter{}
+	p := newPipe(t, mod, &frames.FakeFrameSource{}, &capSink{})
+	p.Diverter = div
+
+	_ = p.Process(context.Background(), "job-1", moderation.Source{Kind: "file", Ref: img})
+	if len(div.items) != 0 {
+		t.Fatalf("at/above block_at must not divert (it blocks), got %d", len(div.items))
 	}
 }
 
 // A divert that fails must NOT fail the job (fail-safe), but MUST bump the
-// divert-failure counter so a lost potential-CSAM frame is observable.
+// divert-failure counter so a lost flagged frame is observable.
 func TestProcessDivertFailureIsObservableButNonFatal(t *testing.T) {
 	dir := t.TempDir()
 	img := filepath.Join(dir, "x.jpg")
 	if err := os.WriteFile(img, []byte("data"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	mod := &fakeMod{caps: moderation.Caps{MaxImageBytes: 1024}, result: sexualFrame(0.7)}
+	// 0.6 in [flag_at 0.5, block_at 0.667) => flag => divert (which fails here).
+	mod := &fakeMod{caps: moderation.Caps{MaxImageBytes: 1024}, result: sexualFrame(0.6)}
 	rec := &countingRecorder{}
 	p := newPipe(t, mod, &frames.FakeFrameSource{}, &capSink{})
 	p.Diverter = failDiverter{}

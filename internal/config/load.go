@@ -22,7 +22,6 @@ func setDefaults(v *viper.Viper) {
 	// SEXUAL is strictest by default.
 	v.SetDefault("thresholds.SEXUAL.flag_at", 0.5)
 	v.SetDefault("thresholds.SEXUAL.block_at", 0.667)
-	v.SetDefault("thresholds.SEXUAL.potential_csam", 0.667)
 
 	v.SetDefault("queue.driver", "memory")
 	v.SetDefault("queue.workers", 4)
@@ -104,8 +103,7 @@ func resolveThresholds(v *viper.Viper) Thresholds {
 			FlagAt:  v.GetFloat64("thresholds.default.flag_at"),
 			BlockAt: v.GetFloat64("thresholds.default.block_at"),
 		},
-		PerCategory:         map[moderation.Category]CategoryThreshold{},
-		SexualPotentialCSAM: v.GetFloat64("thresholds.SEXUAL.potential_csam"),
+		PerCategory: map[moderation.Category]CategoryThreshold{},
 	}
 	sub := v.Sub("thresholds")
 	if sub == nil {
@@ -120,9 +118,6 @@ func resolveThresholds(v *viper.Viper) Thresholds {
 			BlockAt: sub.GetFloat64(key + ".block_at"),
 		}
 		t.PerCategory[moderation.Category(strings.ToUpper(key))] = ct
-	}
-	if t.SexualPotentialCSAM == 0 {
-		t.SexualPotentialCSAM = 0.667
 	}
 	return t
 }
@@ -155,7 +150,6 @@ func (c Config) ConfigHash(modelVersion string) string {
 	fmt.Fprintf(&b, "adapter=%s\n", c.Adapter.Name)
 	fmt.Fprintf(&b, "model_version=%s\n", modelVersion)
 	fmt.Fprintf(&b, "default=flag:%g,block:%g\n", c.Thresholds.Default.FlagAt, c.Thresholds.Default.BlockAt)
-	fmt.Fprintf(&b, "sexual_potential_csam=%g\n", c.Thresholds.SexualPotentialCSAM)
 
 	cats := make([]string, 0, len(c.Thresholds.PerCategory))
 	for cat := range c.Thresholds.PerCategory {
@@ -283,7 +277,6 @@ func (c Config) ModelFingerprint() string {
 	}
 
 	fmt.Fprintf(&b, "default=flag:%g,block:%g\n", c.Thresholds.Default.FlagAt, c.Thresholds.Default.BlockAt)
-	fmt.Fprintf(&b, "sexual_potential_csam=%g\n", c.Thresholds.SexualPotentialCSAM)
 
 	cats := make([]string, 0, len(c.Thresholds.PerCategory))
 	for cat := range c.Thresholds.PerCategory {

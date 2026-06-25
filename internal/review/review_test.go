@@ -21,7 +21,7 @@ func TestLogDiverterRecordsHashNotBytes(t *testing.T) {
 		TimestampSec: &ts,
 		Category:     "SEXUAL",
 		Score:        &score,
-		Reason:       "sexual score >= potential_csam",
+		Reason:       "score >= flag_at",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -30,8 +30,8 @@ func TestLogDiverterRecordsHashNotBytes(t *testing.T) {
 	if !strings.Contains(out, "deadbeef") {
 		t.Fatalf("divert must log the frame hash, got: %s", out)
 	}
-	if !strings.Contains(strings.ToLower(out), "potential") && !strings.Contains(strings.ToLower(out), "csam") {
-		t.Fatalf("divert log must signal potential-CSAM, got: %s", out)
+	if !strings.Contains(strings.ToLower(out), "flagged") && !strings.Contains(out, "review_divert") {
+		t.Fatalf("divert log must signal a flagged-frame review divert, got: %s", out)
 	}
 	// Doc promises the score is recorded; assert it is actually emitted.
 	if !strings.Contains(out, "score=0.9") {

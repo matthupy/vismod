@@ -48,7 +48,7 @@ type Deduper interface {
 	Commit(ctx context.Context, jobID string) error
 }
 
-// DivertFailureRecorder counts potential-CSAM diverts that failed to reach the
+// DivertFailureRecorder counts flagged-frame diverts that failed to reach the
 // review channel (§G.8 vismod_divert_failures_total). It is an OPTIONAL
 // capability discovered by type-asserting the wired Metrics — a recorder that
 // does not implement it (or a nil Metrics) makes the bump a no-op, so the divert
@@ -68,7 +68,7 @@ type Pipeline struct {
 	Log       *slog.Logger
 	Metrics   JobRecorder     // optional; nil = no metrics
 	Audit     *audit.Log      // optional; nil = no audit trail (CLI scan default)
-	Diverter  review.Diverter // optional; nil = no potential-CSAM divert (§G.8)
+	Diverter  review.Diverter // optional; nil = no flagged-frame divert (§G.8)
 	Dedup     Deduper         // optional; nil = in-memory guards only (scan/memq)
 }
 
@@ -302,9 +302,10 @@ func (p *Pipeline) moderateFrame(ctx context.Context, img moderation.Image, ts *
 	if len(res.Frames) > 0 {
 		cats = res.Frames[0].Categories
 	}
-	// §G.8: a high-severity SEXUAL hit is NOT a CSAM determination but MUST be
-	// handled as potential-CSAM. Divert to human review BEFORE Sink.Write,
-	// carrying only SHA-256(frame) — never the frame bytes or Raw (§G.2).
+	// §G.8: a frame whose category score lands in the flag band ([flag_at,
+	// block_at)) is flagged for manual review. Divert it to human review BEFORE
+	// Sink.Write, carrying only SHA-256(frame) — never the frame bytes or Raw
+	// (§G.2). Scores >= block_at auto-block and are NOT diverted.
 	//
 	// DELIVERY CONTRACT — AT-LEAST-ONCE (unlike Sink.Write + Audit.Append, which
 	// are idempotent per JobID). Divert fires here inside analyze, which re-runs
@@ -314,7 +315,7 @@ func (p *Pipeline) moderateFrame(ctx context.Context, img moderation.Image, ts *
 	// seen-set is lost. The (JobID, FrameSHA256) pair on review.Item is the stable
 	// dedup key — the downstream Diverter (durable review queue) MUST collapse
 	// repeats on it. v1 LogDiverter is dedup-exempt (a repeated WARN is harmless).
-	p.divertPotentialCSAM(ctx, meta, img, ts, cats)
+	p.divertFlagged(ctx, meta, img, ts, cats)
 	return moderation.FrameResult{TimestampSec: ts, Status: moderation.FrameStatusOK, Categories: cats}
 }
 
@@ -325,19 +326,23 @@ type jobMeta struct {
 	AssetID string
 }
 
-// divertPotentialCSAM routes a frame to human review when a SEXUAL category
-// scores at/above thresholds.SEXUAL.potential_csam (§G.8). It is a no-op when
-// no Diverter is configured or the threshold is disabled (<= 0).
-func (p *Pipeline) divertPotentialCSAM(ctx context.Context, meta jobMeta, img moderation.Image, ts *float64, cats []moderation.CategoryResult) {
+// divertFlagged routes a frame to human review when any category score lands in
+// the flag band [flag_at, block_at) for that category (§G.8). Scores >= block_at
+// auto-block and are NOT diverted; scores < flag_at allow. It is a no-op when no
+// Diverter is configured.
+//
+// Flagged is not yet stamped on the CategoryResult here (applyThresholds runs
+// later in Process), so the band is computed inline from the per-category config.
+func (p *Pipeline) divertFlagged(ctx context.Context, meta jobMeta, img moderation.Image, ts *float64, cats []moderation.CategoryResult) {
 	if p.Diverter == nil {
 		return
 	}
-	thr := p.Cfg.Thresholds.SexualPotentialCSAM
-	if thr <= 0 {
-		return
-	}
 	for _, c := range cats {
-		if c.Category != moderation.CategorySexual || c.Score == nil || *c.Score < thr {
+		if c.Score == nil {
+			continue
+		}
+		ct := p.Cfg.Thresholds.For(c.Category)
+		if *c.Score < ct.FlagAt || *c.Score >= ct.BlockAt {
 			continue
 		}
 		sum := sha256.Sum256(img.Bytes)
@@ -349,14 +354,14 @@ func (p *Pipeline) divertPotentialCSAM(ctx context.Context, meta jobMeta, img mo
 			TimestampSec: ts,
 			Category:     string(c.Category),
 			Score:        &score,
-			Reason:       "SEXUAL score >= thresholds.SEXUAL.potential_csam",
+			Reason:       "score >= flag_at",
 		}
 		if err := p.Diverter.Divert(ctx, it); err != nil {
 			// FAIL-SAFE: a dropped divert must NOT block the job (the §G.8 seam is
-			// best-effort by contract). But a silently-lost potential-CSAM frame is
-			// the one thing §G.8 must not hide, so make the drop observable via a
-			// counter an operator can alert on — log alone is not alertable.
-			p.Log.Warn("potential-CSAM divert failed", "job_id", meta.ID, "err", err)
+			// best-effort by contract). But a silently-lost flagged frame is the one
+			// thing §G.8 must not hide, so make the drop observable via a counter an
+			// operator can alert on — log alone is not alertable.
+			p.Log.Warn("flagged frame divert failed", "job_id", meta.ID, "err", err)
 			// TODO(v1.1): p.Metrics is nil on the scan path, so a real erroring
 			// Diverter's failure goes uncounted here (only logged). Harmless today
 			// (LogDiverter never errors); wire a Metrics sink on the scan path

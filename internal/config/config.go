@@ -21,9 +21,6 @@ type CategoryThreshold struct {
 type Thresholds struct {
 	Default     CategoryThreshold                         `mapstructure:"default"`
 	PerCategory map[moderation.Category]CategoryThreshold `mapstructure:"-"`
-	// SexualPotentialCSAM is the SEXUAL score at/above which a frame is treated
-	// as potential-CSAM and diverted (default 0.667 = Azure severity 4).
-	SexualPotentialCSAM float64 `mapstructure:"-"`
 }
 
 // For returns the threshold for category c, falling back to Default.

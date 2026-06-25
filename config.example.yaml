@@ -69,6 +69,8 @@ adapter:
 
 # Two boundaries per category: flag_at (-> verdict flag) and block_at (-> verdict block).
 # Categories not listed fall back to thresholds.default.
+# A score in [flag_at, block_at) flags and routes to manual review; >= block_at auto-blocks.
+# block_at > 1.0 => category never auto-blocks; all above-flag hits route to manual review (flag).
 thresholds:
   default:
     flag_at: 0.5
@@ -76,7 +78,6 @@ thresholds:
   SEXUAL:               # strictest by default
     flag_at: 0.5
     block_at: 0.667
-    potential_csam: 0.667   # SEXUAL score at/above which a frame is treated as potential-CSAM (M4 divert)
 
 queue:
   driver: memory        # "memory" (dev/CLI, non-durable) or "redis" (durable, at-least-once).

@@ -35,9 +35,6 @@ func TestLoadDefaults(t *testing.T) {
 	if got := c.Thresholds.For(moderation.CategorySexual).BlockAt; got != 0.667 {
 		t.Errorf("SEXUAL block_at = %v, want 0.667", got)
 	}
-	if c.Thresholds.SexualPotentialCSAM != 0.667 {
-		t.Errorf("SEXUAL potential_csam = %v, want 0.667", c.Thresholds.SexualPotentialCSAM)
-	}
 }
 
 func TestLoadFileOverride(t *testing.T) {
