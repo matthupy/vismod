@@ -20,6 +20,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"math/rand/v2"
+	"net/http"
 	"time"
 
 	"github.com/matthupy/vismod/internal/moderate"
@@ -222,9 +223,17 @@ func responseError(resp annotateResponse) error {
 
 // validateInput enforces the inline size budget and the format allow-list. All
 // failures are terminal (a retry won't fix empty/oversize/unsupported input), so
-// each returns a coded *apiError (Status 0 == local, pre-transport) and thus
-// lands in vismod_adapter_errors_total{code} with a label, consistent with
-// transport/HTTP/decode errors.
+// each returns a coded *apiError and thus lands in vismod_adapter_errors_total{code}
+// with a label, consistent with transport/HTTP/decode errors.
+//
+// Each failure carries a semantically-correct 4xx Status so apiError.Error()
+// renders a meaningful "HTTP 4xx" (a bad-request condition) rather than the
+// misleading "HTTP 0", which reads as a transport event in logs. Status is
+// purely a rendering/observability detail here: these errors stay TERMINAL
+// because the retry loop (client.go) keys off apiError.Retryable (left false),
+// never the numeric Status, and locally-constructed validation errors never
+// reach classifyHTTPError (the only path that maps a Status to retryable). The
+// {code} labels (input_empty/input_oversize/input_mime) are unchanged.
 //
 // The size check is against the base64-ENCODED length vs Vision's 10 MB JSON
 // request limit, not the raw byte count: client.go sends the image as inline
@@ -232,15 +241,15 @@ func responseError(resp annotateResponse) error {
 // request limit (see maxRawImageBytes).
 func validateInput(img moderation.Image) error {
 	if len(img.Bytes) == 0 {
-		return &apiError{Code: "input_empty", Message: "empty image"}
+		return &apiError{Status: http.StatusBadRequest, Code: "input_empty", Message: "empty image"}
 	}
 	if base64.StdEncoding.EncodedLen(len(img.Bytes)) > maxRequestBytes-requestEnvelopeBytes {
-		return &apiError{Code: "input_oversize", Message: fmt.Sprintf(
+		return &apiError{Status: http.StatusRequestEntityTooLarge, Code: "input_oversize", Message: fmt.Sprintf(
 			"image %d bytes exceeds inline budget (base64 must fit Vision's 10 MB request limit; raw cap ~%d bytes)",
 			len(img.Bytes), maxRawImageBytes)}
 	}
 	if img.MIME != "" && !allowedMIME[img.MIME] {
-		return &apiError{Code: "input_mime", Message: fmt.Sprintf(
+		return &apiError{Status: http.StatusUnsupportedMediaType, Code: "input_mime", Message: fmt.Sprintf(
 			"unsupported MIME %q (allowed: jpeg/png/gif/bmp/webp/tiff/ico)", img.MIME)}
 	}
 	return nil

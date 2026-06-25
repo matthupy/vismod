@@ -145,6 +145,21 @@ func codeOf(t *testing.T, err error) string {
 	return ce.ErrorCode()
 }
 
+// apiErrOf extracts the concrete *apiError so a test can assert its Status (the
+// HTTP code rendered in Error()). Local validation failures must carry a
+// semantic 4xx, not the zero value (which renders as a misleading "HTTP 0").
+func apiErrOf(t *testing.T, err error) *apiError {
+	t.Helper()
+	if err == nil {
+		t.Fatal("expected an error, got nil")
+	}
+	var ae *apiError
+	if !errors.As(err, &ae) {
+		t.Fatalf("error %T is not *apiError: %v", err, err)
+	}
+	return ae
+}
+
 func TestValidateInput(t *testing.T) {
 	if got := codeOf(t, validateInput(moderation.Image{})); got != "input_empty" {
 		t.Errorf("empty bytes code = %q, want input_empty", got)
@@ -158,6 +173,39 @@ func TestValidateInput(t *testing.T) {
 	}
 	if err := validateInput(moderation.Image{Bytes: []byte("x"), MIME: "image/png"}); err != nil {
 		t.Errorf("valid png rejected: %v", err)
+	}
+}
+
+// TestValidateInputHTTPStatus asserts each local validation failure carries a
+// semantically-correct 4xx HTTP Status (not the zero value, which would render
+// as a misleading "HTTP 0" in logs) while keeping its existing {code} label.
+// These remain TERMINAL: the retry loop keys off apiError.Retryable (left
+// false), never the numeric Status, and these constructed errors never pass
+// through classifyHTTPError (the only path that maps Status -> retryable).
+func TestValidateInputHTTPStatus(t *testing.T) {
+	cases := []struct {
+		name       string
+		img        moderation.Image
+		wantCode   string
+		wantStatus int
+	}{
+		{"empty", moderation.Image{}, "input_empty", http.StatusBadRequest},
+		{"oversize", moderation.Image{Bytes: make([]byte, maxRawImageBytes+1), MIME: "image/png"}, "input_oversize", http.StatusRequestEntityTooLarge},
+		{"mime", moderation.Image{Bytes: []byte("x"), MIME: "application/zip"}, "input_mime", http.StatusUnsupportedMediaType},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ae := apiErrOf(t, validateInput(tc.img))
+			if ae.Code != tc.wantCode {
+				t.Errorf("Code = %q, want %q", ae.Code, tc.wantCode)
+			}
+			if ae.Status != tc.wantStatus {
+				t.Errorf("Status = %d, want %d", ae.Status, tc.wantStatus)
+			}
+			if ae.Retryable {
+				t.Error("validation error must stay terminal (Retryable=false)")
+			}
+		})
 	}
 }
 
