@@ -71,6 +71,9 @@ type FramesConfig struct {
 	// excluded from ConfigHash/ModelFingerprint. Defaults mirror
 	// videosift.DefaultConfig(); an absent key resolves to that default via
 	// setDefaults so it never zeroes a meaningful value.
+	// SceneThreshold is the scene-change score in (0, 1]; LOWER is more sensitive.
+	// 0 is NOT max-sensitive — videosift re-defaults 0 -> 0.4, so a true 0 is
+	// unreachable. Validated to [0, 1] at Load.
 	SceneThreshold       float64 `mapstructure:"scene_threshold"`
 	TemporalInterval     float64 `mapstructure:"temporal_interval"`
 	MPDecimateHi         int     `mapstructure:"mpdecimate_hi"`

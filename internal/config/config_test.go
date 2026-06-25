@@ -225,6 +225,69 @@ func TestValidateErrors(t *testing.T) {
 	}
 }
 
+// hash_algo is cast through videosift.HashAlgo at the seam, where an unknown
+// value silently falls back to phash. Load must reject typos so a misconfig
+// fails fast; empty and the two real algos must pass.
+func TestValidateHashAlgo(t *testing.T) {
+	dir := t.TempDir()
+	t.Run("invalid rejected", func(t *testing.T) {
+		path := filepath.Join(dir, "bad-algo.yaml")
+		yaml := "frames:\n  max_frames: 10\n  hash_algo: ahash\n"
+		if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Load(path); err == nil {
+			t.Fatal("expected error for invalid hash_algo")
+		}
+	})
+	for _, algo := range []string{"phash", "dhash", ""} {
+		algo := algo
+		t.Run("valid "+algo, func(t *testing.T) {
+			path := filepath.Join(dir, "ok-algo-"+algo+".yaml")
+			yaml := "frames:\n  max_frames: 10\n  hash_algo: \"" + algo + "\"\n"
+			if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Load(path); err != nil {
+				t.Fatalf("hash_algo=%q must be accepted: %v", algo, err)
+			}
+		})
+	}
+}
+
+// scene_threshold and mpdecimate_frac are meant to be in [0, 1]. Out-of-range
+// (<0 or >1) must be rejected at Load; in-range accepted.
+func TestValidateFramesRanges(t *testing.T) {
+	dir := t.TempDir()
+	reject := map[string]string{
+		"scene_threshold neg":  "frames:\n  max_frames: 10\n  scene_threshold: -0.1\n",
+		"scene_threshold high": "frames:\n  max_frames: 10\n  scene_threshold: 1.5\n",
+		"mpdecimate_frac neg":  "frames:\n  max_frames: 10\n  mpdecimate_frac: -0.2\n",
+		"mpdecimate_frac high": "frames:\n  max_frames: 10\n  mpdecimate_frac: 2.0\n",
+	}
+	for name, yaml := range reject {
+		t.Run("reject "+name, func(t *testing.T) {
+			path := filepath.Join(dir, name+".yaml")
+			if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Load(path); err == nil {
+				t.Fatalf("expected range error for %q", name)
+			}
+		})
+	}
+	t.Run("in-range accepted", func(t *testing.T) {
+		path := filepath.Join(dir, "in-range.yaml")
+		yaml := "frames:\n  max_frames: 10\n  scene_threshold: 0.0\n  mpdecimate_frac: 1.0\n"
+		if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Load(path); err != nil {
+			t.Fatalf("in-range scene_threshold/mpdecimate_frac must be accepted: %v", err)
+		}
+	})
+}
+
 func TestConfigHashDeterministicAndSensitive(t *testing.T) {
 	c, _ := Load("")
 	base := c.ConfigHash("v1")

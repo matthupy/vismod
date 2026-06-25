@@ -154,6 +154,21 @@ func (c Config) validate() error {
 	if c.Frames.MaxFrames <= 0 {
 		return fmt.Errorf("config: frames.max_frames must be > 0 (bounds per-video cost and disk)")
 	}
+	// hash_algo is cast to videosift.HashAlgo at the seam, where an unknown value
+	// silently falls back to phash. Reject typos at Load so a misconfigured algo
+	// fails fast instead of quietly degrading. Empty is fine — it keeps
+	// videosift.DefaultConfig()'s algorithm (see internal/frames/videosift.go).
+	switch c.Frames.HashAlgo {
+	case "", "phash", "dhash":
+	default:
+		return fmt.Errorf("config: frames.hash_algo must be phash|dhash (or empty), got %q", c.Frames.HashAlgo)
+	}
+	if c.Frames.SceneThreshold < 0 || c.Frames.SceneThreshold > 1 {
+		return fmt.Errorf("config: frames.scene_threshold must be in [0, 1], got %v", c.Frames.SceneThreshold)
+	}
+	if c.Frames.MPDecimateFrac < 0 || c.Frames.MPDecimateFrac > 1 {
+		return fmt.Errorf("config: frames.mpdecimate_frac must be in [0, 1], got %v", c.Frames.MPDecimateFrac)
+	}
 	return nil
 }
 
