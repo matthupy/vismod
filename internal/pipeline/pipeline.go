@@ -312,9 +312,12 @@ func (p *Pipeline) moderateFrame(ctx context.Context, img moderation.Image, ts *
 	// in full whenever Process is retried (a transient sink/audit failure
 	// dead-letters and redelivers the whole job). The pipeline cannot dedup across
 	// that retry: redelivery may land on a different worker, so any in-process
-	// seen-set is lost. The (JobID, FrameSHA256) pair on review.Item is the stable
-	// dedup key — the downstream Diverter (durable review queue) MUST collapse
-	// repeats on it. v1 LogDiverter is dedup-exempt (a repeated WARN is harmless).
+	// seen-set is lost. The (JobID, FrameSHA256, Category) triple on review.Item is
+	// the stable dedup key — the downstream Diverter (durable review queue) MUST
+	// collapse repeats on it. A frame flagged in N categories emits N Items that
+	// share (JobID, FrameSHA256) but differ in Category, so all N survive while a
+	// retry's identical re-emission still collapses. v1 LogDiverter is dedup-exempt
+	// (a repeated WARN is harmless).
 	p.divertFlagged(ctx, meta, img, ts, cats)
 	return moderation.FrameResult{TimestampSec: ts, Status: moderation.FrameStatusOK, Categories: cats}
 }
@@ -337,6 +340,10 @@ func (p *Pipeline) divertFlagged(ctx context.Context, meta jobMeta, img moderati
 	if p.Diverter == nil {
 		return
 	}
+	// SHA-256 over the frame bytes is identical for every in-band category, and
+	// frames can be MB — so hash at most ONCE per frame, lazily on the first
+	// match, and reuse the hex digest for every emitted Item.
+	var frameSHA string
 	for _, c := range cats {
 		if c.Score == nil {
 			continue
@@ -345,16 +352,19 @@ func (p *Pipeline) divertFlagged(ctx context.Context, meta jobMeta, img moderati
 		if *c.Score < ct.FlagAt || *c.Score >= ct.BlockAt {
 			continue
 		}
-		sum := sha256.Sum256(img.Bytes)
+		if frameSHA == "" {
+			sum := sha256.Sum256(img.Bytes)
+			frameSHA = hex.EncodeToString(sum[:])
+		}
 		score := *c.Score
 		it := review.Item{
 			JobID:        meta.ID,
 			AssetID:      meta.AssetID,
-			FrameSHA256:  hex.EncodeToString(sum[:]),
+			FrameSHA256:  frameSHA,
 			TimestampSec: ts,
 			Category:     string(c.Category),
 			Score:        &score,
-			Reason:       "score >= flag_at",
+			Reason:       "flagged: flag_at <= score < block_at",
 		}
 		if err := p.Diverter.Divert(ctx, it); err != nil {
 			// FAIL-SAFE: a dropped divert must NOT block the job (the §G.8 seam is
@@ -370,7 +380,8 @@ func (p *Pipeline) divertFlagged(ctx context.Context, meta jobMeta, img moderati
 				r.RecordDivertFailure()
 			}
 		}
-		return // one divert per frame
+		// No early return: one Item per in-band category. The dedup key
+		// (JobID, FrameSHA256, Category) keeps these distinct downstream.
 	}
 }
 

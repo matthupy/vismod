@@ -38,8 +38,12 @@ type Item struct {
 // Delivery is AT-LEAST-ONCE: the pipeline diverts before Sink.Write, and a
 // retried job re-runs the divert (redelivery may hit a different worker, so the
 // pipeline cannot dedup). A production Diverter MUST treat (Item.JobID,
-// Item.FrameSHA256) as the idempotency key and collapse repeats — otherwise a
-// transient retry enqueues the same flagged frame twice for reviewers.
+// Item.FrameSHA256, Item.Category) as the idempotency key and collapse repeats —
+// otherwise a transient retry enqueues the same flagged frame twice for
+// reviewers. The Category component is load-bearing: one frame flagged in N
+// categories emits N Items sharing (JobID, FrameSHA256) but differing in
+// Category, so a key without Category would collapse all but one and a reviewer
+// would lose every category but one.
 type Diverter interface {
 	Divert(ctx context.Context, it Item) error
 }

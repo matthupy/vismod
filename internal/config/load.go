@@ -138,6 +138,32 @@ func (c Config) validate() error {
 	if c.Frames.MaxFrames <= 0 {
 		return fmt.Errorf("config: frames.max_frames must be > 0 (bounds per-video cost and disk)")
 	}
+	// Sanity-check the decision policy: the default and every per-category override.
+	if err := validateCategoryThreshold("default", c.Thresholds.Default); err != nil {
+		return err
+	}
+	for cat, ct := range c.Thresholds.PerCategory {
+		if err := validateCategoryThreshold(string(cat), ct); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateCategoryThreshold sanity-checks one category's decision boundaries.
+// flag_at must lie in the [0, 1] score range, and block_at must sit at or above
+// flag_at (a flag boundary past the block boundary would let a score block
+// without ever flagging). block_at is INTENTIONALLY allowed to exceed 1.0 — that
+// is the documented "never auto-block" lever: scores are [0,1] and the rollup
+// uses >=, so block_at > 1.0 routes every above-flag hit to manual review
+// instead of auto-removing. There is deliberately NO upper bound on block_at.
+func validateCategoryThreshold(name string, ct CategoryThreshold) error {
+	if ct.FlagAt < 0 || ct.FlagAt > 1 {
+		return fmt.Errorf("config: thresholds.%s.flag_at must be in [0, 1], got %v", name, ct.FlagAt)
+	}
+	if ct.BlockAt < ct.FlagAt {
+		return fmt.Errorf("config: thresholds.%s.block_at must be >= flag_at (%v), got %v", name, ct.FlagAt, ct.BlockAt)
+	}
 	return nil
 }
 

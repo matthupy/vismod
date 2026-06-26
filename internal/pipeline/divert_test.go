@@ -48,6 +48,46 @@ func sexualFrame(score float64) moderation.NormalizedResult {
 	return moderation.NormalizedResult{Frames: []moderation.FrameResult{okFrame(scoreCat(moderation.CategorySexual, score))}}
 }
 
+// twoCatFrame carries two categories on a single frame so a multi-category
+// divert can be exercised.
+func twoCatFrame(a moderation.CategoryResult, b moderation.CategoryResult) moderation.NormalizedResult {
+	return moderation.NormalizedResult{Frames: []moderation.FrameResult{okFrame(a, b)}}
+}
+
+// A frame flagged in two categories must emit two distinct review Items — one
+// per in-band category — so a spec-compliant downstream (dedup key now
+// (JobID, FrameSHA256, Category)) keeps every category, not just one.
+func TestProcessDivertsEachFlaggedCategory(t *testing.T) {
+	dir := t.TempDir()
+	img := filepath.Join(dir, "x.jpg")
+	if err := os.WriteFile(img, []byte("data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// SEXUAL 0.6 in [flag 0.5, block 0.667); VIOLENCE 0.6 in default [0.5, 0.8).
+	// Both land in their own flag band => two diverts.
+	mod := &fakeMod{caps: moderation.Caps{MaxImageBytes: 1024}, result: twoCatFrame(
+		scoreCat(moderation.CategorySexual, 0.6),
+		scoreCat(moderation.CategoryViolence, 0.6),
+	)}
+	div := &fakeDiverter{}
+	p := newPipe(t, mod, &frames.FakeFrameSource{}, &capSink{})
+	p.Diverter = div
+
+	if err := p.Process(context.Background(), "job-1", moderation.Source{Kind: "file", Ref: img}); err != nil {
+		t.Fatalf("Process: %v", err)
+	}
+	if len(div.items) != 2 {
+		t.Fatalf("want 2 diverts (one per flagged category), got %d", len(div.items))
+	}
+	if div.items[0].Category == div.items[1].Category {
+		t.Fatalf("the two diverts must carry DISTINCT categories, both = %q", div.items[0].Category)
+	}
+	got := map[string]bool{div.items[0].Category: true, div.items[1].Category: true}
+	if !got["SEXUAL"] || !got["VIOLENCE"] {
+		t.Fatalf("want SEXUAL and VIOLENCE diverts, got %v", got)
+	}
+}
+
 func TestProcessDivertsFlaggedBand(t *testing.T) {
 	dir := t.TempDir()
 	img := filepath.Join(dir, "x.jpg")
