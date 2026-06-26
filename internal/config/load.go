@@ -22,7 +22,6 @@ func setDefaults(v *viper.Viper) {
 	// SEXUAL is strictest by default.
 	v.SetDefault("thresholds.SEXUAL.flag_at", 0.5)
 	v.SetDefault("thresholds.SEXUAL.block_at", 0.667)
-	v.SetDefault("thresholds.SEXUAL.potential_csam", 0.667)
 
 	v.SetDefault("queue.driver", "memory")
 	v.SetDefault("queue.workers", 4)
@@ -115,8 +114,7 @@ func resolveThresholds(v *viper.Viper) Thresholds {
 			FlagAt:  v.GetFloat64("thresholds.default.flag_at"),
 			BlockAt: v.GetFloat64("thresholds.default.block_at"),
 		},
-		PerCategory:         map[moderation.Category]CategoryThreshold{},
-		SexualPotentialCSAM: v.GetFloat64("thresholds.SEXUAL.potential_csam"),
+		PerCategory: map[moderation.Category]CategoryThreshold{},
 	}
 	sub := v.Sub("thresholds")
 	if sub == nil {
@@ -131,9 +129,6 @@ func resolveThresholds(v *viper.Viper) Thresholds {
 			BlockAt: sub.GetFloat64(key + ".block_at"),
 		}
 		t.PerCategory[moderation.Category(strings.ToUpper(key))] = ct
-	}
-	if t.SexualPotentialCSAM == 0 {
-		t.SexualPotentialCSAM = 0.667
 	}
 	return t
 }
@@ -195,6 +190,32 @@ func (c Config) validate() error {
 	if c.Frames.HashResizeWidth < 0 {
 		return fmt.Errorf("config: frames.hash_resize_width must be >= 0 (0 disables rescale), got %d", c.Frames.HashResizeWidth)
 	}
+	// Sanity-check the decision policy: the default and every per-category override.
+	if err := validateCategoryThreshold("default", c.Thresholds.Default); err != nil {
+		return err
+	}
+	for cat, ct := range c.Thresholds.PerCategory {
+		if err := validateCategoryThreshold(string(cat), ct); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateCategoryThreshold sanity-checks one category's decision boundaries.
+// flag_at must lie in the [0, 1] score range, and block_at must sit at or above
+// flag_at (a flag boundary past the block boundary would let a score block
+// without ever flagging). block_at is INTENTIONALLY allowed to exceed 1.0 — that
+// is the documented "never auto-block" lever: scores are [0,1] and the rollup
+// uses >=, so block_at > 1.0 routes every above-flag hit to manual review
+// instead of auto-removing. There is deliberately NO upper bound on block_at.
+func validateCategoryThreshold(name string, ct CategoryThreshold) error {
+	if ct.FlagAt < 0 || ct.FlagAt > 1 {
+		return fmt.Errorf("config: thresholds.%s.flag_at must be in [0, 1], got %v", name, ct.FlagAt)
+	}
+	if ct.BlockAt < ct.FlagAt {
+		return fmt.Errorf("config: thresholds.%s.block_at must be >= flag_at (%v), got %v", name, ct.FlagAt, ct.BlockAt)
+	}
 	return nil
 }
 
@@ -207,7 +228,6 @@ func (c Config) ConfigHash(modelVersion string) string {
 	fmt.Fprintf(&b, "adapter=%s\n", c.Adapter.Name)
 	fmt.Fprintf(&b, "model_version=%s\n", modelVersion)
 	fmt.Fprintf(&b, "default=flag:%g,block:%g\n", c.Thresholds.Default.FlagAt, c.Thresholds.Default.BlockAt)
-	fmt.Fprintf(&b, "sexual_potential_csam=%g\n", c.Thresholds.SexualPotentialCSAM)
 
 	cats := make([]string, 0, len(c.Thresholds.PerCategory))
 	for cat := range c.Thresholds.PerCategory {
@@ -335,7 +355,6 @@ func (c Config) ModelFingerprint() string {
 	}
 
 	fmt.Fprintf(&b, "default=flag:%g,block:%g\n", c.Thresholds.Default.FlagAt, c.Thresholds.Default.BlockAt)
-	fmt.Fprintf(&b, "sexual_potential_csam=%g\n", c.Thresholds.SexualPotentialCSAM)
 
 	cats := make([]string, 0, len(c.Thresholds.PerCategory))
 	for cat := range c.Thresholds.PerCategory {

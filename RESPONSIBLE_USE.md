@@ -24,24 +24,27 @@ detect CSAM.
 - **Operators who need CSAM coverage cannot rely on this tool until the v1.1
   matcher ships.** Do not represent v1 as providing CSAM detection.
 
-## 2. Potential-CSAM handling (the safe failure mode)
+## 2. Flagged-frame review divert (the safe failure mode)
 
-The generic `SEXUAL` classifier **will sometimes fire on content that is
-actually CSAM**. A high-severity `SEXUAL` result is **not** a CSAM
-determination — but it **must be handled as potential-CSAM**.
+CSAM is detected by **hash-match against known lists** (the Matcher pre-stage),
+**not** inferred from a classifier score. The generic `SEXUAL` classifier is a
+severity signal, not a CSAM determination. To keep the failure mode safe, any
+category result that **flags but does not block** is routed to a human instead
+of being auto-actioned.
 
-- **Trigger:** a `SEXUAL` category result with normalized
-  `Score >= thresholds.SEXUAL.potential_csam` (config key; default `0.667`,
-  i.e. Azure severity level 4).
-- **What vismod does:** before the result is written to the Sink, the frame is
-  **diverted to a human-review channel**. The diverted record carries only
-  `SHA-256(frame)` + metadata — **never the frame bytes and never provider
+- **Trigger:** a category result whose normalized `Score` lands in the **flag
+  band** `[flag_at, block_at)` for that category. Scores `>= block_at` auto-block
+  and are not diverted; scores `< flag_at` allow. Configure `block_at > 1.0` for a
+  category that should **never auto-block** — every above-flag hit then routes to
+  manual review.
+- **What vismod does:** before the result is written to the Sink, the flagged
+  frame is **diverted to a human-review channel**. The diverted record carries
+  only `SHA-256(frame)` + metadata — **never the frame bytes and never provider
   `Raw` text** (§G.2). The default `LogDiverter` emits a structured WARN event;
   a production deployment must supply a `Diverter` that writes to an **encrypted,
   access-controlled** review queue.
 - **What vismod must NOT do:** no fully-automated consequential action on a
-  positive or potential match. Borderline / low-confidence results go to a
-  **human** (§4 below).
+  flagged result. Borderline / low-confidence results go to a **human** (§4 below).
 
 ## 3. Never persist or transmit the illegal media itself
 

@@ -35,9 +35,6 @@ func TestLoadDefaults(t *testing.T) {
 	if got := c.Thresholds.For(moderation.CategorySexual).BlockAt; got != 0.667 {
 		t.Errorf("SEXUAL block_at = %v, want 0.667", got)
 	}
-	if c.Thresholds.SexualPotentialCSAM != 0.667 {
-		t.Errorf("SEXUAL potential_csam = %v, want 0.667", c.Thresholds.SexualPotentialCSAM)
-	}
 	// frames moderation fan-out (pipeline concurrency) is wired with a non-zero default.
 	if c.Frames.Concurrency != 4 {
 		t.Errorf("default frames.concurrency = %d, want 4", c.Frames.Concurrency)
@@ -223,6 +220,64 @@ func TestValidateErrors(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Thresholds are sanity-checked at Load for BOTH thresholds.default and every
+// per-category entry: flag_at must be in [0, 1] and block_at must be >= flag_at
+// (and >= 0). block_at is DELIBERATELY allowed to EXCEED 1.0 — that is the
+// documented "never auto-block" lever: scores are [0,1] and the rollup uses >=,
+// so block_at > 1.0 means every above-flag hit routes to manual review instead
+// of auto-removing. There is intentionally NO upper bound on block_at.
+func TestValidateThresholds(t *testing.T) {
+	dir := t.TempDir()
+
+	reject := map[string]string{
+		// flag_at above block_at: the flag boundary would sit past the block
+		// boundary, so a score could block without ever flagging — incoherent.
+		"flag_at exceeds block_at (default)": "thresholds:\n  default:\n    flag_at: 0.8\n    block_at: 0.5\n",
+		"flag_at exceeds block_at (per-cat)": "thresholds:\n  VIOLENCE:\n    flag_at: 0.8\n    block_at: 0.5\n",
+		// flag_at out of the [0,1] score range.
+		"flag_at above 1 (default)":  "thresholds:\n  default:\n    flag_at: 1.5\n    block_at: 2.0\n",
+		"flag_at above 1 (per-cat)":  "thresholds:\n  HATE:\n    flag_at: 1.5\n    block_at: 2.0\n",
+		"flag_at negative (default)": "thresholds:\n  default:\n    flag_at: -0.1\n    block_at: 0.8\n",
+		"flag_at negative (per-cat)": "thresholds:\n  HATE:\n    flag_at: -0.1\n    block_at: 0.8\n",
+	}
+	for name, yaml := range reject {
+		t.Run("reject "+name, func(t *testing.T) {
+			path := filepath.Join(dir, name+".yaml")
+			if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Load(path); err == nil {
+				t.Fatalf("expected threshold validation error for %q", name)
+			}
+		})
+	}
+
+	// The never-auto-block lever MUST pass: block_at = 2.0 with flag_at 0.5 is a
+	// valid, intentional config (scores are [0,1], so nothing ever reaches 2.0).
+	t.Run("accept block_at above 1 (never-auto-block lever)", func(t *testing.T) {
+		path := filepath.Join(dir, "never-block.yaml")
+		yaml := "thresholds:\n  HATE:\n    flag_at: 0.5\n    block_at: 2.0\n"
+		if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Load(path); err != nil {
+			t.Fatalf("block_at=2.0 (never-auto-block lever) must be accepted: %v", err)
+		}
+	})
+
+	// A normal, in-range per-category config must pass.
+	t.Run("accept normal SEXUAL thresholds", func(t *testing.T) {
+		path := filepath.Join(dir, "normal-sexual.yaml")
+		yaml := "thresholds:\n  SEXUAL:\n    flag_at: 0.5\n    block_at: 0.667\n"
+		if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Load(path); err != nil {
+			t.Fatalf("normal SEXUAL flag_at 0.5 / block_at 0.667 must be accepted: %v", err)
+		}
+	})
 }
 
 // hash_algo is cast through videosift.HashAlgo at the seam, where an unknown

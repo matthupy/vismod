@@ -51,7 +51,7 @@ Full pipeline runs end-to-end with a credential-free `stub` adapter. No network/
 - **audit canonicalization:** M0 uses Go `json.Marshal` (stable field order) with
   length-prefixed SHA-256 chain. Spec wants RFC 8785 JCS — **deferred to M4** (noted in code).
 - **videosift not yet imported** (no `require` line); `replace` directive in place. Import lands M2.
-- **potential-CSAM divert (§G.8)** deliberately deferred to M4 (rollup already flags/blocks SEXUAL).
+- **flagged-frame review divert (§G.8)** deliberately deferred to M4 (rollup already flags/blocks SEXUAL).
 
 ### Verified live
 - `vismod scan x.jpg` → valid envelope, `verdict=block` (SELF_HARM 0.867 ≥ block_at 0.8),
@@ -178,7 +178,7 @@ Branch `feat/m1-azure-adapter` (PR, not merged to main directly).
 
 ### Deferred to later milestones (unchanged)
 - videosift import + video framing = M2. Audit RFC 8785 JCS, docs (SECURITY/RESPONSIBLE_USE),
-  potential-CSAM divert = M4. asynq/Redis + `-race` in CI = M5.
+  flagged-frame review divert = M4. asynq/Redis + `-race` in CI = M5.
 
 ---
 
@@ -211,18 +211,18 @@ Branch `feat/m4-responsible-use` off `main` (post #6 merge).
   Append failure → infra error → retry (Sink+audit both idempotent). New
   `audit.path` config key (empty = disabled; OK for one-shot scan). Wired in `wire.go`.
 
-### Potential-CSAM divert (§G.8)
+### Flagged-frame review divert (§G.8)
 - New `internal/review`: `Diverter` interface + `Item` (carries `SHA-256(frame)` +
   metadata, **never bytes/Raw**) + default `LogDiverter` (WARN event).
-- Pipeline trigger in `moderateFrame`: a `SEXUAL` score ≥ `thresholds.SEXUAL.potential_csam`
-  diverts the frame BEFORE `Sink.Write`. `jobMeta` threads job identity into the
+- Pipeline trigger in `moderateFrame`: a score in the flag band `[flag_at, block_at)`
+  diverts the frame BEFORE `Sink.Write` (scores ≥ `block_at` auto-block, not diverted). `jobMeta` threads job identity into the
   fan-out. Default `LogDiverter` wired in `wire.go`. Frames path already never
   persists bytes/Raw, so §G.2 transient-handling holds by construction.
 
 ### Docs shipped (§G.9)
 - `LICENSE` (Apache-2.0 full text) + `NOTICE` (third-party + CSAM/PhotoDNA notes).
-- `RESPONSIBLE_USE.md` (not-legal-advice, no-CSAM-in-v1, potential-CSAM policy,
-  NCMEC reporting, "do not test against real CSAM").
+- `RESPONSIBLE_USE.md` (not-legal-advice, no-CSAM-in-v1, flagged-frame review
+  divert policy, NCMEC reporting, "do not test against real CSAM").
 - `SECURITY.md` (SSRF/egress, audit tamper-evidence honest scope + signing/anchoring
   seam, anti-abuse residual risk, fail-safe posture).
 - `MODEL_AND_HASH_LIMITATIONS.md` (classifier bias/FP, perceptual-hash evadability,

@@ -18,7 +18,9 @@ The precision/recall tradeoff is **tunable** per category via two boundaries:
 
 Lower thresholds catch more (higher recall, more false positives); higher
 thresholds are stricter (higher precision, more false negatives). `SEXUAL` is
-strictest by default and additionally carries `potential_csam` (§G.8).
+strictest by default. A score in the flag band `[flag_at, block_at)` is diverted
+to manual review (§G.8); set `block_at > 1.0` for a category that should never
+auto-block.
 
 ## Scores are within-provider comparable ONLY
 
