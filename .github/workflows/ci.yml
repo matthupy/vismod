@@ -86,7 +86,7 @@ jobs:
       # binary and assembles the ffmpeg-bearing runtime. Context = workspace root
       # (holds vismod/ and videosift/ as siblings).
       - name: Build image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: vismod/Dockerfile
