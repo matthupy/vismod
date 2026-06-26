@@ -163,11 +163,15 @@ func (c Config) validate() error {
 	default:
 		return fmt.Errorf("config: frames.hash_algo must be phash|dhash (or empty), got %q", c.Frames.HashAlgo)
 	}
-	if c.Frames.SceneThreshold < 0 || c.Frames.SceneThreshold > 1 {
-		return fmt.Errorf("config: frames.scene_threshold must be in [0, 1], got %v", c.Frames.SceneThreshold)
+	// Lower bound is EXCLUSIVE: videosift re-defaults an explicit 0 (scene_threshold
+	// 0→0.4, mpdecimate_frac 0→0.33), so 0 silently becomes the default instead of
+	// what the user typed. Reject it. An ABSENT key still passes — setDefaults seeds
+	// both above, and validate runs on the resolved (post-default) config.
+	if c.Frames.SceneThreshold <= 0 || c.Frames.SceneThreshold > 1 {
+		return fmt.Errorf("config: frames.scene_threshold must be in (0, 1], got %v", c.Frames.SceneThreshold)
 	}
-	if c.Frames.MPDecimateFrac < 0 || c.Frames.MPDecimateFrac > 1 {
-		return fmt.Errorf("config: frames.mpdecimate_frac must be in [0, 1], got %v", c.Frames.MPDecimateFrac)
+	if c.Frames.MPDecimateFrac <= 0 || c.Frames.MPDecimateFrac > 1 {
+		return fmt.Errorf("config: frames.mpdecimate_frac must be in (0, 1], got %v", c.Frames.MPDecimateFrac)
 	}
 	return nil
 }

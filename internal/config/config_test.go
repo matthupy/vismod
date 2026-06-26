@@ -255,13 +255,18 @@ func TestValidateHashAlgo(t *testing.T) {
 	}
 }
 
-// scene_threshold and mpdecimate_frac are meant to be in [0, 1]. Out-of-range
-// (<0 or >1) must be rejected at Load; in-range accepted.
+// scene_threshold and mpdecimate_frac must be in (0, 1] — lower bound EXCLUSIVE.
+// An explicit 0 is degenerate (videosift re-defaults 0 -> 0.4 / 0.33), so it is
+// rejected at Load alongside <0 and >1; in-range is accepted. An ABSENT key is
+// fine: setDefaults seeds both, so validate sees the resolved default (see
+// TestLoadFramesDefaults / TestLoadDefaults which exercise absent keys).
 func TestValidateFramesRanges(t *testing.T) {
 	dir := t.TempDir()
 	reject := map[string]string{
+		"scene_threshold zero": "frames:\n  max_frames: 10\n  scene_threshold: 0.0\n",
 		"scene_threshold neg":  "frames:\n  max_frames: 10\n  scene_threshold: -0.1\n",
 		"scene_threshold high": "frames:\n  max_frames: 10\n  scene_threshold: 1.5\n",
+		"mpdecimate_frac zero": "frames:\n  max_frames: 10\n  mpdecimate_frac: 0.0\n",
 		"mpdecimate_frac neg":  "frames:\n  max_frames: 10\n  mpdecimate_frac: -0.2\n",
 		"mpdecimate_frac high": "frames:\n  max_frames: 10\n  mpdecimate_frac: 2.0\n",
 	}
@@ -278,7 +283,7 @@ func TestValidateFramesRanges(t *testing.T) {
 	}
 	t.Run("in-range accepted", func(t *testing.T) {
 		path := filepath.Join(dir, "in-range.yaml")
-		yaml := "frames:\n  max_frames: 10\n  scene_threshold: 0.0\n  mpdecimate_frac: 1.0\n"
+		yaml := "frames:\n  max_frames: 10\n  scene_threshold: 0.4\n  mpdecimate_frac: 0.33\n"
 		if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
 			t.Fatal(err)
 		}
