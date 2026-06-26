@@ -259,7 +259,14 @@ func TestValidateHashAlgo(t *testing.T) {
 // An explicit 0 is degenerate (videosift re-defaults 0 -> 0.4 / 0.33), so it is
 // rejected at Load alongside <0 and >1; in-range is accepted. An ABSENT key is
 // fine: setDefaults seeds both, so validate sees the resolved default (see
-// TestLoadFramesDefaults / TestLoadDefaults which exercise absent keys).
+// TestLoadFramesTuningDefaultsWhenAbsent / TestLoadDefaults which exercise absent
+// keys).
+//
+// temporal_interval/mpdecimate_hi/mpdecimate_lo share the same reject-0 contract:
+// videosift re-defaults their explicit 0 (2.0 / 768 / 320), so a typed 0 is
+// silently swapped — Load rejects <= 0. hamming_threshold/hash_resize_width are
+// the exception: videosift honors their 0 as a "disable" signal (dedup / rescale
+// off), so 0 must PASS Load and only < 0 is rejected.
 func TestValidateFramesRanges(t *testing.T) {
 	dir := t.TempDir()
 	reject := map[string]string{
@@ -269,6 +276,17 @@ func TestValidateFramesRanges(t *testing.T) {
 		"mpdecimate_frac zero": "frames:\n  max_frames: 10\n  mpdecimate_frac: 0.0\n",
 		"mpdecimate_frac neg":  "frames:\n  max_frames: 10\n  mpdecimate_frac: -0.2\n",
 		"mpdecimate_frac high": "frames:\n  max_frames: 10\n  mpdecimate_frac: 2.0\n",
+		// videosift re-defaults an explicit 0 for these, so a typed 0 is silently
+		// swapped — reject <= 0.
+		"temporal_interval zero": "frames:\n  max_frames: 10\n  temporal_interval: 0.0\n",
+		"temporal_interval neg":  "frames:\n  max_frames: 10\n  temporal_interval: -1.0\n",
+		"mpdecimate_hi zero":     "frames:\n  max_frames: 10\n  mpdecimate_hi: 0\n",
+		"mpdecimate_hi neg":      "frames:\n  max_frames: 10\n  mpdecimate_hi: -1\n",
+		"mpdecimate_lo zero":     "frames:\n  max_frames: 10\n  mpdecimate_lo: 0\n",
+		"mpdecimate_lo neg":      "frames:\n  max_frames: 10\n  mpdecimate_lo: -1\n",
+		// hamming_threshold/hash_resize_width honor 0 as "disable"; only < 0 is invalid.
+		"hamming_threshold neg": "frames:\n  max_frames: 10\n  hamming_threshold: -1\n",
+		"hash_resize_width neg": "frames:\n  max_frames: 10\n  hash_resize_width: -1\n",
 	}
 	for name, yaml := range reject {
 		t.Run("reject "+name, func(t *testing.T) {
@@ -289,6 +307,19 @@ func TestValidateFramesRanges(t *testing.T) {
 		}
 		if _, err := Load(path); err != nil {
 			t.Fatalf("in-range scene_threshold/mpdecimate_frac must be accepted: %v", err)
+		}
+	})
+	// The disable contract must not regress: hamming_threshold:0 (dedup off) and
+	// hash_resize_width:0 (rescale off) are valid values videosift honors, so Load
+	// must accept them.
+	t.Run("hamming/resize zero accepted (disable)", func(t *testing.T) {
+		path := filepath.Join(dir, "disable.yaml")
+		yaml := "frames:\n  max_frames: 10\n  hamming_threshold: 0\n  hash_resize_width: 0\n"
+		if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Load(path); err != nil {
+			t.Fatalf("hamming_threshold:0 / hash_resize_width:0 must be accepted (disable): %v", err)
 		}
 	})
 }

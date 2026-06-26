@@ -74,6 +74,12 @@ type FramesConfig struct {
 	// SceneThreshold is the scene-change score in (0, 1]; LOWER is more sensitive.
 	// 0 is NOT max-sensitive — videosift re-defaults 0 -> 0.4, so a true 0 is
 	// unreachable. Validated to (0, 1] at Load (explicit 0 is rejected).
+	//
+	// TemporalInterval/MPDecimateHi/MPDecimateLo are validated > 0 at Load for the
+	// same reason: videosift re-defaults their explicit 0 (2.0 / 768 / 320), so a
+	// typed 0 would be silently swapped. HammingThreshold/HashResizeWidth are the
+	// exception — videosift honors 0 as a "disable" signal (dedup / rescale off),
+	// so they are validated >= 0 (0 is a valid value, only negatives are rejected).
 	SceneThreshold   float64 `mapstructure:"scene_threshold"`
 	TemporalInterval float64 `mapstructure:"temporal_interval"`
 	MPDecimateHi     int     `mapstructure:"mpdecimate_hi"`

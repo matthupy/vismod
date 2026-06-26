@@ -173,6 +173,28 @@ func (c Config) validate() error {
 	if c.Frames.MPDecimateFrac <= 0 || c.Frames.MPDecimateFrac > 1 {
 		return fmt.Errorf("config: frames.mpdecimate_frac must be in (0, 1], got %v", c.Frames.MPDecimateFrac)
 	}
+	// temporal_interval / mpdecimate_hi / mpdecimate_lo get the SAME reject-0 as
+	// scene_threshold / mpdecimate_frac: videosift re-defaults an explicit 0 (2.0,
+	// 768, 320 — see videosift extract.go:81-95), so a user's typed 0 is silently
+	// swapped for the default. Reject <= 0 so a degenerate value fails fast.
+	if c.Frames.TemporalInterval <= 0 {
+		return fmt.Errorf("config: frames.temporal_interval must be > 0, got %v", c.Frames.TemporalInterval)
+	}
+	if c.Frames.MPDecimateHi <= 0 {
+		return fmt.Errorf("config: frames.mpdecimate_hi must be > 0, got %d", c.Frames.MPDecimateHi)
+	}
+	if c.Frames.MPDecimateLo <= 0 {
+		return fmt.Errorf("config: frames.mpdecimate_lo must be > 0, got %d", c.Frames.MPDecimateLo)
+	}
+	// hamming_threshold / hash_resize_width DIFFER: videosift honors their 0 as a
+	// "disable" signal (0 disables hash dedup / rescale — see videosift extract.go:99-102),
+	// so 0 is a legitimate value that must pass. Only a negative is meaningless; reject < 0.
+	if c.Frames.HammingThreshold < 0 {
+		return fmt.Errorf("config: frames.hamming_threshold must be >= 0 (0 disables dedup), got %d", c.Frames.HammingThreshold)
+	}
+	if c.Frames.HashResizeWidth < 0 {
+		return fmt.Errorf("config: frames.hash_resize_width must be >= 0 (0 disables rescale), got %d", c.Frames.HashResizeWidth)
+	}
 	return nil
 }
 
