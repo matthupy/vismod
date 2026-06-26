@@ -42,6 +42,17 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("frames.keyframe", true)
 	v.SetDefault("frames.temporal", true)
 	v.SetDefault("frames.mpdecimate", true)
+	// videosift extraction tuning; defaults mirror videosift.DefaultConfig() so an
+	// absent key resolves to the upstream default rather than a zero value.
+	v.SetDefault("frames.scene_threshold", 0.4)
+	v.SetDefault("frames.temporal_interval", 2.0)
+	v.SetDefault("frames.mpdecimate_hi", 768)
+	v.SetDefault("frames.mpdecimate_lo", 320)
+	v.SetDefault("frames.mpdecimate_frac", 0.33)
+	v.SetDefault("frames.hash_algo", "phash")
+	v.SetDefault("frames.hamming_threshold", 8)
+	v.SetDefault("frames.hash_resize_width", 256)
+	v.SetDefault("frames.videosift_concurrency", 0) // 0 => videosift uses #enabled strategies
 	v.SetDefault("frames.ffmpeg_path", "")
 	v.SetDefault("frames.ffprobe_path", "")
 
@@ -142,6 +153,47 @@ func (c Config) validate() error {
 	}
 	if c.Frames.MaxFrames <= 0 {
 		return fmt.Errorf("config: frames.max_frames must be > 0 (bounds per-video cost and disk)")
+	}
+	// hash_algo is cast to videosift.HashAlgo at the seam, where an unknown value
+	// silently falls back to phash. Reject typos at Load so a misconfigured algo
+	// fails fast instead of quietly degrading. Empty is fine — it keeps
+	// videosift.DefaultConfig()'s algorithm (see internal/frames/videosift.go).
+	switch c.Frames.HashAlgo {
+	case "", "phash", "dhash":
+	default:
+		return fmt.Errorf("config: frames.hash_algo must be phash|dhash (or empty), got %q", c.Frames.HashAlgo)
+	}
+	// Lower bound is EXCLUSIVE: videosift re-defaults an explicit 0 (scene_threshold
+	// 0→0.4, mpdecimate_frac 0→0.33), so 0 silently becomes the default instead of
+	// what the user typed. Reject it. An ABSENT key still passes — setDefaults seeds
+	// both above, and validate runs on the resolved (post-default) config.
+	if c.Frames.SceneThreshold <= 0 || c.Frames.SceneThreshold > 1 {
+		return fmt.Errorf("config: frames.scene_threshold must be in (0, 1], got %v", c.Frames.SceneThreshold)
+	}
+	if c.Frames.MPDecimateFrac <= 0 || c.Frames.MPDecimateFrac > 1 {
+		return fmt.Errorf("config: frames.mpdecimate_frac must be in (0, 1], got %v", c.Frames.MPDecimateFrac)
+	}
+	// temporal_interval / mpdecimate_hi / mpdecimate_lo get the SAME reject-0 as
+	// scene_threshold / mpdecimate_frac: videosift re-defaults an explicit 0 (2.0,
+	// 768, 320 — see videosift extract.go:81-95), so a user's typed 0 is silently
+	// swapped for the default. Reject <= 0 so a degenerate value fails fast.
+	if c.Frames.TemporalInterval <= 0 {
+		return fmt.Errorf("config: frames.temporal_interval must be > 0, got %v", c.Frames.TemporalInterval)
+	}
+	if c.Frames.MPDecimateHi <= 0 {
+		return fmt.Errorf("config: frames.mpdecimate_hi must be > 0, got %d", c.Frames.MPDecimateHi)
+	}
+	if c.Frames.MPDecimateLo <= 0 {
+		return fmt.Errorf("config: frames.mpdecimate_lo must be > 0, got %d", c.Frames.MPDecimateLo)
+	}
+	// hamming_threshold / hash_resize_width DIFFER: videosift honors their 0 as a
+	// "disable" signal (0 disables hash dedup / rescale — see videosift extract.go:99-102),
+	// so 0 is a legitimate value that must pass. Only a negative is meaningless; reject < 0.
+	if c.Frames.HammingThreshold < 0 {
+		return fmt.Errorf("config: frames.hamming_threshold must be >= 0 (0 disables dedup), got %d", c.Frames.HammingThreshold)
+	}
+	if c.Frames.HashResizeWidth < 0 {
+		return fmt.Errorf("config: frames.hash_resize_width must be >= 0 (0 disables rescale), got %d", c.Frames.HashResizeWidth)
 	}
 	return nil
 }

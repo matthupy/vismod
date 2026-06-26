@@ -38,6 +38,69 @@ func TestLoadDefaults(t *testing.T) {
 	if c.Thresholds.SexualPotentialCSAM != 0.667 {
 		t.Errorf("SEXUAL potential_csam = %v, want 0.667", c.Thresholds.SexualPotentialCSAM)
 	}
+	// frames moderation fan-out (pipeline concurrency) is wired with a non-zero default.
+	if c.Frames.Concurrency != 4 {
+		t.Errorf("default frames.concurrency = %d, want 4", c.Frames.Concurrency)
+	}
+	// videosift extraction tuning defaults mirror videosift.DefaultConfig().
+	if c.Frames.SceneThreshold != 0.4 {
+		t.Errorf("default scene_threshold = %v, want 0.4", c.Frames.SceneThreshold)
+	}
+	if c.Frames.TemporalInterval != 2.0 {
+		t.Errorf("default temporal_interval = %v, want 2.0", c.Frames.TemporalInterval)
+	}
+	if c.Frames.MPDecimateHi != 768 || c.Frames.MPDecimateLo != 320 {
+		t.Errorf("default mpdecimate_hi/lo = %d/%d, want 768/320", c.Frames.MPDecimateHi, c.Frames.MPDecimateLo)
+	}
+	if c.Frames.MPDecimateFrac != 0.33 {
+		t.Errorf("default mpdecimate_frac = %v, want 0.33", c.Frames.MPDecimateFrac)
+	}
+	if c.Frames.HashAlgo != "phash" {
+		t.Errorf("default hash_algo = %q, want phash", c.Frames.HashAlgo)
+	}
+	if c.Frames.HammingThreshold != 8 {
+		t.Errorf("default hamming_threshold = %d, want 8", c.Frames.HammingThreshold)
+	}
+	if c.Frames.HashResizeWidth != 256 {
+		t.Errorf("default hash_resize_width = %d, want 256", c.Frames.HashResizeWidth)
+	}
+}
+
+// A config file that sets only an unrelated frames key (max_frames) must still
+// resolve every videosift tuning knob to its videosift.DefaultConfig() value —
+// an absent key must never zero a meaningful default.
+func TestLoadFramesTuningDefaultsWhenAbsent(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "c.yaml")
+	if err := os.WriteFile(path, []byte("frames:\n  max_frames: 7\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.Frames.MaxFrames != 7 {
+		t.Errorf("max_frames = %d, want 7", c.Frames.MaxFrames)
+	}
+	if c.Frames.SceneThreshold != 0.4 {
+		t.Errorf("absent scene_threshold = %v, want videosift default 0.4", c.Frames.SceneThreshold)
+	}
+	if c.Frames.TemporalInterval != 2.0 {
+		t.Errorf("absent temporal_interval = %v, want 2.0", c.Frames.TemporalInterval)
+	}
+	if c.Frames.HashAlgo != "phash" {
+		t.Errorf("absent hash_algo = %q, want phash", c.Frames.HashAlgo)
+	}
+	if c.Frames.HammingThreshold != 8 {
+		t.Errorf("absent hamming_threshold = %d, want 8", c.Frames.HammingThreshold)
+	}
+	if c.Frames.HashResizeWidth != 256 {
+		t.Errorf("absent hash_resize_width = %d, want 256", c.Frames.HashResizeWidth)
+	}
+	if c.Frames.MPDecimateHi != 768 || c.Frames.MPDecimateLo != 320 || c.Frames.MPDecimateFrac != 0.33 {
+		t.Errorf("absent mpdecimate hi/lo/frac = %d/%d/%v, want 768/320/0.33",
+			c.Frames.MPDecimateHi, c.Frames.MPDecimateLo, c.Frames.MPDecimateFrac)
+	}
 }
 
 func TestLoadFileOverride(t *testing.T) {
@@ -160,6 +223,105 @@ func TestValidateErrors(t *testing.T) {
 			}
 		})
 	}
+}
+
+// hash_algo is cast through videosift.HashAlgo at the seam, where an unknown
+// value silently falls back to phash. Load must reject typos so a misconfig
+// fails fast; empty and the two real algos must pass.
+func TestValidateHashAlgo(t *testing.T) {
+	dir := t.TempDir()
+	t.Run("invalid rejected", func(t *testing.T) {
+		path := filepath.Join(dir, "bad-algo.yaml")
+		yaml := "frames:\n  max_frames: 10\n  hash_algo: ahash\n"
+		if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Load(path); err == nil {
+			t.Fatal("expected error for invalid hash_algo")
+		}
+	})
+	for _, algo := range []string{"phash", "dhash", ""} {
+		algo := algo
+		t.Run("valid "+algo, func(t *testing.T) {
+			path := filepath.Join(dir, "ok-algo-"+algo+".yaml")
+			yaml := "frames:\n  max_frames: 10\n  hash_algo: \"" + algo + "\"\n"
+			if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Load(path); err != nil {
+				t.Fatalf("hash_algo=%q must be accepted: %v", algo, err)
+			}
+		})
+	}
+}
+
+// scene_threshold and mpdecimate_frac must be in (0, 1] — lower bound EXCLUSIVE.
+// An explicit 0 is degenerate (videosift re-defaults 0 -> 0.4 / 0.33), so it is
+// rejected at Load alongside <0 and >1; in-range is accepted. An ABSENT key is
+// fine: setDefaults seeds both, so validate sees the resolved default (see
+// TestLoadFramesTuningDefaultsWhenAbsent / TestLoadDefaults which exercise absent
+// keys).
+//
+// temporal_interval/mpdecimate_hi/mpdecimate_lo share the same reject-0 contract:
+// videosift re-defaults their explicit 0 (2.0 / 768 / 320), so a typed 0 is
+// silently swapped — Load rejects <= 0. hamming_threshold/hash_resize_width are
+// the exception: videosift honors their 0 as a "disable" signal (dedup / rescale
+// off), so 0 must PASS Load and only < 0 is rejected.
+func TestValidateFramesRanges(t *testing.T) {
+	dir := t.TempDir()
+	reject := map[string]string{
+		"scene_threshold zero": "frames:\n  max_frames: 10\n  scene_threshold: 0.0\n",
+		"scene_threshold neg":  "frames:\n  max_frames: 10\n  scene_threshold: -0.1\n",
+		"scene_threshold high": "frames:\n  max_frames: 10\n  scene_threshold: 1.5\n",
+		"mpdecimate_frac zero": "frames:\n  max_frames: 10\n  mpdecimate_frac: 0.0\n",
+		"mpdecimate_frac neg":  "frames:\n  max_frames: 10\n  mpdecimate_frac: -0.2\n",
+		"mpdecimate_frac high": "frames:\n  max_frames: 10\n  mpdecimate_frac: 2.0\n",
+		// videosift re-defaults an explicit 0 for these, so a typed 0 is silently
+		// swapped — reject <= 0.
+		"temporal_interval zero": "frames:\n  max_frames: 10\n  temporal_interval: 0.0\n",
+		"temporal_interval neg":  "frames:\n  max_frames: 10\n  temporal_interval: -1.0\n",
+		"mpdecimate_hi zero":     "frames:\n  max_frames: 10\n  mpdecimate_hi: 0\n",
+		"mpdecimate_hi neg":      "frames:\n  max_frames: 10\n  mpdecimate_hi: -1\n",
+		"mpdecimate_lo zero":     "frames:\n  max_frames: 10\n  mpdecimate_lo: 0\n",
+		"mpdecimate_lo neg":      "frames:\n  max_frames: 10\n  mpdecimate_lo: -1\n",
+		// hamming_threshold/hash_resize_width honor 0 as "disable"; only < 0 is invalid.
+		"hamming_threshold neg": "frames:\n  max_frames: 10\n  hamming_threshold: -1\n",
+		"hash_resize_width neg": "frames:\n  max_frames: 10\n  hash_resize_width: -1\n",
+	}
+	for name, yaml := range reject {
+		t.Run("reject "+name, func(t *testing.T) {
+			path := filepath.Join(dir, name+".yaml")
+			if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Load(path); err == nil {
+				t.Fatalf("expected range error for %q", name)
+			}
+		})
+	}
+	t.Run("in-range accepted", func(t *testing.T) {
+		path := filepath.Join(dir, "in-range.yaml")
+		yaml := "frames:\n  max_frames: 10\n  scene_threshold: 0.4\n  mpdecimate_frac: 0.33\n"
+		if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Load(path); err != nil {
+			t.Fatalf("in-range scene_threshold/mpdecimate_frac must be accepted: %v", err)
+		}
+	})
+	// The disable contract must not regress: hamming_threshold:0 (dedup off) and
+	// hash_resize_width:0 (rescale off) are valid values videosift honors, so Load
+	// must accept them.
+	t.Run("hamming/resize zero accepted (disable)", func(t *testing.T) {
+		path := filepath.Join(dir, "disable.yaml")
+		yaml := "frames:\n  max_frames: 10\n  hamming_threshold: 0\n  hash_resize_width: 0\n"
+		if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Load(path); err != nil {
+			t.Fatalf("hamming_threshold:0 / hash_resize_width:0 must be accepted (disable): %v", err)
+		}
+	})
 }
 
 func TestConfigHashDeterministicAndSensitive(t *testing.T) {

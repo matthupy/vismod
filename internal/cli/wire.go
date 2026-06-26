@@ -40,14 +40,23 @@ func buildModerator(cfg config.Config) (moderation.Moderator, error) {
 // this source owns only extraction + WorkDir lifecycle.
 func buildFrameSource(cfg config.Config) frames.FrameSource {
 	return frames.NewVideosiftSource(frames.VideosiftOptions{
-		WorkDir:     cfg.Frames.WorkDir,
-		MaxFrames:   cfg.Frames.MaxFrames,
-		Scene:       cfg.Frames.Scene,
-		Keyframe:    cfg.Frames.Keyframe,
-		Temporal:    cfg.Frames.Temporal,
-		MPDecimate:  cfg.Frames.MPDecimate,
-		FFmpegPath:  cfg.Frames.FFmpegPath,
-		FFprobePath: cfg.Frames.FFprobePath,
+		WorkDir:              cfg.Frames.WorkDir,
+		MaxFrames:            cfg.Frames.MaxFrames,
+		Scene:                cfg.Frames.Scene,
+		Keyframe:             cfg.Frames.Keyframe,
+		Temporal:             cfg.Frames.Temporal,
+		MPDecimate:           cfg.Frames.MPDecimate,
+		SceneThreshold:       cfg.Frames.SceneThreshold,
+		TemporalInterval:     cfg.Frames.TemporalInterval,
+		MPDecimateHi:         cfg.Frames.MPDecimateHi,
+		MPDecimateLo:         cfg.Frames.MPDecimateLo,
+		MPDecimateFrac:       cfg.Frames.MPDecimateFrac,
+		HashAlgo:             cfg.Frames.HashAlgo,
+		HammingThreshold:     cfg.Frames.HammingThreshold,
+		HashResizeWidth:      cfg.Frames.HashResizeWidth,
+		VideosiftConcurrency: cfg.Frames.VideosiftConcurrency,
+		FFmpegPath:           cfg.Frames.FFmpegPath,
+		FFprobePath:          cfg.Frames.FFprobePath,
 	})
 }
 

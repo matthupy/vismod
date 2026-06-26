@@ -106,6 +106,16 @@ frames:
   keyframe: true
   temporal: true
   mpdecimate: true
+  # videosift extraction tuning (defaults mirror videosift; NOT verdict-affecting)
+  scene_threshold: 0.4        # scene-change score in (0, 1]; LOWER=more sensitive. 0 is rejected at load (not max-sensitive: videosift would re-default 0 -> 0.4)
+  temporal_interval: 2.0      # seconds between uniform samples
+  mpdecimate_hi: 768          # mpdecimate high threshold
+  mpdecimate_lo: 320          # mpdecimate low threshold
+  mpdecimate_frac: 0.33       # mpdecimate fraction of changed blocks in (0, 1]. 0 is rejected at load (videosift would re-default 0 -> 0.33)
+  hash_algo: "phash"          # phash|dhash
+  hamming_threshold: 8        # max hash distance for dedup; 0 disables dedup
+  hash_resize_width: 256      # pre-hash scale width; 0 disables (not recommended)
+  videosift_concurrency: 0    # videosift internal strategy parallelism (0 -> #enabled strategies)
   ffmpeg_path: ""       # override ffmpeg binary (empty -> discovered on PATH; validated at boot)
   ffprobe_path: ""      # override ffprobe binary (empty -> discovered on PATH; validated at boot)
 
