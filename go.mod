@@ -7,7 +7,7 @@ replace github.com/matthupy/videosift => ../videosift
 require (
 	github.com/alicebob/miniredis/v2 v2.38.0
 	github.com/hibiken/asynq v0.26.0
-	github.com/matthupy/videosift v0.0.0-20260613001556-66e5f27378c7
+	github.com/matthupy/videosift v0.0.0-20260625194117-970d4ab8663a
 	github.com/prometheus/client_golang v1.23.2
 	github.com/redis/go-redis/v9 v9.14.1
 	github.com/spf13/cobra v1.10.2

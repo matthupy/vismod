@@ -63,6 +63,31 @@ type FramesConfig struct {
 	Keyframe    bool   `mapstructure:"keyframe"`
 	Temporal    bool   `mapstructure:"temporal"`
 	MPDecimate  bool   `mapstructure:"mpdecimate"`
+	// videosift extraction tuning. These are NOT verdict-affecting (consistent
+	// with the scene/keyframe/temporal/mpdecimate toggles) and are intentionally
+	// excluded from ConfigHash/ModelFingerprint. Defaults mirror
+	// videosift.DefaultConfig(); an absent key resolves to that default via
+	// setDefaults so it never zeroes a meaningful value.
+	// SceneThreshold is the scene-change score in (0, 1]; LOWER is more sensitive.
+	// 0 is NOT max-sensitive — videosift re-defaults 0 -> 0.4, so a true 0 is
+	// unreachable. Validated to (0, 1] at Load (explicit 0 is rejected).
+	//
+	// TemporalInterval/MPDecimateHi/MPDecimateLo are validated > 0 at Load for the
+	// same reason: videosift re-defaults their explicit 0 (2.0 / 768 / 320), so a
+	// typed 0 would be silently swapped. HammingThreshold/HashResizeWidth are the
+	// exception — videosift honors 0 as a "disable" signal (dedup / rescale off),
+	// so they are validated >= 0 (0 is a valid value, only negatives are rejected).
+	SceneThreshold   float64 `mapstructure:"scene_threshold"`
+	TemporalInterval float64 `mapstructure:"temporal_interval"`
+	MPDecimateHi     int     `mapstructure:"mpdecimate_hi"`
+	MPDecimateLo     int     `mapstructure:"mpdecimate_lo"`
+	// MPDecimateFrac is the changed-block fraction in (0, 1]; 0 is re-defaulted to
+	// 0.33 upstream, so it is not a usable value. Validated to (0, 1] at Load.
+	MPDecimateFrac       float64 `mapstructure:"mpdecimate_frac"`
+	HashAlgo             string  `mapstructure:"hash_algo"` // "phash" | "dhash"
+	HammingThreshold     int     `mapstructure:"hamming_threshold"`
+	HashResizeWidth      int     `mapstructure:"hash_resize_width"`
+	VideosiftConcurrency int     `mapstructure:"videosift_concurrency"`
 	// Binary overrides for the videosift extractor; empty => discovered on PATH.
 	FFmpegPath  string `mapstructure:"ffmpeg_path"`
 	FFprobePath string `mapstructure:"ffprobe_path"`
