@@ -164,3 +164,69 @@ func TestFramesExtractsRealVideo(t *testing.T) {
 		t.Errorf("workdir %q survived cleanup (stat err=%v)", workDir, err)
 	}
 }
+
+// buildConfig is the vismod->videosift seam. It must pass an explicit
+// HammingThreshold:0 / HashResizeWidth:0 (the documented "disable dedup" /
+// "disable rescale" contract) through verbatim. videosift honors 0 as disable,
+// so re-defaulting it on the vismod side would silently break the contract — the
+// exact regression this test guards at vismod's boundary.
+func TestBuildConfigDisableValuesSurvive(t *testing.T) {
+	s := NewVideosiftSource(VideosiftOptions{HammingThreshold: 0, HashResizeWidth: 0})
+	cfg := s.buildConfig("/work")
+	if cfg.HammingThreshold != 0 {
+		t.Errorf("HammingThreshold = %d, want 0 (disable must survive the seam)", cfg.HammingThreshold)
+	}
+	if cfg.HashResizeWidth != 0 {
+		t.Errorf("HashResizeWidth = %d, want 0 (disable must survive the seam)", cfg.HashResizeWidth)
+	}
+}
+
+// buildConfig passes every numeric tuning knob through to videosift.Config and
+// resolves HashAlgo: a non-empty value overrides DefaultConfig's algorithm.
+func TestBuildConfigMapsTuning(t *testing.T) {
+	s := NewVideosiftSource(VideosiftOptions{
+		MaxFrames:            5,
+		SceneThreshold:       0.2,
+		TemporalInterval:     1.5,
+		MPDecimateHi:         700,
+		MPDecimateLo:         300,
+		MPDecimateFrac:       0.5,
+		HammingThreshold:     12,
+		HashResizeWidth:      128,
+		VideosiftConcurrency: 3,
+		HashAlgo:             "dhash",
+	})
+	cfg := s.buildConfig("/work")
+	checks := []struct {
+		name string
+		got  any
+		want any
+	}{
+		{"WorkDir", cfg.WorkDir, "/work"},
+		{"MaxFrames", cfg.MaxFrames, 5},
+		{"SceneThreshold", cfg.SceneThreshold, 0.2},
+		{"TemporalInterval", cfg.TemporalInterval, 1.5},
+		{"MPDecimateHi", cfg.MPDecimateHi, 700},
+		{"MPDecimateLo", cfg.MPDecimateLo, 300},
+		{"MPDecimateFrac", cfg.MPDecimateFrac, 0.5},
+		{"HammingThreshold", cfg.HammingThreshold, 12},
+		{"HashResizeWidth", cfg.HashResizeWidth, 128},
+		{"Concurrency", cfg.Concurrency, 3},
+		{"HashAlgo", cfg.HashAlgo, videosift.HashDHash},
+	}
+	for _, c := range checks {
+		if c.got != c.want {
+			t.Errorf("%s = %v, want %v", c.name, c.got, c.want)
+		}
+	}
+}
+
+// An empty HashAlgo is the zero value, not a valid algorithm; buildConfig must
+// keep DefaultConfig's HashPHash rather than casting "" through to videosift.
+func TestBuildConfigEmptyHashAlgoKeepsDefault(t *testing.T) {
+	s := NewVideosiftSource(VideosiftOptions{HashAlgo: ""})
+	cfg := s.buildConfig("/work")
+	if cfg.HashAlgo != videosift.HashPHash {
+		t.Errorf("empty HashAlgo => %q, want default %q", cfg.HashAlgo, videosift.HashPHash)
+	}
+}

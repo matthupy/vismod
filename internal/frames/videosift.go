@@ -129,6 +129,22 @@ func (s *VideosiftSource) Frames(ctx context.Context, videoPath string) ([]Frame
 	}
 	cleanup := newCleanup(workDir)
 
+	vframes, err := videosift.Extract(ctx, videoPath, s.buildConfig(workDir))
+	if err != nil {
+		// Wrap, preserving the sentinel/typed cause for errors.Is/As upstream.
+		return nil, cleanup, fmt.Errorf("frames: videosift extract: %w", err)
+	}
+	return mapFrames(vframes), cleanup, nil
+}
+
+// buildConfig is the vismod->videosift seam: it translates VideosiftOptions into
+// a videosift.Config rooted at workDir. It passes every tuning knob through
+// verbatim — in particular an explicit HammingThreshold:0 / HashResizeWidth:0
+// (the "disable dedup" / "disable rescale" contract) is NOT re-defaulted here;
+// videosift honors 0 as disable, so clobbering it would silently break the
+// documented config behavior. Kept separate from Frames so the mapping is unit
+// testable without ffmpeg.
+func (s *VideosiftSource) buildConfig(workDir string) videosift.Config {
 	cfg := videosift.DefaultConfig()
 	cfg.WorkDir = workDir // absolute, caller-owned: videosift will NOT delete it
 	cfg.MaxFrames = s.opts.MaxFrames
@@ -150,13 +166,7 @@ func (s *VideosiftSource) Frames(ctx context.Context, videoPath string) ([]Frame
 	}
 	cfg.FFmpegPath = s.ffmpegPath()
 	cfg.FFprobePath = s.ffprobePath()
-
-	vframes, err := videosift.Extract(ctx, videoPath, cfg)
-	if err != nil {
-		// Wrap, preserving the sentinel/typed cause for errors.Is/As upstream.
-		return nil, cleanup, fmt.Errorf("frames: videosift extract: %w", err)
-	}
-	return mapFrames(vframes), cleanup, nil
+	return cfg
 }
 
 // mapFrames translates videosift frames into pipeline-owned Frames. It MUST NOT
