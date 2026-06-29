@@ -44,7 +44,7 @@ govulncheck ./...                                      # vuln scan (CI)
 CI (`.github/workflows/ci.yml`) runs: `go mod tidy` + `git diff --exit-code go.mod go.sum`, build, vet,
 `-race` tests w/ coverage, `golangci-lint`, `govulncheck`, and a Docker build. Keep `go.mod`/`go.sum`
 tidy or CI fails. There is no standalone gofmt step in CI — formatting is enforced via `golangci-lint`
-(the gofmt/gofumpt linters); run `gofmt -l .` locally to catch it before pushing.
+(the gofmt formatter); run `gofmt -l .` locally to catch it before pushing.
 
 ### Critical build gotcha — sibling `videosift` checkout
 
