@@ -10,7 +10,8 @@ schema (`pkg/moderation`), and runs as a one-shot CLI (`vismod scan`) and a long
 (`vismod serve`). Public good for trust & safety; **no commercial goals**. Correctness, safety, and
 auditability come first.
 
-Single binary, subcommands: `scan`, `serve`, `adapters`, `audit verify`, `version`, `healthcheck`.
+Single binary, subcommands: `scan`, `serve`, `adapters`, `audit verify`, `version`, `healthcheck`
+(hidden, operational).
 
 ## Safety — read before any change touching media, logs, or moderation logic
 
@@ -42,7 +43,8 @@ govulncheck ./...                                      # vuln scan (CI)
 
 CI (`.github/workflows/ci.yml`) runs: `go mod tidy` + `git diff --exit-code go.mod go.sum`, build, vet,
 `-race` tests w/ coverage, `golangci-lint`, `govulncheck`, and a Docker build. Keep `go.mod`/`go.sum`
-tidy or CI fails.
+tidy or CI fails. There is no standalone gofmt step in CI — formatting is enforced via `golangci-lint`
+(the gofmt/gofumpt linters); run `gofmt -l .` locally to catch it before pushing.
 
 ### Critical build gotcha — sibling `videosift` checkout
 
