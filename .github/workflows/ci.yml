@@ -80,7 +80,7 @@ jobs:
           path: videosift
 
       - name: Set up Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       # Build only (no push): proves the multi-stage Dockerfile compiles the
       # binary and assembles the ffmpeg-bearing runtime. Context = workspace root
