@@ -3,6 +3,7 @@ package jobstore
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"math/rand"
 	"strings"
 	"sync"
@@ -469,7 +470,7 @@ func TestNewMemStoreClampsNonPositiveMaxEntries(t *testing.T) {
 	const inserted = 10
 	var ids []result.JobID
 	for i := 0; i < inserted; i++ {
-		id := result.JobID(time.Now().String() + string(rune('a'+i)))
+		id := result.JobID(fmt.Sprintf("job-clamp-%d", i))
 		ids = append(ids, id)
 		_ = m.SetPending(ctx, id, src(), now())
 	}
@@ -501,7 +502,7 @@ func TestMaxEntriesEviction(t *testing.T) {
 
 	var ids []result.JobID
 	for i := 0; i < max+extras; i++ {
-		id := result.JobID(time.Now().String() + string(rune('a'+i)))
+		id := result.JobID(fmt.Sprintf("job-evict-%d", i))
 		ids = append(ids, id)
 		_ = m.SetPending(ctx, id, src(), now())
 	}
@@ -617,7 +618,7 @@ func TestConcurrentOutOfOrder(t *testing.T) {
 
 	for job := 0; job < numJobs; job++ {
 		for round := 0; round < rounds; round++ {
-			id := result.JobID(time.Now().String() + string(rune('A'+job%26)) + string(rune('a'+job%26)) + string(rune('0'+round%10)))
+			id := result.JobID(fmt.Sprintf("job-concurrent-%d-%d", job, round))
 			m := NewMemStore(1000, 0)
 			env := envelopeDone(id)
 
@@ -682,6 +683,148 @@ func TestSetProcessingWithNoExistingRecord(t *testing.T) {
 	if !found || rec.Status != StatusProcessing {
 		t.Errorf("expected processing, got found=%v status=%v", found, rec.Status)
 	}
+}
+
+// TestSetProcessingWithNoExistingRecordSetsSubmittedAtFallback covers the race
+// where SetProcessing lands before any SetPending: no record exists, so
+// SubmittedAt is never set from a prior write. Without a fallback this
+// serializes as the epoch-zero value "0001-01-01T00:00:00Z" for the duration
+// of the processing window (or permanently, if the worker crashes and the job
+// stays "processing" — the wedged-job signal). SetProcessing must fall back
+// SubmittedAt to startedAt on the processing-first (!ok) path, mirroring the
+// fallback already applied in Complete.
+func TestSetProcessingWithNoExistingRecordSetsSubmittedAtFallback(t *testing.T) {
+	m := newStore(t, 100, 0)
+	id := result.JobID("j-proc-first-fallback")
+	startedAt := now()
+	_ = m.SetProcessing(ctx, id, "w", startedAt)
+
+	rec, found, _ := m.Get(ctx, id)
+	if !found {
+		t.Fatalf("expected record to be found")
+	}
+	if rec.SubmittedAt.IsZero() {
+		t.Fatalf("expected non-zero SubmittedAt fallback, got zero value")
+	}
+	if !rec.SubmittedAt.Equal(startedAt) {
+		t.Errorf("expected SubmittedAt == startedAt, got SubmittedAt=%v startedAt=%v", rec.SubmittedAt, startedAt)
+	}
+}
+
+// ---- FIX 1: insertOrder/entries desync (TTL evict leak + capacity FIFO) ----
+
+// TestTTLChurnKeepsInsertOrderBounded covers consequence (a) of FIX 1:
+// under a TTL-dominated, sub-capacity workload (resident set stays well below
+// maxEntries because each job is read via Get — triggering lazy TTL evict —
+// before the next is inserted), insertOrder must NOT grow unboundedly with
+// the number of jobs inserted over time. Before the fix, evict() left the
+// stale id in insertOrder forever, since evictOldest (the only pruner) never
+// runs under capacity pressure.
+func TestTTLChurnKeepsInsertOrderBounded(t *testing.T) {
+	const maxEntries = 100
+	const ttl = time.Minute
+	const numJobs = 1000 // numJobs >> maxEntries
+
+	fakeNow := now()
+	clock := func() time.Time { return fakeNow }
+	m := newStore(t, maxEntries, ttl, WithClock(clock))
+
+	for i := 0; i < numJobs; i++ {
+		id := result.JobID(fmt.Sprintf("job-%d", i))
+		_ = m.SetPending(ctx, id, src(), fakeNow)
+
+		// Advance the clock past TTL and read it back, forcing lazy TTL evict
+		// before the next insert. Resident set therefore never reaches capacity.
+		fakeNow = fakeNow.Add(ttl + time.Second)
+		_, found, _ := m.Get(ctx, id)
+		if found {
+			t.Fatalf("job %d: expected TTL-expired entry to be evicted on Get", i)
+		}
+	}
+
+	m.mu.Lock()
+	orderLen := len(m.insertOrder)
+	entriesLen := len(m.entries)
+	m.mu.Unlock()
+
+	if orderLen != 0 {
+		t.Errorf("insertOrder should be empty after every inserted job was TTL-evicted via Get, got len=%d", orderLen)
+	}
+	if entriesLen != 0 {
+		t.Errorf("entries should be empty after every inserted job was TTL-evicted via Get, got len=%d", entriesLen)
+	}
+	// Bounded regardless: must never approach numJobs.
+	if orderLen >= numJobs {
+		t.Errorf("insertOrder grew unboundedly with numJobs: len=%d numJobs=%d", orderLen, numJobs)
+	}
+}
+
+// TestEvictRecreateCapacityFIFO covers consequence (b) of FIX 1: a
+// TTL-evicted record that is RECREATED by a late SetPending must not be
+// prematurely evicted by a stale front entry left behind in insertOrder by
+// the earlier TTL eviction — eviction order must still follow true insertion
+// order. Before the fix, evict() left id A's stale id at the front of
+// insertOrder; a different id B inserted between the TTL evict and the
+// recreate became the genuinely oldest live record, but the stale front
+// entry still named A. The next evictOldest popped the stale front id A,
+// found the key DOES exist (the freshly recreated live A), and deleted A —
+// the wrong (newer) record — while B, the true oldest, wrongly survived.
+func TestEvictRecreateCapacityFIFO(t *testing.T) {
+	const maxEntries = 5
+
+	fakeNow := now()
+	clock := func() time.Time { return fakeNow }
+	m := newStore(t, maxEntries, time.Minute, WithClock(clock))
+
+	idA := result.JobID("job-A")
+	_ = m.SetPending(ctx, idA, src(), fakeNow)
+
+	// TTL-evict A via Get.
+	fakeNow = fakeNow.Add(2 * time.Minute)
+	_, found, _ := m.Get(ctx, idA)
+	if found {
+		t.Fatalf("expected A to be TTL-evicted before recreation")
+	}
+
+	// B is inserted after A's TTL eviction but before A's recreation, so B
+	// is genuinely older than the recreated A in true insertion order.
+	idB := result.JobID("job-B")
+	_ = m.SetPending(ctx, idB, src(), fakeNow)
+
+	// Recreate A via a late SetPending — A is now newer than B.
+	_ = m.SetPending(ctx, idA, src(), fakeNow)
+
+	// Fill with other ids to force exactly one evictOldest call. Total
+	// resident set reaches maxEntries+1 (A, B, job-0..extras-1), so exactly
+	// one eviction occurs; the true oldest live record is B.
+	const extras = maxEntries - 1
+	for i := 0; i < extras; i++ {
+		id := result.JobID(fmt.Sprintf("job-%d", i))
+		_ = m.SetPending(ctx, id, src(), fakeNow)
+	}
+
+	// A (recreated, newer) must survive; B (true oldest live record) must be
+	// the one evicted — NOT a stale front entry wrongly targeting A.
+	recA, foundA, _ := m.Get(ctx, idA)
+	_, foundB, _ := m.Get(ctx, idB)
+	if !foundA {
+		t.Errorf("expected recreated record A to still be present after capacity eviction, but it was evicted")
+	}
+	if foundA && recA.Status != StatusPending {
+		t.Errorf("expected recreated record A to be pending, got %v", recA.Status)
+	}
+	if foundB {
+		t.Errorf("expected B (true oldest live record) to be evicted by capacity pressure, but it survived")
+	}
+
+	// Invariant: every id in insertOrder is also in entries (no orphans).
+	m.mu.Lock()
+	for _, id := range m.insertOrder {
+		if _, ok := m.entries[id]; !ok {
+			t.Errorf("insertOrder contains orphan id %v not present in entries", id)
+		}
+	}
+	m.mu.Unlock()
 }
 
 // TestCompleteWithNoExistingRecordSetsSubmittedAtFallback covers the race

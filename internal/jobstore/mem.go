@@ -105,6 +105,12 @@ func (m *MemStore) SetPending(_ context.Context, id result.JobID, src moderation
 // reached processing will NOT overwrite WorkerID/StartedAt — the stored
 // WorkerID reflects the first worker to reach processing, not necessarily
 // the one currently (or still) running the job.
+//
+// When SetProcessing races ahead of SetPending (no existing record), the
+// created record carries an empty Source until a later SetPending/Complete
+// supplies it, and SubmittedAt falls back to startedAt (a job that has
+// started was submitted no later than it started) rather than the
+// zero-value time.Time.
 func (m *MemStore) SetProcessing(_ context.Context, id result.JobID, workerID string, startedAt time.Time) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -125,6 +131,13 @@ func (m *MemStore) SetProcessing(_ context.Context, id result.JobID, workerID st
 		// Preserve fields from the existing pending record.
 		rec.Source = existing.record.Source
 		rec.SubmittedAt = existing.record.SubmittedAt
+	} else {
+		// Race-ahead guard: SetProcessing landed before any SetPending, so
+		// SubmittedAt would otherwise serialize as the epoch-zero value
+		// "0001-01-01T00:00:00Z" for the duration of the processing window
+		// (or permanently, if the worker crashes — the wedged-job signal).
+		// Fall back to startedAt, mirroring the fallback Complete applies.
+		rec.SubmittedAt = startedAt
 	}
 	m.upsert(id, rec, ok)
 	return nil
@@ -214,8 +227,10 @@ func (m *MemStore) upsert(id result.JobID, rec JobRecord, isUpdate bool) {
 }
 
 // evictOldest removes the oldest entry by insertion order (FIFO approximation).
-// It scans insertOrder, skipping any IDs that no longer exist in the map
-// (already evicted by TTL or a previous eviction).
+// It scans insertOrder, skipping any IDs that no longer exist in the map.
+// Since evict() now keeps insertOrder in sync with entries, this skip branch
+// should normally be unreachable; it is kept as defensive belt-and-suspenders
+// against any future caller that mutates entries without going through evict.
 func (m *MemStore) evictOldest() {
 	for len(m.insertOrder) > 0 {
 		oldest := m.insertOrder[0]
@@ -227,11 +242,22 @@ func (m *MemStore) evictOldest() {
 	}
 }
 
-// evict removes a single entry by id from the map only; it does NOT touch
-// insertOrder. The stale id is left in insertOrder and is skipped lazily the
-// next time evictOldest scans past it (evictOldest is the only place that
-// cleans up insertOrder). Removing from the map here is sufficient so that
-// subsequent Gets see the entry as gone.
+// evict removes a single entry by id from both the map and insertOrder. The
+// invariant maintained across the store is: every id in insertOrder is also
+// in entries (no orphans). Without pruning insertOrder here, a TTL-dominated
+// workload that never hits capacity would never run evictOldest (the other
+// pruner), leaking one slot per TTL-expired insert forever; and a
+// TTL/capacity-evicted id later RECREATED by a late SetPending/SetProcessing
+// would leave a stale copy at the front of insertOrder, causing evictOldest
+// to delete the freshly recreated live record out of FIFO order. Removing
+// one id is an O(n) compaction over insertOrder — acceptable here since at
+// most one id is evicted per evicting Get call.
 func (m *MemStore) evict(id result.JobID) {
 	delete(m.entries, id)
+	for i, oid := range m.insertOrder {
+		if oid == id {
+			m.insertOrder = append(m.insertOrder[:i], m.insertOrder[i+1:]...)
+			break
+		}
+	}
 }
