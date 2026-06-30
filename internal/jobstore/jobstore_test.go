@@ -456,6 +456,32 @@ func TestTTLEviction(t *testing.T) {
 
 // ---- Negative/Edge: max-entries eviction ------------------------------------
 
+// TestNewMemStoreClampsNonPositiveMaxEntries covers the defensive lower bound
+// on maxEntries. NewMemStore is exported and config validation is not part of
+// this change, so a caller-supplied maxEntries<=0 must not be trusted
+// verbatim: at maxEntries=0 (or negative) every insert would evict on
+// insertion and the store would thrash at effective capacity 1. Instead,
+// NewMemStore must clamp to defaultMaxEntries so the store behaves sanely
+// until upstream config validation lands.
+func TestNewMemStoreClampsNonPositiveMaxEntries(t *testing.T) {
+	m := NewMemStore(0, 0)
+
+	const inserted = 10
+	var ids []result.JobID
+	for i := 0; i < inserted; i++ {
+		id := result.JobID(time.Now().String() + string(rune('a'+i)))
+		ids = append(ids, id)
+		_ = m.SetPending(ctx, id, src(), now())
+	}
+
+	for _, id := range ids {
+		_, found, _ := m.Get(ctx, id)
+		if !found {
+			t.Errorf("entry %v should still be retained under the clamped default capacity, not evicted", id)
+		}
+	}
+}
+
 func TestMaxEntriesEviction(t *testing.T) {
 	const max = 5
 	const extras = 3
@@ -574,56 +600,63 @@ func TestStoreSinkDelegates(t *testing.T) {
 
 // ---- P0: concurrent out-of-order race (headline test) ----------------------
 //
-// Run with: go test ./internal/jobstore/ -run TestConcurrentOutOfOrder -count=200
-//
 // This test fires SetPending, SetProcessing, and Complete for the same JobID
 // in random order from concurrent goroutines, then asserts the record is
 // terminal (done or dead_letter), never regressed. The test is written to
 // exercise the race detector when run under -race in CI.
+//
+// A single `go test -race` invocation (no -count needed) already runs
+// numJobs * rounds = 50 * 20 = 1000 shuffled 5-op sequences (~5000 op-runs
+// total, each against a fresh MemStore), so CI gets meaningful volume on
+// every run without relying on a manual -count flag. Pass -count=N to
+// multiply that further for extended manual fuzzing.
 
 func TestConcurrentOutOfOrder(t *testing.T) {
 	const numJobs = 50
+	const rounds = 20
 
 	for job := 0; job < numJobs; job++ {
-		id := result.JobID(time.Now().String() + string(rune('A'+job%26)) + string(rune('a'+job%26)))
-		m := NewMemStore(1000, 0)
-		env := envelopeDone(id)
+		for round := 0; round < rounds; round++ {
+			id := result.JobID(time.Now().String() + string(rune('A'+job%26)) + string(rune('a'+job%26)) + string(rune('0'+round%10)))
+			m := NewMemStore(1000, 0)
+			env := envelopeDone(id)
 
-		ops := []func(){
-			func() { _ = m.SetPending(ctx, id, src(), now()) },
-			func() { _ = m.SetProcessing(ctx, id, "worker-x", now()) },
-			func() { _ = m.Complete(ctx, env) },
-			// Extra late-arriving duplicates to stress idempotency.
-			func() { _ = m.SetPending(ctx, id, src(), now()) },
-			func() { _ = m.Complete(ctx, env) },
-		}
+			ops := []func(){
+				func() { _ = m.SetPending(ctx, id, src(), now()) },
+				func() { _ = m.SetProcessing(ctx, id, "worker-x", now()) },
+				func() { _ = m.Complete(ctx, env) },
+				// Extra late-arriving duplicates to stress idempotency.
+				func() { _ = m.SetPending(ctx, id, src(), now()) },
+				func() { _ = m.Complete(ctx, env) },
+			}
 
-		// Shuffle to randomize order.
-		rand.Shuffle(len(ops), func(i, j int) { ops[i], ops[j] = ops[j], ops[i] })
+			// Shuffle to randomize order.
+			rand.Shuffle(len(ops), func(i, j int) { ops[i], ops[j] = ops[j], ops[i] })
 
-		var wg sync.WaitGroup
-		for _, op := range ops {
-			wg.Add(1)
-			op := op
-			go func() {
-				defer wg.Done()
-				op()
-			}()
-		}
-		wg.Wait()
+			var wg sync.WaitGroup
+			for _, op := range ops {
+				wg.Add(1)
+				op := op
+				go func() {
+					defer wg.Done()
+					op()
+				}()
+			}
+			wg.Wait()
 
-		rec, found, err := m.Get(ctx, id)
-		if err != nil {
-			t.Errorf("job %d: Get error: %v", job, err)
-			continue
-		}
-		if !found {
-			t.Errorf("job %d: record not found after concurrent ops", job)
-			continue
-		}
-		// Final status MUST be terminal — never pending or processing.
-		if rec.Status != StatusDone && rec.Status != StatusDeadLetter {
-			t.Errorf("job %d: status regressed to %v (want terminal)", job, rec.Status)
+			rec, found, err := m.Get(ctx, id)
+			if err != nil {
+				t.Errorf("job %d round %d: Get error: %v", job, round, err)
+				continue
+			}
+			if !found {
+				t.Errorf("job %d round %d: record not found after concurrent ops", job, round)
+				continue
+			}
+			// Final status MUST be terminal — never pending or processing.
+			if rec.Status != StatusDone && rec.Status != StatusDeadLetter {
+				t.Errorf("job %d round %d: status regressed to %v (want terminal)", job, round, rec.Status)
+			}
 		}
 	}
 }
@@ -648,5 +681,33 @@ func TestSetProcessingWithNoExistingRecord(t *testing.T) {
 	rec, found, _ := m.Get(ctx, id)
 	if !found || rec.Status != StatusProcessing {
 		t.Errorf("expected processing, got found=%v status=%v", found, rec.Status)
+	}
+}
+
+// TestCompleteWithNoExistingRecordSetsSubmittedAtFallback covers the race
+// where Complete lands before any SetPending: no record exists, so
+// SubmittedAt is never set from a prior write. Without a fallback this
+// serializes as the epoch-zero value "0001-01-01T00:00:00Z", which is a
+// confusing value for GET /v1/jobs/{id}. Complete must fall back to
+// FinishedAt (preferred) or StartedAt when SubmittedAt would otherwise be
+// zero.
+func TestCompleteWithNoExistingRecordSetsSubmittedAtFallback(t *testing.T) {
+	m := newStore(t, 100, 0)
+	id := result.JobID("j-race-ahead-fallback")
+	env := envelopeDone(id) // has both StartedAt and FinishedAt set
+	_ = m.Complete(ctx, env)
+
+	rec, found, _ := m.Get(ctx, id)
+	if !found {
+		t.Fatalf("expected record to be found")
+	}
+	if rec.SubmittedAt.IsZero() {
+		t.Fatalf("expected non-zero SubmittedAt fallback, got zero value")
+	}
+	if rec.FinishedAt == nil {
+		t.Fatalf("expected FinishedAt to be set on the record")
+	}
+	if !rec.SubmittedAt.Equal(*rec.FinishedAt) {
+		t.Errorf("expected SubmittedAt == *FinishedAt, got SubmittedAt=%v FinishedAt=%v", rec.SubmittedAt, *rec.FinishedAt)
 	}
 }

@@ -14,6 +14,19 @@
 // the stored record (or no record exists). Equal or lower rank ⇒ drop (no-op,
 // return nil). This gives both monotonicity AND idempotency: a second Complete on
 // an already-terminal record is rank 3 vs 3 ⇒ dropped ⇒ record unchanged.
+//
+// # Eviction can defeat monotonicity for evicted records
+//
+// The strict-rank guard above only protects a record that is still resident
+// in the store. Once a terminal record is evicted — by TTL expiry (lazy, in
+// Get) or by oldest-first capacity eviction (evictOldest) — a late
+// SetPending/SetProcessing for that same JobID finds no record (ok=false)
+// and RECREATES it at a lower status: a job that was already `done` can
+// reappear as `pending` or `processing`. This is an inherent limitation of a
+// bounded/TTL-expiring store, not a bug in the rank rule itself, and it is
+// NOT covered by the monotonicity guarantee above. The same hole applies to
+// the future Redis driver's key `EXPIRE`: once a key expires, a late status
+// write recreates it with no memory of the prior terminal state.
 package jobstore
 
 import (
@@ -57,9 +70,15 @@ func statusRank(s JobStatus) int {
 // and nullable timestamps (StartedAt, FinishedAt) are pointers WITHOUT omitempty
 // so they serialize to explicit JSON null when unset — never 0, never absent key.
 type JobRecord struct {
-	JobID       result.JobID         `json:"job_id"`
-	Status      JobStatus            `json:"status"`
-	Source      moderation.Source    `json:"source"`
+	JobID  result.JobID      `json:"job_id"`
+	Status JobStatus         `json:"status"`
+	Source moderation.Source `json:"source"`
+	// WorkerID is set by the first worker to reach processing for this job and
+	// is NOT updated by later redeliveries (the strict-rank monotonicity rule
+	// drops a second SetProcessing once a record is already at rank
+	// processing-or-higher). Do not treat WorkerID as "the worker currently
+	// running this job" — on a redelivered/retried job it may name a dead or
+	// long-finished worker.
 	WorkerID    string               `json:"worker_id,omitempty"`
 	SubmittedAt time.Time            `json:"submitted_at"`
 	StartedAt   *time.Time           `json:"started_at"`

@@ -21,8 +21,9 @@ import (
 // Verdict scalars are populated from env.Result.Overall when env.Result != nil;
 // on dead_letter all five verdict fields are left nil and Error is set.
 //
-// This is the sole RFC3339 parsing site in the jobstore package. The Redis driver
-// (WI-2) and any future driver MUST call this helper rather than re-implement it.
+// This is the sole RFC3339 parsing site in the jobstore package. The future
+// Redis driver and any other driver MUST call this helper rather than
+// re-implement it.
 func recordFromEnvelope(env result.ResultEnvelope) JobRecord {
 	rec := JobRecord{
 		JobID:  env.JobID,
