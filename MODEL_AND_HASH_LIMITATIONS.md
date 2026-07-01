@@ -110,6 +110,21 @@ all-`null`/unsupported result **never** yields `allow` — it rolls up to `error
 (could-not-evaluate). Consumers must read explicit `null` and must tolerate
 **unknown future `Category` values as `OTHER`**.
 
+## Job store eviction can defeat status monotonicity
+
+The in-memory job store (`internal/jobstore`) enforces a strict-rank rule so
+status writes never regress a **resident** record (`pending → processing →
+{done|dead_letter}`, out-of-order writes dropped). That guard only covers
+records still in the store. Once a terminal record is evicted — TTL expiry
+or oldest-first capacity eviction in the memory driver, or key `EXPIRE` in
+the future Redis driver — a late `SetPending`/`SetProcessing` for that same
+job finds no record and **recreates it at a lower status**: a job that was
+already `done` can reappear as `pending` or `processing` after eviction.
+This is an inherent limitation of a bounded/TTL-expiring store, not a defect
+in the rank rule, and callers of `GET /v1/jobs/{id}` should not assume a
+`pending`/`processing` status guarantees the job hasn't already finished and
+been evicted.
+
 ## Perceptual-hash evadability (CSAM matcher, v1.1)
 
 The CSAM control is a **perceptual-hash match** (PDQ / TMK+PDQF / vPDQ), shipping
