@@ -1,14 +1,16 @@
 // THROWAWAY SPIKE POC — VISMOD-16. NOT production code; NOT wired into any
 // driver. This file is retained in-repo so the VISMOD-19 Redis-jobstore driver
-// story can lift the proven encoding, the three Lua scripts, and the miniredis
-// harness verbatim. Delete it once VISMOD-19 ships the real driver.
+// story can lift the proven encoding, the Lua CAS-merge script, and the
+// miniredis harness verbatim. Delete it once VISMOD-19 ships the real driver.
 //
 // What it proves (see docs/design/VISMOD-16-redis-jobstore-encoding.md):
 //  1. Hash encoding round-trip: nil pointer -> field omitted on HSET ->
 //     HGET-miss on reload -> nil in Go -> JSON `null` (never 0/""), under
 //     miniredis. Disambiguates HGET-miss vs written-nil vs written-empty.
-//  2. Three Lua CAS scripts (SetPending / SetProcessing / Complete), each
-//     proving BOTH the apply path AND the equal-or-higher-rank DROP no-op.
+//  2. ONE parameterised Lua CAS-merge script driven per writer (SetPending /
+//     SetProcessing / Complete via an ARGV protocol, not three scripts — see
+//     design doc §2.1), each writer proving BOTH the apply path AND the
+//     equal-or-higher-rank DROP no-op.
 //  3. Complete merge-preserve (SubmittedAt always / WorkerID if non-empty /
 //     StartedAt if non-nil) + rank-3-vs-3 idempotent drop + race-ahead
 //     SubmittedAt fallbacks, reusing the mandated Go-side recordFromEnvelope.
@@ -17,11 +19,12 @@
 //     the Lua CAS with no lost terminal status.
 //
 // The Go/Lua boundary mirrors sink.go:24: RFC3339 parse + verdict extraction
-// stay Go-side (recordFromEnvelope); Lua does HGET -> rank-branch -> HSET/EXPIRE
-// only. No cjson on the write path.
+// stay Go-side (recordFromEnvelope); Lua does HGET -> rank-branch ->
+// HSET/HEXISTS/EXPIRE only. No cjson on the write path.
 package jobstore
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strconv"
@@ -264,9 +267,17 @@ func newSpikeStore(t *testing.T, ttlSec int) *spikeStore {
 	return &spikeStore{rdb: rdb, script: redis.NewScript(luaCASMerge), ttlSec: ttlSec}
 }
 
+// runE executes the CAS-merge script and returns (applied, err) WITHOUT touching
+// *testing.T — safe to call from a spawned goroutine (t.Fatalf must only be
+// called from the test's own goroutine). run is the t.Fatalf-on-error wrapper
+// for the single-goroutine tests.
+func (s *spikeStore) runE(ctx context.Context, id result.JobID, target, ttl int, over, pres []string) (int64, error) {
+	return s.script.Run(ctx, s.rdb, []string{spikeKey(id)}, buildArgs(target, ttl, over, pres)...).Int64()
+}
+
 func (s *spikeStore) run(t *testing.T, id result.JobID, target, ttl int, over, pres []string) int64 {
 	t.Helper()
-	n, err := s.script.Run(t.Context(), s.rdb, []string{spikeKey(id)}, buildArgs(target, ttl, over, pres)...).Int64()
+	n, err := s.runE(t.Context(), id, target, ttl, over, pres)
 	if err != nil {
 		t.Fatalf("EVAL: %v", err)
 	}
@@ -283,6 +294,16 @@ func (s *spikeStore) setPending(t *testing.T, id result.JobID, src moderation.So
 }
 
 func (s *spikeStore) setProcessing(t *testing.T, id result.JobID, workerID string, started time.Time) int64 {
+	t.Helper()
+	n, err := s.setProcessingE(t.Context(), id, workerID, started)
+	if err != nil {
+		t.Fatalf("EVAL: %v", err)
+	}
+	return n
+}
+
+// setProcessingE is the goroutine-safe core of setProcessing (no *testing.T).
+func (s *spikeStore) setProcessingE(ctx context.Context, id result.JobID, workerID string, started time.Time) (int64, error) {
 	over := []string{
 		"status", string(StatusProcessing),
 		"worker_id", workerID,
@@ -291,10 +312,20 @@ func (s *spikeStore) setProcessing(t *testing.T, id result.JobID, workerID strin
 	// Race-ahead fallback: if no pending exists, SubmittedAt := started (mem.go:140).
 	// preserve => set only if absent, so an existing pending's SubmittedAt wins.
 	pres := []string{"submitted_at", started.UTC().Format(time.RFC3339Nano)}
-	return s.run(t, id, statusRank(StatusProcessing), s.ttlSec, over, pres)
+	return s.runE(ctx, id, statusRank(StatusProcessing), s.ttlSec, over, pres)
 }
 
 func (s *spikeStore) complete(t *testing.T, env result.ResultEnvelope) int64 {
+	t.Helper()
+	n, err := s.completeE(t.Context(), env)
+	if err != nil {
+		t.Fatalf("EVAL: %v", err)
+	}
+	return n
+}
+
+// completeE is the goroutine-safe core of complete (no *testing.T).
+func (s *spikeStore) completeE(ctx context.Context, env result.ResultEnvelope) (int64, error) {
 	// Go-side: reuse the mandated helper (sink.go:24) for RFC3339 parse + verdict
 	// extraction. Lua never parses time or ranks verdicts.
 	rec := recordFromEnvelope(env)
@@ -308,11 +339,13 @@ func (s *spikeStore) complete(t *testing.T, env result.ResultEnvelope) int64 {
 	over, started := splitOut(over, "started_at") // absent if rec.StartedAt==nil (already omitted)
 
 	// Race-ahead SubmittedAt fallback already applied by mem-style Go logic:
-	// recordFromEnvelope leaves SubmittedAt zero, so compute the fallback here
-	// (FinishedAt -> StartedAt), mirroring mem.go:178-184, before it becomes the
-	// create-time value.
+	// recordFromEnvelope leaves SubmittedAt zero, so encodeFields wrote the
+	// zero-formatted "0001-01-01T00:00:00Z". Replace it with a sensible non-zero
+	// time (FinishedAt -> StartedAt), mirroring mem.go:178-184, before it becomes
+	// the create-time value. (submitted is never "" — encodeFields always writes
+	// submitted_at — so isZeroRFC3339 is the only trigger.)
 	subVal := submitted
-	if subVal == "" || isZeroRFC3339(subVal) {
+	if isZeroRFC3339(subVal) {
 		if rec.FinishedAt != nil {
 			subVal = rec.FinishedAt.UTC().Format(time.RFC3339Nano)
 		} else if rec.StartedAt != nil {
@@ -330,7 +363,9 @@ func (s *spikeStore) complete(t *testing.T, env result.ResultEnvelope) int64 {
 	if started != "" {
 		pres = append(pres, "started_at", started)
 	}
-	return s.run(t, env.JobID, statusRank(StatusDone), s.ttlSec, over, pres)
+	// target derived from rec.Status (done and dead_letter both rank 3) rather
+	// than hard-coded StatusDone, so the rank guard reads correctly when lifted.
+	return s.runE(ctx, env.JobID, statusRank(rec.Status), s.ttlSec, over, pres)
 }
 
 // splitOut removes field f (and its value) from a flat pair slice, returning the
@@ -616,11 +651,23 @@ func TestSpike_ConcurrentProcessingVsComplete(t *testing.T) {
 		FinishedAt: rfc3339("2026-07-01T05:00:02Z"),
 		Result:     &moderation.NormalizedResult{Overall: moderation.OverallVerdict{Verdict: moderation.VerdictBlock, Flagged: true}},
 	}
+	// Goroutines must NOT touch *testing.T (t.Fatalf from a non-test goroutine is
+	// testing misuse: it runs Goexit on the wrong goroutine, so the failure goes
+	// unrecorded and the test can hang). Use the *E variants and funnel any EVAL
+	// error to a channel; assert on the main goroutine after wg.Wait().
+	ctx := t.Context()
+	errc := make(chan error, 2)
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go func() { defer wg.Done(); s.setProcessing(t, "cc1", "w1", started) }()
-	go func() { defer wg.Done(); s.complete(t, env) }()
+	go func() { defer wg.Done(); _, err := s.setProcessingE(ctx, "cc1", "w1", started); errc <- err }()
+	go func() { defer wg.Done(); _, err := s.completeE(ctx, env); errc <- err }()
 	wg.Wait()
+	close(errc)
+	for err := range errc {
+		if err != nil {
+			t.Fatalf("concurrent writer EVAL error: %v", err)
+		}
+	}
 
 	rec, _ := s.get(t, "cc1")
 	if rec.Status != StatusDone {
