@@ -1,6 +1,6 @@
 module github.com/matthupy/vismod
 
-go 1.26.4
+go 1.26.5
 
 replace github.com/matthupy/videosift => ../videosift
 
@@ -12,7 +12,7 @@ require (
 	github.com/redis/go-redis/v9 v9.21.0
 	github.com/spf13/cobra v1.10.2
 	github.com/spf13/viper v1.21.0
-	golang.org/x/sync v0.21.0
+	golang.org/x/sync v0.22.0
 	golang.org/x/time v0.15.0
 )
 
