@@ -1,9 +1,7 @@
 ## Links
 
-<!--- Which ticket(s), if any, were closed by this PR? -->
-* Closes: 
-<!--- Which ticket(s), if any, are related (e.g. caused by) to this PR? -->
-* Related To:
+* Closes: <!--- Which ticket(s), if any, were closed by this PR? -->
+* Related To: <!--- Which ticket(s), if any, are related (e.g. caused by) to this PR? -->
 
 ## Description
 <!--- A short, 1-5 sentence description using layman's terminology describing the change -->
