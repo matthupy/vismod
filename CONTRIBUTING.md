@@ -46,6 +46,16 @@ video path locally.
 - **Small, reviewable PRs** that keep `main` green. Match the surrounding code's
   style and comment density.
 
+## Pull requests
+
+Open PRs against `main`. GitHub pre-fills the
+[pull request template](.github/pull_request_template.md) — **fill in every
+section** (Links, Description, Technical Solution, Testing). Do not delete
+headings; if a section does not apply, say so (e.g. "No change to
+functionality"). The Testing section carries a **required safety checkbox** —
+confirm no media bytes, PII, or secrets were added to code, tests, or fixtures
+before requesting review.
+
 ## Adding a moderation adapter
 
 1. Implement `moderation.Moderator` (and optionally `moderation.VideoModerator`)

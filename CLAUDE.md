@@ -61,6 +61,15 @@ parent/
 install both to run the video path locally. Docker builds use the **parent dir** as context
 (`docker build -f vismod/Dockerfile -t vismod:dev parent/`), not this repo.
 
+## Pull requests
+
+When opening a PR, use the repo's PR template
+(`.github/pull_request_template.md`) as the PR body — `gh pr create --body-file
+.github/pull_request_template.md`, then fill it in. Complete every section
+(Links with `Closes:`/`Related To:`, Description, Technical Solution, Testing),
+keep the headings, and check the Testing safety box (no media bytes, PII, or
+secrets in code/tests/fixtures — this is enforced, see the Safety section).
+
 ## Layout
 
 ```

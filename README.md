@@ -146,6 +146,13 @@ hash — `SHA-256(Raw)` + `ModelIdentity` + verdict, **never the media or `Raw`
 text**. `vismod audit verify <path>` recomputes the chain and reports the first
 broken link.
 
+## Contributing
+
+Read [CONTRIBUTING.md](CONTRIBUTING.md) first. PRs are opened against `main` and
+use the repo's [pull request template](.github/pull_request_template.md), which
+GitHub pre-fills automatically — complete every section, including the Testing
+safety checkbox (no media bytes, PII, or secrets in code/tests/fixtures).
+
 ## Internal dependency
 
 Video framing uses `github.com/matthupy/videosift` (MIT) — **tracked at latest, never
