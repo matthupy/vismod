@@ -2,252 +2,187 @@ package queue
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/matthupy/vismod/internal/result"
-	"github.com/matthupy/vismod/pkg/moderation"
+	"github.com/vismod/vismod/pkg/moderation"
 )
 
-// fakeRecorder counts terminal-disposition calls (queue.Recorder).
-type fakeRecorder struct{ completed, failed atomic.Int64 }
-
-func (r *fakeRecorder) RecordJobCompleted() { r.completed.Add(1) }
-func (r *fakeRecorder) RecordJobFailed()    { r.failed.Add(1) }
-
-// captureSink records envelopes written to it (used as a DLQ sink).
-type captureSink struct {
-	mu   sync.Mutex
-	envs []result.ResultEnvelope
+func job(id string) Job {
+	return Job{ID: JobID(id), Source: moderation.Source{Kind: "file", Ref: id, MediaType: "image"}, SubmittedAt: time.Now()}
 }
 
-func (c *captureSink) Write(_ context.Context, env result.ResultEnvelope) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.envs = append(c.envs, env)
-	return nil
-}
-
-func (c *captureSink) ids() []result.JobID {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	out := make([]result.JobID, len(c.envs))
-	for i, e := range c.envs {
-		out[i] = e.JobID
-	}
-	return out
-}
-
-func newTestQueue(t *testing.T, cfg QueueConfig) (*memQueue, *captureSink) {
+func waitFor(t *testing.T, timeout time.Duration, cond func() bool, msg string) {
 	t.Helper()
-	dlq := &captureSink{}
-	cfg.DeadLetter = dlq
-	q, err := NewMemQueue(cfg, nil)
-	if err != nil {
-		t.Fatalf("NewMemQueue: %v", err)
-	}
-	return q, dlq
-}
-
-func TestMemQueueFIFOSingleWorker(t *testing.T) {
-	q, _ := newTestQueue(t, QueueConfig{Workers: 1, Buffer: 16, DrainTimeout: 2 * time.Second})
-
-	var mu sync.Mutex
-	var order []result.JobID
-	handler := func(_ context.Context, j Job) (Disposition, error) {
-		mu.Lock()
-		order = append(order, j.ID)
-		mu.Unlock()
-		return Ack, nil
-	}
-	if err := q.Start(context.Background(), handler); err != nil {
-		t.Fatal(err)
-	}
-
-	want := make([]result.JobID, 0, 20)
-	for i := 0; i < 20; i++ {
-		id, err := q.Enqueue(context.Background(), Job{Source: moderation.Source{Ref: "x"}})
-		if err != nil {
-			t.Fatal(err)
-		}
-		want = append(want, id)
-	}
-	if err := q.Close(context.Background()); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
-
-	if len(order) != len(want) {
-		t.Fatalf("processed %d, want %d", len(order), len(want))
-	}
-	for i := range want {
-		if order[i] != want[i] {
-			t.Fatalf("FIFO violated at %d: got %s want %s", i, order[i], want[i])
-		}
-	}
-}
-
-func TestMemQueuePanicDeadLettersAndPoolSurvives(t *testing.T) {
-	q, dlq := newTestQueue(t, QueueConfig{Workers: 2, Buffer: 16, DrainTimeout: 2 * time.Second})
-
-	var processed int
-	var mu sync.Mutex
-	handler := func(_ context.Context, j Job) (Disposition, error) {
-		if j.Source.Ref == "poison" {
-			panic("boom")
-		}
-		mu.Lock()
-		processed++
-		mu.Unlock()
-		return Ack, nil
-	}
-	_ = q.Start(context.Background(), handler)
-
-	_, _ = q.Enqueue(context.Background(), Job{Source: moderation.Source{Ref: "poison"}})
-	for i := 0; i < 5; i++ {
-		_, _ = q.Enqueue(context.Background(), Job{Source: moderation.Source{Ref: "ok"}})
-	}
-	if err := q.Close(context.Background()); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
-
-	if got := dlq.ids(); len(got) != 1 {
-		t.Fatalf("want 1 dead-lettered job, got %d", len(got))
-	}
-	if processed != 5 {
-		t.Fatalf("pool must survive panic and process the other 5, processed=%d", processed)
-	}
-	// Dead-lettered envelope must be fail-safe: Result nil, Error set (never allow).
-	if dlq.envs[0].Result != nil || dlq.envs[0].Error == "" {
-		t.Fatalf("dead-letter envelope must carry an error and no result: %+v", dlq.envs[0])
-	}
-}
-
-func TestMemQueueRetryExhaustionDeadLetters(t *testing.T) {
-	q, dlq := newTestQueue(t, QueueConfig{
-		Workers: 1, Buffer: 8, MaxRetries: 2, RetryBackoff: time.Millisecond, DrainTimeout: 2 * time.Second,
-	})
-
-	var attempts int
-	handler := func(_ context.Context, _ Job) (Disposition, error) {
-		attempts++
-		return Retry, nil // always transient
-	}
-	_ = q.Start(context.Background(), handler)
-	_, _ = q.Enqueue(context.Background(), Job{Source: moderation.Source{Ref: "x"}})
-	_ = q.Close(context.Background())
-
-	// 1 initial + 2 retries = 3 attempts, then dead-letter.
-	if attempts != 3 {
-		t.Fatalf("want 3 attempts, got %d", attempts)
-	}
-	if len(dlq.ids()) != 1 {
-		t.Fatalf("retry-exhausted job must dead-letter, got %d", len(dlq.ids()))
-	}
-}
-
-// The driver threads a 0-based attempt counter into Job.Attempt so a handler can
-// distinguish a first dequeue from a retry re-dispatch. memq increments it across
-// its in-process retry loop: first attempt = 0, then 1, 2, ...
-func TestMemQueueThreadsAttemptAcrossRetries(t *testing.T) {
-	q, _ := newTestQueue(t, QueueConfig{
-		Workers: 1, Buffer: 8, MaxRetries: 2, RetryBackoff: time.Millisecond, DrainTimeout: 2 * time.Second,
-	})
-
-	var mu sync.Mutex
-	var seen []int
-	handler := func(_ context.Context, j Job) (Disposition, error) {
-		mu.Lock()
-		seen = append(seen, j.Attempt)
-		mu.Unlock()
-		return Retry, nil // always transient => exhausts retries
-	}
-	_ = q.Start(context.Background(), handler)
-	_, _ = q.Enqueue(context.Background(), Job{Source: moderation.Source{Ref: "x"}})
-	_ = q.Close(context.Background())
-
-	mu.Lock()
-	defer mu.Unlock()
-	want := []int{0, 1, 2} // 1 initial + 2 retries
-	if len(seen) != len(want) {
-		t.Fatalf("attempts seen = %v, want %v", seen, want)
-	}
-	for i := range want {
-		if seen[i] != want[i] {
-			t.Fatalf("attempt[%d] = %d, want %d (full=%v)", i, seen[i], want[i], seen)
-		}
-	}
-}
-
-func TestMemQueueDeadLetterImmediate(t *testing.T) {
-	q, dlq := newTestQueue(t, QueueConfig{Workers: 1, Buffer: 4, MaxRetries: 5, DrainTimeout: time.Second})
-	handler := func(_ context.Context, _ Job) (Disposition, error) { return DeadLetter, nil }
-	_ = q.Start(context.Background(), handler)
-	_, _ = q.Enqueue(context.Background(), Job{Source: moderation.Source{Ref: "x"}})
-	_ = q.Close(context.Background())
-	if len(dlq.ids()) != 1 {
-		t.Fatalf("DeadLetter disposition must dead-letter immediately, got %d", len(dlq.ids()))
-	}
-}
-
-func TestMemQueueActiveDepthAndLifecycleCounters(t *testing.T) {
-	rec := &fakeRecorder{}
-	q, _ := newTestQueue(t, QueueConfig{
-		Workers: 1, Buffer: 8, MaxRetries: 0, DrainTimeout: 2 * time.Second, Metrics: rec,
-	})
-
-	release := make(chan struct{})
-	_ = q.Start(context.Background(), func(_ context.Context, j Job) (Disposition, error) {
-		if j.Source.Ref == "fail" {
-			return DeadLetter, nil
-		}
-		<-release // block so the job stays in-flight (Active)
-		return Ack, nil
-	})
-
-	// Enqueue a job that blocks in the handler => ActiveDepth rises to 1.
-	if _, err := q.Enqueue(context.Background(), Job{Source: moderation.Source{Ref: "ok"}}); err != nil {
-		t.Fatal(err)
-	}
-	waitForInt(t, func() int { return q.ActiveDepth() }, 1, "ActiveDepth should be 1 while a job is in-flight")
-
-	// Release it => acked => ActiveDepth back to 0, completed counter == 1.
-	close(release)
-	waitForInt(t, func() int { return q.ActiveDepth() }, 0, "ActiveDepth should return to 0 after ack")
-	waitForInt(t, func() int { return int(rec.completed.Load()) }, 1, "completed counter should be 1 after ack")
-
-	// A dead-lettered job bumps the failed counter and never the completed one.
-	if _, err := q.Enqueue(context.Background(), Job{Source: moderation.Source{Ref: "fail"}}); err != nil {
-		t.Fatal(err)
-	}
-	waitForInt(t, func() int { return int(rec.failed.Load()) }, 1, "failed counter should be 1 after dead-letter")
-	if got := rec.completed.Load(); got != 1 {
-		t.Fatalf("completed counter must stay 1 (dead-letter is not a completion), got %d", got)
-	}
-	waitForInt(t, func() int { return q.ActiveDepth() }, 0, "ActiveDepth should be 0 after the dead-lettered job finishes")
-
-	_ = q.Close(context.Background())
-}
-
-// waitForInt polls f until it equals want or a short deadline passes.
-func waitForInt(t *testing.T, f func() int, want int, msg string) {
-	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if f() == want {
+		if cond() {
 			return
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	t.Fatalf("%s (last=%d, want=%d)", msg, f(), want)
+	t.Fatal("timeout waiting for: " + msg)
 }
 
-func TestMemQueueRejectsAfterClose(t *testing.T) {
-	q, _ := newTestQueue(t, QueueConfig{Workers: 1, Buffer: 4, DrainTimeout: time.Second})
-	_ = q.Start(context.Background(), func(context.Context, Job) (Disposition, error) { return Ack, nil })
+// FIFO: with one worker, dequeue order must equal enqueue order.
+func TestMemqFIFO(t *testing.T) {
+	q := NewMemq(QueueConfig{Workers: 1, Buffer: 100}, nil)
+	var mu sync.Mutex
+	var got []string
+
+	// Enqueue IDs whose lexicographic order differs from arrival order to
+	// catch sorted-key ordering bugs.
+	ids := []string{"z-9", "a-1", "m-5", "b-2", "y-8"}
+	for _, id := range ids {
+		if _, err := q.Enqueue(context.Background(), job(id)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := q.Start(context.Background(), func(_ context.Context, j Job) (Disposition, error) {
+		mu.Lock()
+		got = append(got, string(j.ID))
+		mu.Unlock()
+		return Ack, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 2*time.Second, func() bool { mu.Lock(); defer mu.Unlock(); return len(got) == len(ids) }, "all jobs processed")
 	_ = q.Close(context.Background())
-	if _, err := q.Enqueue(context.Background(), Job{}); err != ErrQueueClosed {
-		t.Fatalf("want ErrQueueClosed, got %v", err)
+
+	for i := range ids {
+		if got[i] != ids[i] {
+			t.Fatalf("FIFO violated: got %v, want %v", got, ids)
+		}
+	}
+}
+
+func TestMemqRetryThenDLQ(t *testing.T) {
+	dlq := NewMemDLQ()
+	q := NewMemq(QueueConfig{Workers: 2, MaxRetries: 2, RetryBackoff: 5 * time.Millisecond, DeadLetter: dlq}, nil)
+	var attempts atomic.Int32
+	_ = q.Start(context.Background(), func(context.Context, Job) (Disposition, error) {
+		attempts.Add(1)
+		return Retry, errors.New("transient")
+	})
+	if _, err := q.Enqueue(context.Background(), job("j1")); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 2*time.Second, func() bool { return len(dlq.Entries()) == 1 }, "job dead-lettered after retries")
+	_ = q.Close(context.Background())
+
+	// 1 initial + 2 retries = 3 attempts, then DLQ.
+	if got := attempts.Load(); got != 3 {
+		t.Errorf("attempts = %d, want 3", got)
+	}
+	e := dlq.Entries()[0]
+	if e.Job.ID != "j1" || e.Attempts != 3 {
+		t.Errorf("unexpected DLQ entry: %+v", e)
+	}
+}
+
+func TestMemqDeadLetterDisposition(t *testing.T) {
+	dlq := NewMemDLQ()
+	q := NewMemq(QueueConfig{Workers: 1, DeadLetter: dlq}, nil)
+	_ = q.Start(context.Background(), func(context.Context, Job) (Disposition, error) {
+		return DeadLetter, errors.New("terminal")
+	})
+	_, _ = q.Enqueue(context.Background(), job("j1"))
+	waitFor(t, 2*time.Second, func() bool { return len(dlq.Entries()) == 1 }, "immediate dead-letter")
+	_ = q.Close(context.Background())
+	if e := dlq.Entries()[0]; e.Attempts != 1 {
+		t.Errorf("DeadLetter disposition should not retry, attempts=%d", e.Attempts)
+	}
+}
+
+// A panicking handler dead-letters the job and the pool keeps running.
+func TestMemqPanicDeadLettersPoolSurvives(t *testing.T) {
+	dlq := NewMemDLQ()
+	q := NewMemq(QueueConfig{Workers: 1, DeadLetter: dlq}, nil)
+	var processed atomic.Int32
+	_ = q.Start(context.Background(), func(_ context.Context, j Job) (Disposition, error) {
+		if j.ID == "boom" {
+			panic("kaboom")
+		}
+		processed.Add(1)
+		return Ack, nil
+	})
+	_, _ = q.Enqueue(context.Background(), job("boom"))
+	_, _ = q.Enqueue(context.Background(), job("after"))
+	waitFor(t, 2*time.Second, func() bool { return processed.Load() == 1 && len(dlq.Entries()) == 1 }, "panic dead-lettered, next job processed")
+	_ = q.Close(context.Background())
+	if e := dlq.Entries()[0]; e.Job.ID != "boom" {
+		t.Errorf("wrong job dead-lettered: %+v", e)
+	}
+}
+
+// DLQ at capacity: enqueues are rejected with a retryable error; dead
+// letters are never dropped.
+func TestMemqDLQCapRejectsEnqueue(t *testing.T) {
+	dlq := NewMemDLQ()
+	q := NewMemq(QueueConfig{Workers: 1, DeadLetterMax: 1, DeadLetter: dlq}, nil)
+	_ = q.Start(context.Background(), func(context.Context, Job) (Disposition, error) {
+		return DeadLetter, errors.New("bad")
+	})
+	_, _ = q.Enqueue(context.Background(), job("j1"))
+	waitFor(t, 2*time.Second, func() bool { return len(dlq.Entries()) == 1 }, "first job dead-lettered")
+
+	_, err := q.Enqueue(context.Background(), job("j2"))
+	if !errors.Is(err, ErrDeadLetterFull) {
+		t.Errorf("want ErrDeadLetterFull, got %v", err)
+	}
+	_ = q.Close(context.Background())
+}
+
+// Graceful drain: in-flight jobs finish and ack within the drain budget.
+func TestMemqDrainLetsInFlightFinish(t *testing.T) {
+	q := NewMemq(QueueConfig{Workers: 1, DrainTimeout: 2 * time.Second}, nil)
+	started := make(chan struct{})
+	var done atomic.Bool
+	_ = q.Start(context.Background(), func(context.Context, Job) (Disposition, error) {
+		close(started)
+		time.Sleep(100 * time.Millisecond)
+		done.Store(true)
+		return Ack, nil
+	})
+	_, _ = q.Enqueue(context.Background(), job("slow"))
+	<-started
+	if err := q.Close(context.Background()); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if !done.Load() {
+		t.Error("in-flight job was not allowed to finish during drain")
+	}
+	if _, err := q.Enqueue(context.Background(), job("late")); !errors.Is(err, ErrQueueClosed) {
+		t.Errorf("enqueue after close: want ErrQueueClosed, got %v", err)
+	}
+}
+
+// Jobs still buffered at shutdown are surfaced (logged), never acked-done.
+func TestMemqDrainReportsUnstartedJobs(t *testing.T) {
+	q := NewMemq(QueueConfig{Workers: 1, Buffer: 10, DrainTimeout: time.Second}, nil)
+	block := make(chan struct{})
+	_ = q.Start(context.Background(), func(context.Context, Job) (Disposition, error) {
+		<-block
+		return Ack, nil
+	})
+	for i := 0; i < 5; i++ {
+		_, _ = q.Enqueue(context.Background(), job(fmt.Sprintf("j%d", i)))
+	}
+	close(block)
+	_ = q.Close(context.Background())
+	// After close, no job may be in state "running"; unfinished ones stay
+	// queued/lost (memq non-durable), never "done" without running.
+	states := q.States()
+	for id, s := range states {
+		if s == "running" {
+			t.Errorf("job %s left in running state after drain", id)
+		}
+	}
+	if d, _ := q.QueueDepth(context.Background()); d != 0 {
+		t.Errorf("depth after drain = %d, want 0", d)
 	}
 }

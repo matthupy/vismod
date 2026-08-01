@@ -5,115 +5,109 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/matthupy/vismod/pkg/moderation"
+	"github.com/vismod/vismod/internal/queue"
+	"github.com/vismod/vismod/pkg/moderation"
 )
 
-// fakeSink records every Write call and optionally returns a configured error.
-type fakeSink struct {
-	calls []ResultEnvelope
-	ctxs  []context.Context
+type stubSink struct {
+	calls int
 	err   error
 }
 
-func (f *fakeSink) Write(ctx context.Context, env ResultEnvelope) error {
-	f.calls = append(f.calls, env)
-	f.ctxs = append(f.ctxs, ctx)
-	return f.err
+func (s *stubSink) Write(context.Context, ResultEnvelope) error {
+	s.calls++
+	return s.err
 }
 
-func makeEnv(jobID JobID) ResultEnvelope {
+func envFixture(id string) ResultEnvelope {
 	return ResultEnvelope{
-		JobID:  jobID,
-		Source: moderation.Source{Ref: "gs://bucket/image.jpg"},
+		JobID:  queue.JobID(id),
+		Source: moderation.Source{Kind: "file", Ref: "x.png", MediaType: "image"},
+		Result: &moderation.NormalizedResult{
+			Overall: moderation.OverallVerdict{Verdict: moderation.VerdictAllow},
+		},
 	}
 }
 
-// TestMultiSink_FanOut verifies that a single Write reaches all wrapped sinks.
-func TestMultiSink_FanOut(t *testing.T) {
-	a, b, c := &fakeSink{}, &fakeSink{}, &fakeSink{}
-	ms := NewMultiSink(a, b, c)
-	env := makeEnv("job-1")
-
-	if err := ms.Write(context.Background(), env); err != nil {
-		t.Fatalf("unexpected error: %v", err)
+func mustMultiSink(t *testing.T, sinks []Sink, names []string, onFail func(string)) *MultiSink {
+	t.Helper()
+	m, err := NewMultiSink(sinks, names, onFail)
+	if err != nil {
+		t.Fatal(err)
 	}
+	return m
+}
 
-	for i, s := range []*fakeSink{a, b, c} {
-		if len(s.calls) != 1 {
-			t.Errorf("sink %d: got %d calls, want 1", i, len(s.calls))
-			continue
-		}
-		if s.calls[0].JobID != env.JobID {
-			t.Errorf("sink %d: got JobID %q, want %q", i, s.calls[0].JobID, env.JobID)
-		}
-		if s.calls[0].Source.Ref != env.Source.Ref {
-			t.Errorf("sink %d: got Source.Ref %q, want %q", i, s.calls[0].Source.Ref, env.Source.Ref)
-		}
+func TestMultiSinkAttemptsAllSinksEvenWhenOneFails(t *testing.T) {
+	boom := errors.New("webhook down")
+	a, b, c := &stubSink{}, &stubSink{err: boom}, &stubSink{}
+	m := mustMultiSink(t, []Sink{a, b, c}, []string{"stdout", "webhook", "file"}, nil)
+
+	err := m.Write(context.Background(), envFixture("job-1"))
+	if err == nil {
+		t.Fatal("want error from the failing sink, got nil")
+	}
+	if !errors.Is(err, boom) {
+		t.Errorf("want wrapped %v, got %v", boom, err)
+	}
+	// The point of the design: a webhook outage must not suppress the
+	// local record. c is AFTER the failure and must still have been called.
+	if a.calls != 1 || b.calls != 1 || c.calls != 1 {
+		t.Errorf("all sinks must be attempted: a=%d b=%d c=%d", a.calls, b.calls, c.calls)
 	}
 }
 
-// TestMultiSink_FirstErrorSemantics verifies that the first error is returned
-// but ALL sinks are still called even after an error occurs.
-func TestMultiSink_FirstErrorSemantics(t *testing.T) {
-	errA := errors.New("sink A error")
-	errB := errors.New("sink B error")
+func TestMultiSinkReturnsFirstError(t *testing.T) {
+	first, second := errors.New("first"), errors.New("second")
+	m := mustMultiSink(t,
+		[]Sink{&stubSink{err: first}, &stubSink{err: second}},
+		[]string{"file", "webhook"}, nil)
 
-	ok := &fakeSink{}
-	sA := &fakeSink{err: errA}
-	sB := &fakeSink{err: errB}
-	ms := NewMultiSink(ok, sA, sB)
-	env := makeEnv("job-2")
-
-	err := ms.Write(context.Background(), env)
-	if !errors.Is(err, errA) {
-		t.Errorf("got error %v, want errA (%v)", err, errA)
+	err := m.Write(context.Background(), envFixture("job-1"))
+	if !errors.Is(err, first) {
+		t.Errorf("want first error %v, got %v", first, err)
 	}
-
-	// All three sinks must have been called despite the errors.
-	for i, s := range []*fakeSink{ok, sA, sB} {
-		if len(s.calls) != 1 {
-			t.Errorf("sink %d: got %d calls, want 1 (remaining sinks must still be attempted)", i, len(s.calls))
-		}
+	if errors.Is(err, second) {
+		t.Errorf("must not report the second error: %v", err)
 	}
 }
 
-// TestMultiSink_AllOK verifies nil is returned when all sinks succeed.
-func TestMultiSink_AllOK(t *testing.T) {
-	ms := NewMultiSink(&fakeSink{}, &fakeSink{})
-	if err := ms.Write(context.Background(), makeEnv("job-3")); err != nil {
-		t.Errorf("expected nil, got %v", err)
+func TestMultiSinkSuccessPathWritesAll(t *testing.T) {
+	a, b := &stubSink{}, &stubSink{}
+	m := mustMultiSink(t, []Sink{a, b}, []string{"stdout", "file"}, nil)
+	if err := m.Write(context.Background(), envFixture("job-1")); err != nil {
+		t.Fatal(err)
+	}
+	if a.calls != 1 || b.calls != 1 {
+		t.Errorf("a=%d b=%d, want 1 each", a.calls, b.calls)
 	}
 }
 
-// TestMultiSink_ZeroSinks verifies that an empty MultiSink returns nil and does
-// not panic.
-func TestMultiSink_ZeroSinks(t *testing.T) {
-	ms := NewMultiSink()
-	if err := ms.Write(context.Background(), makeEnv("job-4")); err != nil {
-		t.Errorf("expected nil, got %v", err)
+func TestMultiSinkReportsFailingSinkType(t *testing.T) {
+	var got []string
+	m := mustMultiSink(t,
+		[]Sink{&stubSink{}, &stubSink{err: errors.New("x")}},
+		[]string{"stdout", "webhook"},
+		func(sinkType string) { got = append(got, sinkType) })
+
+	_ = m.Write(context.Background(), envFixture("job-1"))
+	if len(got) != 1 || got[0] != "webhook" {
+		t.Errorf("onFail must name only the failing sink, got %v", got)
 	}
 }
 
-// TestMultiSink_ContextThreaded verifies the same context is forwarded to every
-// sink rather than a new one being created.
-func TestMultiSink_ContextThreaded(t *testing.T) {
-	type ctxKey struct{}
-	ctx := context.WithValue(context.Background(), ctxKey{}, "sentinel")
-
-	a, b := &fakeSink{}, &fakeSink{}
-	ms := NewMultiSink(a, b)
-
-	if err := ms.Write(ctx, makeEnv("job-5")); err != nil {
-		t.Fatalf("unexpected error: %v", err)
+// TestNewMultiSinkRejectsNameMismatch enforces the documented contract:
+// names must be the same length as sinks. A short names slice used to
+// label a failing sink "unknown", which is exactly the label an operator
+// cannot act on during an outage.
+func TestNewMultiSinkRejectsNameMismatch(t *testing.T) {
+	if _, err := NewMultiSink([]Sink{&stubSink{}, &stubSink{}}, []string{"stdout"}, nil); err == nil {
+		t.Fatal("want an error when names is shorter than sinks, got nil")
 	}
-
-	for i, s := range []*fakeSink{a, b} {
-		if len(s.ctxs) == 0 {
-			t.Errorf("sink %d: no context recorded", i)
-			continue
-		}
-		if got := s.ctxs[0].Value(ctxKey{}); got != "sentinel" {
-			t.Errorf("sink %d: context value = %v, want sentinel", i, got)
-		}
+	if _, err := NewMultiSink([]Sink{&stubSink{}}, []string{"stdout", "file"}, nil); err == nil {
+		t.Fatal("want an error when names is longer than sinks, got nil")
+	}
+	if _, err := NewMultiSink([]Sink{&stubSink{}}, []string{"stdout"}, nil); err != nil {
+		t.Fatalf("matched lengths must construct: %v", err)
 	}
 }

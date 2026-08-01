@@ -1,35 +1,17 @@
-# Binaries (anchored to repo root — a bare `vismod` also matches the
-# cmd/vismod/ source dir and silently un-tracks the entrypoint).
 /vismod
 /vismod.exe
+*.exe~
 /dist/
-
-# Local artifacts
-*.out
-*.err
-audit.log
-*.tmp
-
-# Docker-compose secrets + mounted media (.env.example IS tracked)
-.env
-/data/
-
-# Test/sample media — NEVER commit media (esp. potential illegal content)
-/testmedia/
-sample.*
-
-# Go
-/vendor/
 *.test
 coverage.out
-coverage.txt
+/audit.log
+/results.jsonl
+.env
 
-# Editor / OS
-.idea/
-.vscode/
-.DS_Store
-Thumbs.db
-
-# Local agent config
-/.claude/
-/.handoff/
+# docker compose local stack: secrets and the per-operator config copy
+deploy/compose/config.compose.yaml
+# docker compose production example: its config/media mounts resolve
+# against deploy/compose/ (compose's project directory), not the repo root.
+deploy/compose/config.yaml
+media/
+!media/.gitkeep

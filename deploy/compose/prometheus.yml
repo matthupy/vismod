@@ -1,0 +1,13 @@
+# Scrapes both vismod replicas over the compose network. vismod exposes
+# /metrics on metrics_addr (":9090") — all interfaces, so no per-replica
+# port publishing is needed.
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: vismod
+    static_configs:
+      - targets: ["vismod-a:9090", "vismod-b:9090"]
+        labels:
+          stack: compose-local

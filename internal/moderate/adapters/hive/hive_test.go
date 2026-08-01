@@ -2,167 +2,228 @@ package hive
 
 import (
 	"context"
-	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
-	"github.com/matthupy/vismod/internal/moderate"
-	"github.com/matthupy/vismod/pkg/moderation"
+	"github.com/vismod/vismod/internal/moderate"
+	"github.com/vismod/vismod/internal/moderate/adapters/golden"
+	"github.com/vismod/vismod/pkg/moderation"
 )
 
-// cfgWith builds an AdapterConfig whose Secret accessor returns secrets and whose
-// Options carry the (test server) endpoint.
-func cfgWith(endpoint string, secrets map[string]string) moderate.AdapterConfig {
-	return moderate.AdapterConfig{
+// fixture pins the v2 sync envelope verified against Hive's docs on
+// 2026-07-29. Every class name below is a documented head except the
+// deliberately synthetic brand_new_future_head, which exercises the
+// never-drop-a-head fallback.
+const fixture = `{"status":[{"response":{"output":[{"time":0,"classes":[
+	{"class":"general_nsfw","score":0.97},
+	{"class":"general_suggestive","score":0.42},
+	{"class":"gun_in_hand","score":0.11},
+	{"class":"knife_not_in_hand","score":0.08},
+	{"class":"very_bloody","score":0.03},
+	{"class":"a_little_bloody","score":0.07},
+	{"class":"yes_marijuana","score":0.21},
+	{"class":"yes_smoking","score":0.30},
+	{"class":"yes_gambling","score":0.15},
+	{"class":"yes_middle_finger","score":0.60},
+	{"class":"animated","score":0.88},
+	{"class":"medical_injectables","score":0.12},
+	{"class":"yes_female_swimwear","score":0.71},
+	{"class":"yes_child_present","score":0.33},
+	{"class":"no_sexual_activity","score":0.02},
+	{"class":"brand_new_future_head","score":0.5}]}]}}]}`
+
+func secretEnv(key string) string {
+	if key == "hive.api_token" {
+		return "test-token"
+	}
+	return ""
+}
+
+func newTestModerator(t *testing.T, url string) moderation.Moderator {
+	t.Helper()
+	m, err := New(moderate.AdapterConfig{
 		Name:    "hive",
-		Options: map[string]any{"endpoint": endpoint},
-		Secret:  func(k string) string { return secrets[k] },
-	}
-}
-
-func TestNew_RequiresToken(t *testing.T) {
-	_, err := New(cfgWith("https://api.thehive.ai/api/v2/task/sync", map[string]string{}))
-	if err == nil {
-		t.Fatal("New must fail fast without VISMOD_HIVE_TOKEN")
-	}
-}
-
-func TestNew_SucceedsWithToken(t *testing.T) {
-	m, err := New(cfgWith("", map[string]string{"HIVE_TOKEN": "tok"}))
+		Options: map[string]any{"endpoint": url, "rate_limit_rps": 1000.0},
+		Secret:  secretEnv,
+	})
 	if err != nil {
-		t.Fatalf("New: %v", err)
+		t.Fatal(err)
 	}
-	if m.Name() != "hive" {
-		t.Errorf("Name = %q, want hive", m.Name())
-	}
-	_ = m.Close()
+	return m
 }
 
-func TestCapabilities(t *testing.T) {
-	m, _ := New(cfgWith("", map[string]string{"HIVE_TOKEN": "tok"}))
-	caps := m.Capabilities()
-	if caps.SupportsVideo {
-		t.Error("SupportsVideo must be false (image-only adapter; video-native is future)")
+func TestAnalyzeImageGolden(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Token test-token" {
+			t.Errorf("auth header = %q", got)
+		}
+		_, _ = w.Write([]byte(fixture))
+	}))
+	defer srv.Close()
+
+	m := newTestModerator(t, srv.URL)
+	res, err := m.AnalyzeImage(context.Background(), moderation.Image{Bytes: []byte("img")})
+	if err != nil {
+		t.Fatal(err)
 	}
-	// The adapter emits a broad canonical set; spot-check a few + OTHER.
-	want := map[moderation.Category]bool{
-		moderation.CategorySexual:  false,
-		moderation.CategoryWeapons: false,
-		moderation.CategoryHate:    false,
-		moderation.CategoryOther:   false,
+	golden.Check(t, "sync_task", res)
+
+	byLabel := map[string]moderation.CategoryResult{}
+	for _, c := range res.Frames[0].Categories {
+		byLabel[c.ProviderLabel] = c
 	}
-	for _, c := range caps.Categories {
-		if _, ok := want[c]; ok {
-			want[c] = true
+	// Known heads map; probability carried as-is.
+	if c := byLabel["general_nsfw"]; c.Category != moderation.CategorySexual || *c.Score != 0.97 || c.ScoreOrigin != moderation.OriginProbability {
+		t.Errorf("general_nsfw = %+v", c)
+	}
+	// Heads whose names were corrected on the 2026-07-29 doc re-verification:
+	// these are the real Hive class names, and they must not fall to OTHER.
+	for label, want := range map[string]moderation.Category{
+		"gun_in_hand":       moderation.CategoryWeapons,
+		"knife_not_in_hand": moderation.CategoryWeapons,
+		"very_bloody":       moderation.CategoryGoreGraphic,
+		"a_little_bloody":   moderation.CategoryGoreGraphic,
+		// Illicit drugs and legal vice are separate categories: an
+		// operator thresholds a joint and a cigarette differently.
+		"yes_marijuana":     moderation.CategoryDrugs,
+		"yes_smoking":       moderation.CategoryAlcoholTobacco,
+		"yes_gambling":      moderation.CategoryGambling,
+		"yes_middle_finger": moderation.CategoryOffensiveGesture,
+		// Provenance carriers, not harm signals.
+		"animated":            moderation.CategoryAnimatedSynthetic,
+		"medical_injectables": moderation.CategoryMedical,
+	} {
+		if c := byLabel[label]; c.Category != want {
+			t.Errorf("%s = %+v, want %s", label, c, want)
 		}
 	}
-	for c, found := range want {
-		if !found {
-			t.Errorf("Capabilities missing category %s", c)
+	// Deliberately unmapped, per the audit in MODEL_LIMITATIONS.md: an
+	// ordinary-apparel head must not inherit the SUGGESTIVE_RACY
+	// threshold, and a child-related head gets no vismod-defined meaning.
+	// Both still carry their label and score.
+	for _, label := range []string{"yes_female_swimwear", "yes_child_present", "no_sexual_activity"} {
+		c := byLabel[label]
+		if c.Category != moderation.CategoryOther {
+			t.Errorf("%s = %s, want OTHER (deliberately unmapped)", label, c.Category)
+		}
+		if c.Score == nil {
+			t.Errorf("%s lost its score", label)
+		}
+	}
+	// Unmapped heads are never dropped: OTHER, raw label + score preserved.
+	if c := byLabel["brand_new_future_head"]; c.Category != moderation.CategoryOther || *c.Score != 0.5 {
+		t.Errorf("unmapped head must be OTHER with its score: %+v", c)
+	}
+	if len(res.Frames[0].Categories) != 16 {
+		t.Errorf("heads dropped: got %d, want 16", len(res.Frames[0].Categories))
+	}
+}
+
+// TestRequestIsDocumentedMultipart pins the REQUEST shape against Hive's
+// documented sync task API. The other tests here accept any body, so
+// without this a regression to an undocumented encoding (this adapter
+// previously posted JSON {"media_b64": ...}) would pass every test and
+// fail every production call.
+func TestRequestIsDocumentedMultipart(t *testing.T) {
+	const wantBytes = "frame-bytes"
+	var gotCT, gotFilename string
+	var gotPart []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotCT = r.Header.Get("Content-Type")
+		if err := r.ParseMultipartForm(1 << 20); err != nil {
+			t.Errorf("body is not multipart/form-data: %v", err)
+			return
+		}
+		f, hdr, err := r.FormFile("media")
+		if err != nil {
+			t.Errorf(`no "media" file part: %v`, err)
+			return
+		}
+		defer f.Close()
+		gotFilename = hdr.Filename
+		gotPart, _ = io.ReadAll(f)
+		_, _ = w.Write([]byte(fixture))
+	}))
+	defer srv.Close()
+
+	m := newTestModerator(t, srv.URL)
+	if _, err := m.AnalyzeImage(context.Background(), moderation.Image{
+		Bytes: []byte(wantBytes),
+		MIME:  "image/png",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(gotCT, "multipart/form-data;") {
+		t.Errorf("Content-Type = %q, want multipart/form-data", gotCT)
+	}
+	if string(gotPart) != wantBytes {
+		t.Errorf("media part = %q, want %q", gotPart, wantBytes)
+	}
+	if gotFilename != "frame.png" {
+		t.Errorf("filename = %q, want frame.png (derived from MIME)", gotFilename)
+	}
+}
+
+// TestCapsCoverClassMap keeps the declared capability surface honest: a
+// head mapped to a category the adapter does not advertise is a silent
+// lie to anything reading Caps.
+func TestCapsCoverClassMap(t *testing.T) {
+	declared := map[moderation.Category]bool{}
+	for _, c := range (&Moderator{}).Capabilities().Categories {
+		declared[c] = true
+	}
+	for label, cat := range defaultClassMap {
+		if moderation.Canonicalize(cat) != cat {
+			t.Errorf("%s maps to non-canonical category %q", label, cat)
+		}
+		if !declared[cat] {
+			t.Errorf("%s maps to %s, which Capabilities() does not declare", label, cat)
 		}
 	}
 }
 
-func TestAnalyzeImage_EndToEnd(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.WriteString(w, okBody) // general_nsfw 0.91 -> SEXUAL
+func TestEmptyOutputIsError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"status":[]}`))
 	}))
 	defer srv.Close()
+	m := newTestModerator(t, srv.URL)
+	if _, err := m.AnalyzeImage(context.Background(), moderation.Image{Bytes: []byte("img")}); err == nil {
+		t.Error("empty output must be could-not-evaluate error, never a clean result")
+	}
+}
 
-	m, _ := New(cfgWith(srv.URL, map[string]string{"HIVE_TOKEN": "tok"}))
-	res, err := m.AnalyzeImage(context.Background(), moderation.Image{Bytes: []byte("png"), MIME: "image/png"})
+func TestClassMapOverride(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"status":[{"response":{"output":[{"time":0,"classes":[{"class":"custom_head","score":0.9}]}]}}]}`))
+	}))
+	defer srv.Close()
+	m, err := New(moderate.AdapterConfig{
+		Options: map[string]any{
+			"endpoint":       srv.URL,
+			"rate_limit_rps": 1000.0,
+			"class_map":      map[string]any{"custom_head": "HATE"},
+		},
+		Secret: secretEnv,
+	})
 	if err != nil {
-		t.Fatalf("AnalyzeImage: %v", err)
+		t.Fatal(err)
 	}
-	if res.Provider != "hive" || res.MediaType != "image" {
-		t.Errorf("provider/media = %q/%q", res.Provider, res.MediaType)
+	res, err := m.AnalyzeImage(context.Background(), moderation.Image{Bytes: []byte("img")})
+	if err != nil {
+		t.Fatal(err)
 	}
-	if len(res.Frames) != 1 || res.Frames[0].Status != moderation.FrameStatusOK {
-		t.Fatalf("want 1 ok frame, got %+v", res.Frames)
-	}
-	if res.Frames[0].TimestampSec != nil {
-		t.Error("still image frame must have nil TimestampSec")
-	}
-	cats := res.Frames[0].Categories
-	if len(cats) != 1 || cats[0].Category != moderation.CategorySexual {
-		t.Fatalf("want single SEXUAL category, got %+v", cats)
-	}
-	if cats[0].ScoreOrigin != moderation.ScoreOriginProbability || *cats[0].Score != 0.91 {
-		t.Errorf("cat = %+v, want probability 0.91", cats[0])
-	}
-	// Adapter must NOT stamp Threshold/Flagged — that is the pipeline's job.
-	if cats[0].Threshold != nil || cats[0].Flagged {
-		t.Errorf("adapter must leave Threshold/Flagged unset, got %+v", cats[0])
+	if c := res.Frames[0].Categories[0]; c.Category != moderation.CategoryHate {
+		t.Errorf("class_map override not applied: %+v", c)
 	}
 }
 
-func TestAnalyzeImage_EmptyOutputIsFailSafeError(t *testing.T) {
-	// An empty output is an unexpected provider state -> could-not-evaluate, never
-	// a clean frame (fail-safe, spec §F.5).
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.WriteString(w, `{"status":[{"response":{"output":[]}}]}`)
-	}))
-	defer srv.Close()
-
-	m, _ := New(cfgWith(srv.URL, map[string]string{"HIVE_TOKEN": "tok"}))
-	_, err := m.AnalyzeImage(context.Background(), moderation.Image{Bytes: []byte("png"), MIME: "image/png"})
+func TestMissingTokenFailsFast(t *testing.T) {
+	_, err := New(moderate.AdapterConfig{Options: map[string]any{}, Secret: func(string) string { return "" }})
 	if err == nil {
-		t.Fatal("empty output must yield an error, never an allow")
-	}
-}
-
-func TestAnalyzeImage_EmptyClassesIsFailSafeError(t *testing.T) {
-	// An output frame present but carrying an empty class list is also an
-	// unexpected state (Hive always returns the full head bank). Without the
-	// len(classes)==0 guard it would normalize to zero categories and leak out as
-	// a clean OK frame instead of could-not-evaluate (fail-safe symmetry).
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.WriteString(w, `{"status":[{"response":{"output":[{"time":0,"classes":[]}]}}]}`)
-	}))
-	defer srv.Close()
-
-	m, _ := New(cfgWith(srv.URL, map[string]string{"HIVE_TOKEN": "tok"}))
-	_, err := m.AnalyzeImage(context.Background(), moderation.Image{Bytes: []byte("png"), MIME: "image/png"})
-	if err == nil {
-		t.Fatal("empty class list must yield an error, never an allow")
-	}
-}
-
-func TestAnalyzeImage_TaskErrorCarriesCodedError(t *testing.T) {
-	// Hive /task/sync can return HTTP 200 with a per-task FAILURE: a non-zero
-	// status[].status.code and empty output. This still fail-safes (empty output ->
-	// error), but it must surface a CodedError so vismod_adapter_errors_total{code}
-	// can distinguish a provider task failure from a genuinely empty frame — not
-	// collapse to the generic "empty output" string.
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.WriteString(w, `{"status":[{"status":{"code":3,"message":"unsupported media"},"response":{"output":[]}}]}`)
-	}))
-	defer srv.Close()
-
-	m, _ := New(cfgWith(srv.URL, map[string]string{"HIVE_TOKEN": "tok"}))
-	_, err := m.AnalyzeImage(context.Background(), moderation.Image{Bytes: []byte("png"), MIME: "image/png"})
-	if err == nil {
-		t.Fatal("non-zero task status must yield an error, never an allow")
-	}
-	var ce moderation.CodedError
-	if !errors.As(err, &ce) {
-		t.Fatalf("task failure must surface a CodedError, got %T: %v", err, err)
-	}
-	if ce.ErrorCode() == "" {
-		t.Error("task-failure code must be non-empty (drives vismod_adapter_errors_total{code})")
-	}
-	// Must be distinguishable from a generic empty-frame state.
-	if ce.ErrorCode() == "empty_output" {
-		t.Errorf("task failure code must differ from a genuine empty frame, got %q", ce.ErrorCode())
-	}
-}
-
-func TestAnalyzeImage_RejectsUnsupportedMIME(t *testing.T) {
-	m, _ := New(cfgWith("https://x", map[string]string{"HIVE_TOKEN": "tok"}))
-	_, err := m.AnalyzeImage(context.Background(), moderation.Image{Bytes: []byte("x"), MIME: "image/tiff"})
-	if err == nil {
-		t.Fatal("tiff is not in Hive's image allow-list; want terminal error")
+		t.Error("missing token must fail at construction")
 	}
 }

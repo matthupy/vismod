@@ -1,0 +1,87 @@
+{
+  "uid": "vismod-overview",
+  "title": "vismod overview",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": false,
+  "refresh": "10s",
+  "time": { "from": "now-30m", "to": "now" },
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Queue depth (the autoscaling signal)",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "vismod-prom" },
+      "targets": [
+        { "expr": "vismod_queue_depth", "legendFormat": "{{instance}}", "refId": "A" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Dead-letter depth",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "vismod-prom" },
+      "targets": [
+        { "expr": "vismod_deadletter_depth", "legendFormat": "{{instance}}", "refId": "A" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Verdicts / sec",
+      "description": "block > error > flag > allow. A rising error rate is the fail-safe path working, not silence.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "vismod-prom" },
+      "targets": [
+        { "expr": "sum by (verdict) (rate(vismod_jobs_total[1m]))", "legendFormat": "{{verdict}}", "refId": "A" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Adapter errors / sec (readiness proxy)",
+      "description": "There is NO backpressure or readiness metric — that state is exposed only as /readyz text. This panel is a proxy: sustained errors here are what trips backpressure.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "vismod-prom" },
+      "targets": [
+        { "expr": "sum by (code) (rate(vismod_adapter_errors_total[1m]))", "legendFormat": "{{code}}", "refId": "A" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Adapter request latency",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "vismod-prom" },
+      "targets": [
+        { "expr": "histogram_quantile(0.5, sum by (le, adapter) (rate(vismod_adapter_request_seconds_bucket[5m])))", "legendFormat": "p50 {{adapter}}", "refId": "A" },
+        { "expr": "histogram_quantile(0.95, sum by (le, adapter) (rate(vismod_adapter_request_seconds_bucket[5m])))", "legendFormat": "p95 {{adapter}}", "refId": "B" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Workers active",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "vismod-prom" },
+      "targets": [
+        { "expr": "vismod_workers_active", "legendFormat": "{{instance}}", "refId": "A" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Frames scanned / sec",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+      "datasource": { "type": "prometheus", "uid": "vismod-prom" },
+      "targets": [
+        { "expr": "sum(rate(vismod_frames_scanned_total[1m]))", "legendFormat": "frames/s", "refId": "A" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Frames per job (p95, by media type)",
+      "description": "FFmpeg workflow tuning signal.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
+      "datasource": { "type": "prometheus", "uid": "vismod-prom" },
+      "targets": [
+        { "expr": "histogram_quantile(0.95, sum by (le, media_type) (rate(vismod_job_frames_bucket[5m])))", "legendFormat": "{{media_type}}", "refId": "A" }
+      ]
+    }
+  ]
+}

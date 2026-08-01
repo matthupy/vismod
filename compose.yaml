@@ -1,0 +1,110 @@
+# vismod local development stack.
+#
+#   cp deploy/compose/env.example .env
+#   cp deploy/compose/config.compose.example.yaml deploy/compose/config.compose.yaml
+#   # edit config.compose.yaml: set adapter.options.endpoint
+#   # edit .env: set VISMOD_MICROSOFT_API_KEY
+#   docker compose up --build
+#
+# Two replicas on ONE durable Redis queue, so this stack exercises what a
+# single container cannot: the redis driver, multi-replica claim, the
+# vismod_queue_depth signal, and graceful drain.
+#
+# NOT a production deployment. See deploy/compose/compose.prod.example.yaml
+# for a minimal production shape, and deploy/README.md for Kubernetes.
+
+name: vismod
+
+x-vismod: &vismod
+  build:
+    context: .
+    args:
+      VERSION: compose-dev
+  env_file: .env
+  command: ["serve", "-c", "/etc/vismod/config.yaml"]
+  volumes:
+    # The config copy is REQUIRED; there is no env-only configuration.
+    - ./deploy/compose/config.compose.yaml:/etc/vismod/config.yaml:ro
+    # Job payloads carry a FILE PATH. Either replica may claim any job,
+    # so the media mount must resolve identically in both.
+    - ./media:/data:ro
+  depends_on:
+    redis:
+      condition: service_healthy
+  restart: unless-stopped
+  stop_grace_period: 40s   # > queue.drain_timeout (30s) so drain finishes
+
+services:
+  redis:
+    image: redis:7-alpine
+    # No persistence: this stack is disposable. The production example
+    # enables appendonly.
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  vismod-a:
+    <<: *vismod
+    ports:
+      - "8080:8080"   # dev intake: POST /jobs
+      - "8081:8081"   # operator UI (basic auth, creds from .env)
+    volumes:
+      - ./deploy/compose/config.compose.yaml:/etc/vismod/config.yaml:ro
+      - ./media:/data:ro
+      # Own audit volume. The audit log is a hash chain replayed into
+      # per-process state; two replicas sharing one file would interleave
+      # and make `vismod audit verify` fail.
+      - audit-a:/home/vismod
+
+  vismod-b:
+    <<: *vismod
+    # No published ports: it would collide with vismod-a. Prometheus
+    # reaches it over the compose network.
+    #
+    # Do NOT `docker compose up --scale vismod-b=N`: because this service
+    # publishes no ports, scaling succeeds silently, but every replica
+    # would share this ONE audit-b volume/audit.log and corrupt the hash
+    # chain. Every replica needs its own audit volume — add a vismod-c
+    # service with its own audit-c volume instead.
+    volumes:
+      - ./deploy/compose/config.compose.yaml:/etc/vismod/config.yaml:ro
+      - ./media:/data:ro
+      - audit-b:/home/vismod
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=6h
+    volumes:
+      - ./deploy/compose/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"   # host 9090 is Prometheus; the replicas' own :9090 stays internal
+    depends_on:
+      - vismod-a
+      - vismod-b
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    environment:
+      # Local stack only: no login wall, view-only. This is why the
+      # production example ships no Grafana.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_AUTH_BASIC_ENABLED: "false"
+      GF_USERS_DEFAULT_THEME: light
+    volumes:
+      - ./deploy/compose/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/compose/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+volumes:
+  audit-a:
+  audit-b:

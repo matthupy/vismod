@@ -1,0 +1,259 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>vismod — operator dashboard</title>
+<style>
+  :root { color-scheme: light dark;
+    --bg:#f6f7f9; --card:#fff; --ink:#1a1d21; --muted:#5c6470;
+    --line:#e3e6ea; --accent:#2f6fed; --warn:#b45309; --bad:#b91c1c; --ok:#15803d; }
+  @media (prefers-color-scheme: dark) { :root {
+    --bg:#101418; --card:#171c22; --ink:#e8eaed; --muted:#9aa3ad;
+    --line:#262d36; --accent:#6ea0ff; --warn:#f59e0b; --bad:#ef4444; --ok:#22c55e; } }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;
+         background:var(--bg); color:var(--ink); padding:24px; }
+  h1 { font-size:18px; margin:0 0 4px; }
+  .sub { color:var(--muted); margin-bottom:16px; }
+  nav.tabs { display:flex; gap:4px; border-bottom:1px solid var(--line); margin-bottom:20px; }
+  nav.tabs button { background:none; border:none; border-bottom:2px solid transparent;
+    color:var(--muted); font:inherit; padding:8px 14px; cursor:pointer; }
+  nav.tabs button.active { color:var(--ink); border-bottom-color:var(--accent); }
+  .tab { display:none; } .tab.active { display:block; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr));
+          gap:12px; margin-bottom:20px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px;
+          padding:14px 16px; }
+  .stat .v { font-size:26px; font-weight:600; font-variant-numeric:tabular-nums; }
+  .stat .k { color:var(--muted); font-size:12px; text-transform:uppercase;
+             letter-spacing:.04em; }
+  .cols { display:grid; grid-template-columns:repeat(auto-fit,minmax(280px,1fr));
+          gap:12px; }
+  h2 { font-size:13px; text-transform:uppercase; letter-spacing:.04em;
+       color:var(--muted); margin:0 0 10px; }
+  table { width:100%; border-collapse:collapse; }
+  td, th { text-align:left; padding:4px 8px 4px 0; font-variant-numeric:tabular-nums; }
+  th { color:var(--muted); font-weight:500; }
+  .pill { display:inline-block; border-radius:999px; padding:1px 10px; font-size:12px;
+          border:1px solid var(--line); }
+  .ok   { color:var(--ok); }  .warn { color:var(--warn); }  .bad { color:var(--bad); }
+  /* Verdict pills: status colors are reserved for state and always
+     accompany the verdict WORD — never color alone. */
+  .v-allow { color:var(--ok);   border-color:currentColor; }
+  .v-flag  { color:var(--warn); border-color:currentColor; }
+  .v-block { color:var(--bad);  border-color:currentColor; }
+  .v-error { color:var(--bad);  border-color:currentColor; font-style:italic; }
+  .v-skip  { color:var(--muted); border-color:currentColor; }
+  .jobs td, .jobs th { border-bottom:1px solid var(--line); padding:6px 10px 6px 0;
+                       white-space:nowrap; }
+  .jobs td.ref { max-width:300px; overflow:hidden; text-overflow:ellipsis; }
+  .scroll { overflow-x:auto; }
+  button.op { background:var(--card); color:var(--ink); border:1px solid var(--line);
+           border-radius:8px; padding:6px 14px; cursor:pointer; font:inherit; }
+  button.op:hover { border-color:var(--accent); }
+  .note { color:var(--muted); font-size:12px; margin-top:16px; }
+  code, pre { color:var(--muted); font-size:12px; }
+  pre { background:var(--bg); border:1px solid var(--line); border-radius:8px;
+        padding:10px; overflow-x:auto; margin:6px 0 0; }
+  .wf { margin-bottom:14px; }
+  .wf .name { font-weight:600; }
+  .wf .default-badge { color:var(--accent); font-size:12px; margin-left:6px; }
+</style>
+</head>
+<body>
+  <h1>vismod</h1>
+  <div class="sub">read-mostly operator dashboard — refs, verdicts &amp; counts only; media and provider payloads are never rendered</div>
+
+  <nav class="tabs">
+    <button data-tab="overview" class="active">Overview</button>
+    <button data-tab="jobs">Recent Jobs</button>
+    <button data-tab="config">Configuration</button>
+  </nav>
+
+  <section id="tab-overview" class="tab active">
+    <div class="grid">
+      <div class="card stat"><div class="v" id="depth">–</div><div class="k">queue depth</div></div>
+      <div class="card stat"><div class="v" id="dlq">–</div><div class="k">dead-letter depth</div></div>
+      <div class="card stat"><div class="v" id="active">–</div><div class="k">workers active / pool</div></div>
+      <div class="card stat"><div class="v" id="intake">–</div><div class="k">intake</div></div>
+    </div>
+    <div class="grid">
+      <div class="card stat"><div class="v" id="total">–</div><div class="k">jobs finished</div></div>
+      <div class="card stat"><div class="v" id="flagrate">–</div><div class="k">flag rate (flag + block, of evaluated)</div></div>
+      <div class="card stat"><div class="v" id="blockrate">–</div><div class="k">block rate (of evaluated)</div></div>
+      <div class="card stat"><div class="v" id="errorrate">–</div><div class="k">error rate (of all finished)</div></div>
+    </div>
+    <div class="grid">
+      <div class="card stat"><div class="v" id="avgframes">–</div><div class="k">avg frames / video job</div></div>
+      <div class="card stat"><div class="v" id="totalframes">–</div><div class="k">frames scanned (all jobs)</div></div>
+      <div class="card stat"><div class="v" id="avgflagframes">–</div><div class="k">avg flagged frames / flagged video</div></div>
+      <div class="card stat"><div class="v" id="singleflag">–</div><div class="k">single-frame flags (recall floor)</div></div>
+    </div>
+    <div class="cols">
+      <div class="card">
+        <h2>Job states (this replica)</h2>
+        <table id="states"><tbody></tbody></table>
+      </div>
+      <div class="card">
+        <h2>Tuning extraction density</h2>
+        <p>Fewer frames per video = lower vendor cost, but the two
+        quality risks pull opposite ways:</p>
+        <p><strong>Recall</strong> — "single-frame flags" counts flagged
+        videos where exactly ONE frame carried the detection. A sparser
+        workflow would likely have missed those. If this number is a
+        meaningful share of flagged videos, you are at the recall floor:
+        don't thin extraction further.</p>
+        <p><strong>Precision</strong> — a high "avg flagged frames /
+        flagged video" means detections have margin (many frames agree),
+        so thinning extraction saves cost without losing them; it also
+        reduces the chances for a single borderline frame to flag a
+        clean video.</p>
+      </div>
+      <div class="card">
+        <h2>Operational controls</h2>
+        <p>Pause stops accepting new jobs (intake returns 503 with a retryable
+        signal); in-flight jobs finish normally. This is the whole control
+        surface by design.</p>
+        <button class="op" onclick="setIntake(true)">Pause intake</button>
+        <button class="op" onclick="setIntake(false)">Resume intake</button>
+      </div>
+    </div>
+  </section>
+
+  <section id="tab-jobs" class="tab">
+    <div class="card">
+      <h2>Recent jobs (this replica, newest first)</h2>
+      <div class="scroll">
+        <table class="jobs" id="jobs"><tbody></tbody></table>
+      </div>
+    </div>
+  </section>
+
+  <section id="tab-config" class="tab">
+    <div class="cols" style="margin-bottom:12px">
+      <div class="card">
+        <h2>Runtime (read-only; restart to change)</h2>
+        <table><tbody>
+          <tr><th>adapter</th><td id="adapter">–</td></tr>
+          <tr><th>queue driver</th><td id="driver">–</td></tr>
+          <tr><th>worker pool</th><td id="pool">–</td></tr>
+          <tr><th>metrics</th><td><code id="metrics">–</code></td></tr>
+          <tr><th>uptime</th><td id="uptime">–</td></tr>
+        </tbody></table>
+      </div>
+      <div class="card">
+        <h2>Thresholds (per-adapter, not portable)</h2>
+        <table id="thresholds"><tbody></tbody></table>
+      </div>
+      <div class="card">
+        <h2>Frame extraction</h2>
+        <table><tbody>
+          <tr><th>default workflow</th><td id="dwf">–</td></tr>
+          <tr><th>max frames / video</th><td id="maxframes">–</td></tr>
+          <tr><th>max width</th><td id="maxwidth">–</td></tr>
+        </tbody></table>
+      </div>
+    </div>
+    <div class="card">
+      <h2>FFmpeg workflows (standard + custom; validated by the same guardrails)</h2>
+      <div id="workflows"></div>
+    </div>
+  </section>
+
+  <div class="note">Auto-refreshes every 3s from <code>/api/status</code>.
+  Full Prometheus series at the metrics address in Configuration.</div>
+
+<script>
+document.querySelectorAll('nav.tabs button').forEach(b =>
+  b.addEventListener('click', () => {
+    document.querySelectorAll('nav.tabs button').forEach(x => x.classList.remove('active'));
+    document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
+    b.classList.add('active');
+    document.getElementById('tab-' + b.dataset.tab).classList.add('active');
+  }));
+
+const esc = t => String(t ?? '').replace(/[&<>"']/g,
+  c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const num = x => (x === null || x === undefined) ? '–' : Number(x).toFixed(3);
+
+async function refresh() {
+  try {
+    const r = await fetch('/api/status');
+    if (!r.ok) return;
+    const s = await r.json();
+    const set = (id, v) => document.getElementById(id).textContent = v;
+
+    // Overview
+    set('depth', s.queue_depth);
+    set('dlq', s.dlq_depth);
+    set('active', s.workers_active + ' / ' + s.workers_pool);
+    const intake = document.getElementById('intake');
+    intake.textContent = s.intake_paused ? 'PAUSED' : 'accepting';
+    intake.className = 'v ' + (s.intake_paused ? 'warn' : 'ok');
+    const v = s.verdicts || { total: 0, evaluated: 0, counts: {} };
+    // flag/block rates are over EVALUATED jobs (allow+flag+block);
+    // error rate is over all finished jobs.
+    const pctOf = (x, denom) => denom ? (100 * x).toFixed(1) + '%' : '–';
+    set('total', v.total);
+    set('flagrate', pctOf(v.flag_rate, v.evaluated));
+    set('blockrate', pctOf(v.block_rate, v.evaluated));
+    set('errorrate', pctOf(v.error_rate, v.total));
+    const fr = s.frames || {};
+    set('avgframes', fr.video_jobs ? fr.avg_frames_per_video.toFixed(1) : '–');
+    set('totalframes', fr.total_frames ?? 0);
+    set('avgflagframes', fr.flagged_videos ? fr.avg_flagged_frames_per_flagged.toFixed(1) : '–');
+    set('singleflag', fr.flagged_videos ? `${fr.single_frame_flag_videos} / ${fr.flagged_videos}` : '–');
+    const st = document.querySelector('#states tbody');
+    const entries = Object.entries(s.job_states || {}).sort();
+    st.innerHTML = entries.length
+      ? entries.map(([k, x]) => `<tr><th>${esc(k)}</th><td>${x}</td></tr>`).join('')
+      : '<tr><td class="note">no jobs yet (redis driver shows shared depth above)</td></tr>';
+
+    // Recent jobs
+    const jobs = document.querySelector('#jobs tbody');
+    const rows = (s.recent_jobs || []).slice(0, 50).map(j =>
+      `<tr><td>${new Date(j.finished_at).toLocaleTimeString()}</td>` +
+      `<td><span class="pill v-${esc(j.verdict)}">${esc(j.verdict)}</span></td>` +
+      `<td>${esc(j.top_category || '')}</td>` +
+      `<td>${num(j.max_score)}</td>` +
+      `<td>${num(j.confidence)}</td>` +
+      `<td>${j.frames_scanned}${j.frames_flagged ? ` (${j.frames_flagged} flagged)` : ''}</td>` +
+      `<td>${esc(j.media_type)}</td>` +
+      `<td class="ref" title="${esc(j.ref)}">${esc(j.ref)}</td>` +
+      `<td>${j.duration_ms} ms</td></tr>`);
+    jobs.innerHTML = rows.length
+      ? '<tr><th>finished</th><th>verdict</th><th>top category</th><th>max score</th><th>confidence</th><th>frames</th><th>media</th><th>source ref</th><th>duration</th></tr>' + rows.join('')
+      : '<tr><td class="note">no finished jobs yet</td></tr>';
+
+    // Configuration
+    set('adapter', s.adapter || '(unset)');
+    set('driver', s.queue_driver);
+    set('pool', s.workers_pool + ' workers');
+    set('metrics', s.metrics_addr + '/metrics');
+    set('uptime', Math.floor(s.uptime_sec / 60) + 'm ' + (s.uptime_sec % 60) + 's');
+    set('dwf', s.default_workflow);
+    set('maxframes', s.max_frames);
+    set('maxwidth', s.max_width + ' px');
+    const th = document.querySelector('#thresholds tbody');
+    th.innerHTML = '<tr><th>category</th><th>flag_at</th><th>block_at</th></tr>' +
+      Object.entries(s.thresholds || {}).sort().map(([k, x]) =>
+        `<tr><th>${esc(k)}</th><td>${x.flag_at ?? '–'}</td><td>${x.block_at ?? '–'}</td></tr>`).join('');
+    const wfs = document.getElementById('workflows');
+    wfs.innerHTML = Object.entries(s.workflows || {}).sort().map(([name, wf]) =>
+      `<div class="wf"><span class="name">${esc(name)}</span>` +
+      (name === s.default_workflow ? '<span class="default-badge">default</span>' : '') +
+      `<div class="note">${esc(wf.description || '')}</div>` +
+      `<pre>${esc((wf.args || []).join(' '))}</pre></div>`).join('') ||
+      '<div class="note">no workflows configured</div>';
+  } catch (e) { /* transient poll failure: keep last snapshot */ }
+}
+async function setIntake(pause) {
+  await fetch('/api/intake/' + (pause ? 'pause' : 'resume'), { method: 'POST' });
+  refresh();
+}
+refresh();
+setInterval(refresh, 3000);
+</script>
+</body>
+</html>

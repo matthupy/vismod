@@ -1,155 +1,35 @@
-name: CI
-
+# CI runs with NO secrets and NO network access to providers: the suite
+# uses interface fakes, httptest, miniredis, and (where present) ffmpeg.
+name: ci
 on:
-  pull_request:
-    branches: [main]
   push:
     branches: [main]
+  pull_request:
 
-# Least-privilege: jobs only read the repo.
 permissions:
   contents: read
 
-# Cancel superseded runs on the same ref to save CI minutes.
-concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
-  build-test:
-    name: Build & Test
+  test:
     runs-on: ubuntu-latest
     steps:
-      - name: Check out vismod
-        uses: actions/checkout@v7
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
         with:
-          path: vismod
+          go-version-file: go.mod
+      - name: Install ffmpeg (integration tests skip without it)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test ./... -count=1
 
-      # vismod's go.mod has `replace github.com/matthupy/videosift => ../videosift`,
-      # so the sibling repo must be present for build/vet/test to resolve.
-      - name: Check out videosift (replace target)
-        uses: actions/checkout@v7
-        with:
-          repository: matthupy/videosift
-          path: videosift
-
-      - name: Set up Go
-        uses: actions/setup-go@v6
-        with:
-          go-version-file: vismod/go.mod
-          cache-dependency-path: vismod/go.sum
-
-      # videosift execs ffmpeg+ffprobe; install them so the M2 frame-extraction
-      # integration test runs instead of skipping.
-      - name: Install ffmpeg
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg
-
-      - name: Verify go.mod / go.sum are tidy
-        working-directory: vismod
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image (both modes, ffmpeg bundled, non-root)
+        run: docker build -t vismod:ci .
+      - name: Smoke: version + workflows validate inside the image
         run: |
-          go mod tidy
-          git diff --exit-code go.mod go.sum
-
-      - name: Build
-        working-directory: vismod
-        run: go build ./...
-
-      - name: go vet
-        working-directory: vismod
-        run: go vet ./...
-
-      - name: Test (race detector + coverage)
-        working-directory: vismod
-        run: go test -race -covermode=atomic -coverprofile=coverage.out ./...
-
-  docker-build:
-    name: Docker build
-    runs-on: ubuntu-latest
-    steps:
-      # The image is built with the PARENT dir as context so the
-      # `replace => ../videosift` target resolves (same sibling layout as build-test).
-      - name: Check out vismod
-        uses: actions/checkout@v7
-        with:
-          path: vismod
-
-      - name: Check out videosift (replace target)
-        uses: actions/checkout@v7
-        with:
-          repository: matthupy/videosift
-          path: videosift
-
-      - name: Set up Buildx
-        uses: docker/setup-buildx-action@v4
-
-      # Build only (no push): proves the multi-stage Dockerfile compiles the
-      # binary and assembles the ffmpeg-bearing runtime. Context = workspace root
-      # (holds vismod/ and videosift/ as siblings).
-      - name: Build image
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          file: vismod/Dockerfile
-          push: false
-          tags: vismod:ci
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-  lint:
-    name: Lint
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out vismod
-        uses: actions/checkout@v7
-        with:
-          path: vismod
-
-      - name: Check out videosift (replace target)
-        uses: actions/checkout@v7
-        with:
-          repository: matthupy/videosift
-          path: videosift
-
-      - name: Set up Go
-        uses: actions/setup-go@v6
-        with:
-          go-version-file: vismod/go.mod
-          cache-dependency-path: vismod/go.sum
-
-      # Install from source with the project's Go toolchain so the linter binary
-      # is built with the same Go version go.mod targets (prebuilt releases lag
-      # behind new Go versions and refuse a newer `go` directive).
-      - name: Install golangci-lint
-        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest
-
-      - name: golangci-lint
-        working-directory: vismod
-        run: golangci-lint run ./...
-
-  govulncheck:
-    name: Vulnerability scan
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out vismod
-        uses: actions/checkout@v7
-        with:
-          path: vismod
-
-      - name: Check out videosift (replace target)
-        uses: actions/checkout@v7
-        with:
-          repository: matthupy/videosift
-          path: videosift
-
-      - name: Set up Go
-        uses: actions/setup-go@v6
-        with:
-          go-version-file: vismod/go.mod
-          cache-dependency-path: vismod/go.sum
-
-      - name: Install govulncheck
-        run: go install golang.org/x/vuln/cmd/govulncheck@latest
-
-      - name: Run govulncheck
-        working-directory: vismod
-        run: govulncheck ./...
+          docker run --rm vismod:ci version
+          docker run --rm vismod:ci workflows validate

@@ -1,135 +1,333 @@
-# vismod configuration example.
+# vismod configuration — fully annotated example.
 #
-# Secrets are NEVER read from this file. They come only from environment
-# variables with the VISMOD_ prefix (dots -> underscores), e.g.:
-#   VISMOD_AZURE_KEY=...        VISMOD_AZURE_ENDPOINT=https://<res>.cognitiveservices.azure.com
-#   VISMOD_HIVE_TOKEN=...
-#   VISMOD_GOOGLE_API_KEY=...   (or VISMOD_GOOGLE_TOKEN=... for auth_mode: bearer)
+# Precedence: built-in defaults < this file < VISMOD_* environment
+# variables (key mapping: dots become underscores, upper-cased —
+# queue.workers -> VISMOD_QUEUE_WORKERS).
 #
-# Thresholds are PER-ADAPTER and NOT portable: a 0.667 threshold means a
-# different thing for Azure severity/6, a Hive per-head probability, a Google
-# SafeSearch likelihood bucket, and an AWS confidence/100 score. Re-tune
-# thresholds whenever you switch adapters.
+# SECRETS ARE ENV-ONLY AND MUST NEVER APPEAR IN THIS FILE:
+#   VISMOD_MICROSOFT_API_KEY       Azure Content Safety key (auth_mode: key)
+#   VISMOD_MICROSOFT_ACCESS_TOKEN  static Entra bearer token (auth_mode: entra)
+#   VISMOD_HIVE_API_TOKEN          Hive API token
+#   VISMOD_QUEUE_REDIS_PASSWORD    Redis AUTH password (if any)
+#   GOOGLE_APPLICATION_CREDENTIALS path to the Google service-account file (ADC)
 
+# ── Active moderation model ─────────────────────────────────────────────
+# Exactly ONE model is active per process, chosen here at startup.
+# Restart to change (no hot-swap). Unknown names fail fast listing the
+# registered adapters: google, hive, microsoft.
 adapter:
-  name: stub            # "stub" (no creds), "azure", "hive", or "google". Selects the single active model.
-  options: {}           # adapter-specific, opaque to the core; decoded inside the adapter.
+  name: microsoft
+  options:
+    # microsoft (Azure AI Content Safety) options:
+    endpoint: https://vizmod-az-content-safety-dev.cognitiveservices.azure.com/
+    api_version: "2024-09-01"   # GA version; Azure deprecates ~90-day cadence
+    auth_mode: key              # key | entra (static token or managed identity)
+    rate_limit_rps: 4           # F0 quota = 5 RPS; default paces BELOW it
+                                # (pacing at exactly the quota still draws
+                                # 429s at window boundaries). S0 = 1000/10s.
+    max_attempts: 3             # HTTP retry budget for 429/5xx/timeouts
 
-  # --- Azure AI Content Safety (image:analyze) ---
-  # Set name: azure and uncomment. All options below are NON-secret. The API key
-  # / bearer token are env-ONLY (never in yaml):
-  #   VISMOD_AZURE_KEY=...      (auth_mode: apikey, the default)
-  #   VISMOD_AZURE_TOKEN=...    (auth_mode: bearer — Entra ID token acquired out-of-band
-  #                              for scope https://cognitiveservices.azure.com/.default)
-  #   VISMOD_AZURE_ENDPOINT=... (alternative to options.endpoint below)
-  # options:
-  #   endpoint: https://<resource>.cognitiveservices.azure.com  # required (or VISMOD_AZURE_ENDPOINT)
-  #   auth_mode: apikey         # apikey (default) | bearer
-  #   api_version: "2024-09-01" # GA; Azure deprecates on ~90-day cadence
-  #   rps: 5                    # shared token-bucket rate (Azure F0 = 5 RPS; S0 = 100/s)
-  #   max_retries: 3            # transient (429/5xx/net) retries before failing the frame (0 disables)
-  #   retry_backoff: 500ms      # base backoff; doubles per attempt (+jitter), capped 30s, honors Retry-After
-  # NOTE: v1 sends inline base64 content ONLY. Remote blobUrl is disabled (SSRF/egress).
-  # Azure thresholds are NOT portable to other adapters (severity/6 scale) — re-tune below.
+    # google options (used when adapter.name: google):
+    # rate_limit_rps: 15
+    # likelihood_scores:        # override the likelihood -> score lookup
+    #   VERY_UNLIKELY: 0.0
+    #   UNLIKELY: 0.25
+    #   POSSIBLE: 0.5
+    #   LIKELY: 0.75
+    #   VERY_LIKELY: 1.0        # UNKNOWN always normalizes to null
 
-  # --- Hive (thehive.ai) visual moderation (v2 /task/sync, image) ---
-  # Set name: hive and uncomment. The API token is env-ONLY (never in yaml):
-  #   VISMOD_HIVE_TOKEN=...   (sent as "Authorization: Token <token>")
-  # options:
-  #   endpoint: https://api.thehive.ai/api/v2/task/sync  # default; override for a regional host
-  #   rps: 5                  # shared token-bucket rate (tune to your Hive plan)
-  #   max_retries: 3          # transient (429/5xx/net) retries before failing the frame (0 disables)
-  #   retry_backoff: 500ms    # base backoff; doubles per attempt (+jitter), capped 30s, honors Retry-After
-  # Hive returns ~50 per-head class scores per image; the adapter reconstructs heads
-  # and emits one normalized CategoryResult per canonical category (score_origin:
-  # probability). Hive probabilities are NOT comparable to Azure severity/6 — a 0.667
-  # threshold means a different thing per adapter. Image-only in v1 (video is native
-  # to Hive but framed via videosift here, same as Azure).
+    # hive options (used when adapter.name: hive):
+    # endpoint: https://api.thehive.ai/api/v2/task/sync
+    # rate_limit_rps: 10
+    # class_map:                # extra head -> canonical-category overrides
+    #   some_new_head: WEAPONS
 
-  # --- Google Cloud Vision SafeSearch (images:annotate, image) ---
-  # Set name: google and uncomment. Credentials are env-ONLY (never in yaml):
-  #   VISMOD_GOOGLE_API_KEY=...   (auth_mode: apikey, the default — sent as ?key=)
-  #   VISMOD_GOOGLE_TOKEN=...     (auth_mode: bearer — OAuth2/ADC access token acquired
-  #                                out-of-band, e.g. `gcloud auth print-access-token`)
-  #   VISMOD_GOOGLE_PROJECT=...   (optional, bearer only — sent as x-goog-user-project
-  #                                for billing/quota attribution)
-  # options:
-  #   endpoint: https://vision.googleapis.com/v1/images:annotate  # default; override for a test host
-  #   auth_mode: apikey       # apikey (default) | bearer
-  #   rps: 5                  # shared token-bucket rate (tune to your Vision quota)
-  #   max_retries: 3          # transient (429/5xx/net) retries before failing the frame (0 disables)
-  #   retry_backoff: 500ms    # base backoff; doubles per attempt (+jitter), capped 30s, honors Retry-After
-  # SafeSearch returns five ORDINAL likelihood enums (adult/spoof/medical/violence/racy),
-  # each UNKNOWN/VERY_UNLIKELY..VERY_LIKELY. The adapter maps them to a fixed [0,1] lookup
-  # (VERY_UNLIKELY=0.0 .. VERY_LIKELY=1.0; UNKNOWN -> score null = could-not-evaluate) with
-  # score_origin: likelihood_enum. Mapping: adult->SEXUAL, racy->SUGGESTIVE_RACY,
-  # violence->VIOLENCE, medical->MEDICAL, spoof->SPOOF. MEDICAL/SPOOF are provenance-only,
-  # NOT harm signals. These likelihood buckets are NOT comparable to Azure severity/6 or
-  # Hive probabilities — re-tune thresholds. v1 sends inline base64 content only (no gcsImageUri).
+    # shieldgemma options — SELF-HOSTED (adapter.name: shieldgemma).
+    # You run the inference server (vLLM / TGI serving
+    # google/shieldgemma-2-4b-it); vismod only speaks HTTP to it. Requires
+    # provider_thresholds.mode: override below — it refuses to boot
+    # otherwise, because category thresholds hold cloud-vendor magnitudes.
+    # endpoint: http://127.0.0.1:8000/v1/chat/completions
+    #                             # config-only, never from a job. http is
+    #                             # allowed ONLY for loopback/RFC1918; a
+    #                             # public host must be https; the
+    #                             # 169.254.0.0/16 metadata range is always
+    #                             # rejected; no user:pass@ in the URL;
+    #                             # redirects are not followed (SECURITY.md).
+    # model_version: shieldgemma-2-4b-it
+    #                             # REQUIRED, no default. It is an OPERATOR
+    #                             # CLAIM, not a vendor-pinned id: a swapped
+    #                             # checkpoint under the same served name
+    #                             # leaves config_hash unchanged
+    #                             # (MODEL_LIMITATIONS.md). Pin by digest in
+    #                             # your own deployment if you need more.
+    # policies:                   # default: all three. ONE REQUEST PER
+    #   - sexually_explicit       # POLICY PER FRAME, so three policies
+    #   - dangerous_content       # triple the request count for the same
+    #   - violence_gore           # frame budget.
+    # timeout_seconds: 120        # set WELL above the server's p99: vLLM
+    #                             # queues instead of returning 429, and a
+    #                             # client timeout is retryable, so a tight
+    #                             # timeout retries work the box is still
+    #                             # doing and adds load.
+    # max_attempts: 2             # keep small for the same reason
+    # rate_limit_rps: 0           # 0 = disabled. There is no billing quota
+    #                             # here; in-flight load is bounded by
+    #                             # queue.workers x frames.concurrency, and
+    #                             # THAT product is what must fit the GPU.
+    #                             # A non-zero value is a burst damper only,
+    #                             # counted per REQUEST, not per frame.
 
-# Two boundaries per category: flag_at (-> verdict flag) and block_at (-> verdict block).
-# Categories not listed fall back to thresholds.default.
-# A score in [flag_at, block_at) flags and routes to manual review; >= block_at auto-blocks.
-# block_at > 1.0 => category never auto-blocks; all above-flag hits route to manual review (flag).
+# ── Decision thresholds ─────────────────────────────────────────────────
+# PER-ADAPTER, NOT PORTABLE: retune when you change adapter.name (see
+# MODEL_LIMITATIONS.md). score >= flag_at flags the category;
+# score >= block_at blocks the asset. All values in [0,1].
 thresholds:
   default:
     flag_at: 0.5
     block_at: 0.8
-  SEXUAL:               # strictest by default
-    flag_at: 0.5
-    block_at: 0.667
+  sexual:
+    flag_at: 0.4                # strictest defaults for SEXUAL
+    block_at: 0.7
+  # violence:
+  #   flag_at: 0.5
+  #   block_at: 0.85
+  #
+  # Canonical categories: sexual, suggestive_racy, violence, gore_graphic,
+  # weapons, self_harm, hate, offensive_gesture, drugs (illicit only),
+  # alcohol_tobacco, gambling, other. Any category you do not name here
+  # inherits `default`.
+  #
+  # medical, spoof and animated_synthetic are PROVENANCE carriers, not
+  # harm signals — thresholding them flags "this is a drawing" or "this is
+  # medical imagery" as if it were harm. Usually you want them left alone.
+  #
+  # Which categories your adapter can actually emit depends on the vendor:
+  # microsoft emits 4, google 5, hive most of the list. See the coverage
+  # table in MODEL_LIMITATIONS.md.
 
-queue:
-  driver: memory        # "memory" (dev/CLI, non-durable) or "redis" (durable, at-least-once).
-  workers: 4            # parallel job workers (bounds parallelism, not throughput)
-  buffer: 64            # in-memory FIFO buffer depth (memory driver only)
-  max_retries: 3        # bounded retry before dead-letter (both drivers)
-  retry_backoff: 500ms  # linear backoff base between retries (both drivers)
-  drain_timeout: 30s    # graceful-drain budget for in-flight jobs on shutdown
-  job_timeout: 60s      # per-job processing timeout
-  deadletter_max: 1024  # DLQ depth cap; at capacity new enqueues are rejected (memory driver)
-  redis_addr: localhost:6379   # REQUIRED when driver=redis; PING-validated at boot AND on /readyz
-  dedup_ttl: 168h       # redis driver only: lifetime of a cross-process dedup claim (§L #9).
-                        # MUST exceed the max redelivery window (asynq retention + retry backoff).
-  # redis driver (asynq-backed): durable + at-least-once across restarts and multiple
-  # workers/replicas. At-least-once requires idempotency — a Redis-backed dedup gate
-  # (key vismod:done:<job_id>, dedup_ttl) records each committed job so a redelivery to a
-  # FRESH process or replica re-uses that fact and never double-writes the sink/audit
-  # (the in-memory per-process guards alone could not span processes). Job payloads in Redis
-  # carry only opaque IDs/refs (file paths), never media bytes. A Redis outage flips
-  # /readyz to not-ready (backpressure) rather than accepting jobs it cannot hold.
+# ── Advanced: per-provider-label thresholds ─────────────────────────────
+# Set boundaries on a SPECIFIC vendor label instead of a canonical
+# category — e.g. block Hive's illicit_injectables at 0.9 without moving
+# the DRUGS category. Even less portable than category thresholds: these
+# are pinned to one vendor's head names and stop matching the day that
+# vendor renames one. Off unless you set a mode.
+#
+#   off       category thresholds only (default; labels must be absent)
+#   hybrid    categories are the fallback, a configured label overrides
+#   override  ONLY configured labels apply — categories and `default` are
+#             dropped entirely
+#
+# Resolution is provider label > category > default, field by field: an
+# entry that sets only flag_at still inherits block_at from the category.
+# The override applies to BOTH flagging and blocking.
+#
+# A label value is applied as written, including when it is LOOSER than
+# what it would have inherited — that is how you quiet a noisy head
+# (Hive's negative `no_*` heads score high on safe images and would
+# otherwise flag against OTHER). It is a real way to weaken a decision,
+# so it is recorded: config_hash changes with these values.
+#
+# DANGER, override mode: a label with no entry has NO boundaries and can
+# never flag or block. A typo in a label name silently disarms that
+# signal. Boot fails if override is set with no labels at all. For the
+# cloud adapters that is the only net there is — vismod has no list of
+# every label Hive might emit — so prefer hybrid unless you truly want a
+# closed list.
+#
+# An adapter that KNOWS its own label set (shieldgemma, whose policies it
+# authors itself) is checked at boot: every label it can emit must appear
+# under labels or unarmed_labels, or startup fails naming the missing ones.
+#
+# unarmed_labels is how you write down "reviewed, deliberately no
+# boundaries". It is a LIST rather than an empty entry under labels because
+# yaml keys with no value (`x: {}`, `x:`, `x: {flag_at: null}`) are dropped
+# before vismod ever sees them. An unarmed label still reaches the merged
+# map, so config_hash changes and the decision stays attributable — and it
+# does not satisfy override mode's "at least one armed label" rule, since an
+# unarmed label cannot flag or block by definition.
+#
+# provider_thresholds:
+#   mode: hybrid
+#   labels:
+#     illicit_injectables:        # Hive head, matched case-insensitively
+#       flag_at: 0.7
+#       block_at: 0.9
+#     no_gun:                     # negative head: quiet it, don't drop it
+#       flag_at: 0.99
+#
+# The shieldgemma shape — override mode, all three policies keyed:
+# provider_thresholds:
+#   mode: override
+#   labels:
+#     sexually_explicit:
+#       flag_at: 0.6
+#       block_at: 0.85
+#     violence_gore:
+#       flag_at: 0.7
+#       block_at: 0.9
+#   unarmed_labels:
+#     - dangerous_content         # reviewed, deliberately no boundaries
+
+# ── FFmpeg frame extraction (the configuration focus) ───────────────────
+ffmpeg:
+  ffmpeg_path: ffmpeg           # resolved on PATH; or an absolute path
+  ffprobe_path: ffprobe
+  default_workflow: scene-detect
+  max_frames: 50                # REQUIRED > 0 — SCAN cap: max frames per video
+                                # reaching moderation, applied AFTER dedup so
+                                # duplicates are removed before anything is cut
+  # max_extract_frames: 200     # disk/extraction bound (frames materialized
+                                # before post-processing); default 4x max_frames.
+                                # This is what {{.MaxFrames}} renders as.
+  max_width: 540                # {{.MaxWidth}} template value
+  timeout: 120s                 # per-extraction wall clock
+  # Workflows are ordinary configuration and an OPERATOR-TRUST BOUNDARY
+  # gated by `vismod workflows validate` (docs/custom-ffmpeg-workflows.md).
+  # The three standard workflows below are the built-in defaults, shown
+  # here in full; entries with the same name override them, new entries
+  # add to them, and omitting this section keeps them as-is.
+  workflows:
+    scene-detect:               # default_workflow
+      description: "Extract one frame per detected scene change (select='gt(scene,0.55)')."
+      args: ["-hide_banner","-nostdin","-y","-i","{{.Input}}",
+             "-vf","select='gt(scene,0.55)',scale={{.MaxWidth}}:-1,showinfo",
+             "-vsync","vfr","-frames:v","{{.MaxFrames}}",
+             "{{.WorkDir}}/frame-%06d.png"]
+    scene-detect-v2:
+      description: "One frame per hard scene change, at most one per 5 seconds."
+      args: ["-hide_banner","-nostdin","-y","-i","{{.Input}}",
+             "-vf","select='gt(scene,0.55)*(isnan(prev_selected_t)+gte(t-prev_selected_t\\,5))',scale={{.MaxWidth}}:-1,showinfo",
+             "-vsync","vfr","-frames:v","{{.MaxFrames}}",
+             "{{.WorkDir}}/frame-%06d.png"]
+    keyframe:
+      description: "Extract keyframes (I-frames) only."
+      args: ["-hide_banner","-nostdin","-y","-skip_frame","nokey","-i","{{.Input}}",
+             "-vf","showinfo","-vsync","vfr","-frames:v","{{.MaxFrames}}",
+             "{{.WorkDir}}/frame-%06d.png"]
+    interval:
+      description: "Extract one frame every 2 seconds."
+      args: ["-hide_banner","-nostdin","-y","-i","{{.Input}}",
+             "-vf","fps=1/2,scale={{.MaxWidth}}:-1,showinfo",
+             "-frames:v","{{.MaxFrames}}",
+             "{{.WorkDir}}/frame-%06d.png"]
+    # every-5s:                 # example custom workflow
+    #   description: "One frame every 5 seconds."
+    #   args: ["-hide_banner","-nostdin","-y","-i","{{.Input}}",
+    #          "-vf","fps=1/5,scale={{.MaxWidth}}:-1,showinfo",
+    #          "-frames:v","{{.MaxFrames}}","{{.WorkDir}}/frame-%06d.png"]
 
 frames:
-  workdir: ""           # absolute, caller-owned, ephemeral, writable dir (empty -> system temp under a vismod dir)
-  max_frames: 64        # REQUIRED > 0: primary bound on per-video cost AND peak disk
-  concurrency: 4        # per-job moderation fan-out limit (distinct from videosift internal concurrency)
-  scene: true
-  keyframe: true
-  temporal: true
-  mpdecimate: true
-  # videosift extraction tuning (defaults mirror videosift; NOT verdict-affecting)
-  scene_threshold: 0.4        # scene-change score in (0, 1]; LOWER=more sensitive. 0 is rejected at load (not max-sensitive: videosift would re-default 0 -> 0.4)
-  temporal_interval: 2.0      # seconds between uniform samples
-  mpdecimate_hi: 768          # mpdecimate high threshold
-  mpdecimate_lo: 320          # mpdecimate low threshold
-  mpdecimate_frac: 0.33       # mpdecimate fraction of changed blocks in (0, 1]. 0 is rejected at load (videosift would re-default 0 -> 0.33)
-  hash_algo: "phash"          # phash|dhash
-  hamming_threshold: 8        # max hash distance for dedup; 0 disables dedup
-  hash_resize_width: 256      # pre-hash scale width; 0 disables (not recommended)
-  videosift_concurrency: 0    # videosift internal strategy parallelism (0 -> #enabled strategies)
-  ffmpeg_path: ""       # override ffmpeg binary (empty -> discovered on PATH; validated at boot)
-  ffprobe_path: ""      # override ffprobe binary (empty -> discovered on PATH; validated at boot)
+  concurrency: 10                # per-job frame fan-out bound (lazy decode)
+  # Optional post-extraction near-duplicate filter: frames whose dHash
+  # Hamming distance to an already-kept frame is <= hamming_threshold
+  # are dropped BEFORE moderation (saves vendor calls; useful when a job
+  # selects multiple workflows with overlapping output). The first
+  # occurrence always survives. 0 removes exact perceptual matches only;
+  # ~8 removes near-duplicates; higher gets aggressive. Jobs may override
+  # per request: "dedup_threshold": 0..64 enables at that distance, -1
+  # disables (scan: --dedup-threshold).
+  dedup:
+    enabled: true
+    hamming_threshold: 14
 
-log:
-  level: info           # debug | info | warn | error
+# ── Job queue ────────────────────────────────────────────────────────────
+queue:
+  driver: memory                # memory (dev/CLI, NON-DURABLE) | redis (production)
+  workers: 4                    # fixed goroutine pool per replica
+  buffer: 1024                  # memory-driver pending buffer
+  max_retries: 3                # Retry disposition budget before dead-letter
+  retry_backoff: 2s
+  drain_timeout: 30s            # graceful-drain budget on SIGTERM
+  job_timeout: 5m               # per-job processing timeout
+  deadletter_max: 1000          # at capacity: reject enqueues + alert (never drop)
+  redis:
+    addr: localhost:6379
+    db: 0                       # password via VISMOD_QUEUE_REDIS_PASSWORD only
 
-metrics:
-  addr: ":9090"         # serve exposes /healthz, /readyz and Prometheus /metrics here
+# ── Fail-safe overrides (gated; leave off) ──────────────────────────────
+failsafe:
+  # When true, a video that extracts ZERO frames is acked as an
+  # operational SKIP (no verdict, prominent audit event) instead of
+  # verdict=error + dead-letter. Enabling accepts that a static/looping
+  # harmful video can pass unevaluated. Default false.
+  allow_empty_video_skip: false
 
+# ── Fail-safe backpressure (§ readiness) ─────────────────────────────────
+backpressure:
+  consecutive_errors: 20        # N: trip after N consecutive provider errors
+  error_rate_pct: 50            # X: or >= X% errors over the window
+  window: 60s                   # W
+  recovery_successes: 5         # M: successes required to restore (hysteresis)
+
+# ── Audit log ────────────────────────────────────────────────────────────
 audit:
-  # Tamper-evident decision log (§G.5): append-only, hash-chained, idempotent per
-  # job_id. Stores SHA-256(Raw) + ModelIdentity + verdict — NEVER media or Raw text.
-  # Empty disables the trail (OK for one-shot CLI scans). A production `serve`
-  # SHOULD set an absolute path on durable storage. Verify with:
-  #   vismod audit verify <path>
-  path: ""              # e.g. /var/lib/vismod/audit.log
+  enabled: true
+  path: audit.log               # append-only hash chain; verify with `vismod audit verify`
+
+# ── Observability ───────────────────────────────────────────────────────
+log_level: info                 # debug | info | warn | error (JSON to stderr)
+metrics_addr: ":9090"           # /metrics /healthz /readyz
+# Dev HTTP intake (serve mode). POST /jobs body:
+#   {"kind":"file","ref":"<abs path>","media_type":"image|video",
+#    "workflows":["interval","keyframe"],   # optional, any number; frames are
+#                                           # the union; omitted = default_workflow
+#    "dedup_threshold": 8}                  # optional; 0..64 enables dedup at
+#                                           # that Hamming distance, -1 disables;
+#                                           # omitted = frames.dedup config
+intake_addr: "127.0.0.1:8080"
+
+# ── Web UI (stretch; read-mostly; never renders media) ──────────────────
+ui:
+  enabled: true
+  addr: "127.0.0.1:8081"
+  auth: basic                   # credentials via VISMOD_UI_USER / VISMOD_UI_PASSWORD
+
+# ── Output sinks ─────────────────────────────────────────────────────────
+# Where result envelopes go. Omit this block entirely for stdout-only
+# (the default, and what every release before this one did).
+#
+# A present block with an empty `sinks` list refuses to boot: emitting
+# nothing silently is exactly the failure mode this project avoids.
+output:
+  sinks:
+    - type: stdout
+
+    # Append-only JSONL. ONE PROCESS PER FILE — two replicas sharing a
+    # path interleave writes, the same hazard the audit log has.
+    #
+    # CONSUMERS MUST DEDUPE ON job_id. Unlike the audit log, this sink
+    # does NOT replay its file on open: the per-job_id dedupe set is in
+    # memory only, so a job redelivered after a restart is appended a
+    # SECOND time with the same job_id. Idempotency here is per process
+    # lifetime, not durable.
+    # - type: file
+    #   path: /var/lib/vismod/results.jsonl
+
+    # POST each envelope to a receiver. This URL is OPERATOR config, not
+    # job input, so private/internal addresses are expected and allowed
+    # (SECURITY.md's operator-endpoint class). http is accepted only for
+    # loopback and RFC 1918 hosts; a public host must be https.
+    # Redirects are refused.
+    #
+    # The receiver must dedupe on job_id: delivery is at-least-once and a
+    # worker restart can resend (same per-process limit as the file sink).
+    #
+    # BUDGET timeout AND max_attempts DELIBERATELY. A webhook failure is
+    # not local to this sink:
+    #   * MultiSink returns the failure, so the whole JOB retries — frame
+    #     extraction and a fresh, BILLED vendor call included. With
+    #     queue.max_retries: 3 a receiver outage costs up to 4x vendor
+    #     quota per job before the job dead-letters.
+    #   * The audit record is written AFTER the sink, so a job that
+    #     dead-letters this way leaves NO audit entry at all, even though
+    #     the envelope is already in the stdout/file sinks.
+    #   * Retry-After is honored up to 120s and attempts are serial, so a
+    #     slow receiver can occupy a worker for minutes and starve the
+    #     pool. Keep timeout x max_attempts well under your job budget.
+    # An unreliable receiver is better fed by tailing the file sink than
+    # by putting it in this list.
+    # - type: webhook
+    #   url: https://collector.internal/results
+    #   timeout: 5s
+    #   max_attempts: 3

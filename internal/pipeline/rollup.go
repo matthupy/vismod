@@ -1,101 +1,94 @@
 package pipeline
 
-import "github.com/matthupy/vismod/pkg/moderation"
+import (
+	"github.com/vismod/vismod/internal/config"
+	"github.com/vismod/vismod/pkg/moderation"
+)
 
-// applyThresholds stamps the flag_at Threshold and computes Flagged for every
-// score-based CategoryResult. List-membership rows (hash matches) keep
-// Threshold=nil and their pre-set Flagged=true.
-func (p *Pipeline) applyThresholds(res *moderation.NormalizedResult) {
-	for fi := range res.Frames {
-		for ci := range res.Frames[fi].Categories {
-			c := &res.Frames[fi].Categories[ci]
-			if c.ScoreOrigin == moderation.ScoreOriginListMembership {
-				// Binary list membership: Flagged already set, no threshold.
-				continue
-			}
-			ct := p.Cfg.Thresholds.For(c.Category)
-			flagAt := ct.FlagAt
-			c.Threshold = moderation.Ptr(flagAt)
-			c.Flagged = c.Score != nil && *c.Score >= flagAt
-		}
+// ApplyThresholds stamps each CategoryResult with its resolved flag_at
+// boundary and computes Flagged. A nil Score never flags — and never
+// counts as clean either; the rollup's all-nil rule handles that.
+//
+// Resolution goes through config.ResolveFor with the provider label, so a
+// per-label override applies here and in Rollup identically.
+func ApplyThresholds(cats []moderation.CategoryResult, th config.Thresholds) []moderation.CategoryResult {
+	out := make([]moderation.CategoryResult, len(cats))
+	for i, c := range cats {
+		resolved := th.ResolveFor(moderation.Canonicalize(c.Category), c.ProviderLabel)
+		c.Threshold = resolved.FlagAt
+		c.Flagged = c.Score != nil && c.Threshold != nil && *c.Score >= *c.Threshold
+		out[i] = c
 	}
+	return out
 }
 
-// rollup computes the asset-level OverallVerdict from per-frame results.
+// Rollup aggregates frame results into the asset-level OverallVerdict.
 //
-// Verdict precedence is STRICT: block > error > flag > allow.
-//   - block: any ok category has *Score >= block_at[cat] OR a list-membership match
-//   - error: any frame Status=error, OR zero ok frames, OR every score is nil
-//   - flag:  any CategoryResult.Flagged
-//   - allow: otherwise
-//
-// MaxScore/Confidence/TopCategory are computed over non-nil scores in ok frames
-// and are nil when no non-nil score exists (never collapsed to 0.0).
-func (p *Pipeline) rollup(framesIn []moderation.FrameResult) moderation.OverallVerdict {
+// Verdict precedence is STRICT: block > error > flag > allow, evaluated in
+// order:
+//   - block: any ok-frame category with *Score >= block_at.
+//   - error: any frame errored, zero ok frames exist, or every score
+//     across all frames is nil (could-not-evaluate). Fail safe: a
+//     partially-errored or unevaluable asset is never "allow".
+//   - flag:  any Flagged category.
+//   - allow: everything else.
+func Rollup(frames []moderation.FrameResult, th config.Thresholds) moderation.OverallVerdict {
 	var (
-		anyError    bool
-		okFrames    int
-		anyFlagged  bool
-		anyBlock    bool
-		anyNonNil   bool
-		maxScore    float64
-		topCategory moderation.Category
-		haveTop     bool
+		anyError   bool
+		okFrames   int
+		anyFlagged bool
+		block      bool
+		maxScore   *float64
+		topCat     *moderation.Category
 	)
 
-	for _, f := range framesIn {
-		if f.Status == moderation.FrameStatusError {
+	for _, f := range frames {
+		if f.Status != moderation.FrameOK {
 			anyError = true
 			continue
 		}
 		okFrames++
 		for _, c := range f.Categories {
-			// list-membership match => block.
-			if c.ScoreOrigin == moderation.ScoreOriginListMembership && c.Flagged {
-				anyBlock = true
-			}
 			if c.Flagged {
 				anyFlagged = true
 			}
-			if c.Score == nil {
-				continue
-			}
-			anyNonNil = true
-			blockAt := p.Cfg.Thresholds.For(c.Category).BlockAt
-			if *c.Score >= blockAt {
-				anyBlock = true
-			}
-			if !haveTop || *c.Score > maxScore {
-				maxScore = *c.Score
-				topCategory = c.Category
-				haveTop = true
+			if c.Score != nil {
+				if maxScore == nil || *c.Score > *maxScore {
+					s := *c.Score
+					maxScore = &s
+					cat := c.Category
+					topCat = &cat
+				}
+				resolved := th.ResolveFor(moderation.Canonicalize(c.Category), c.ProviderLabel)
+				if resolved.BlockAt != nil && *c.Score >= *resolved.BlockAt {
+					block = true
+				}
 			}
 		}
 	}
 
-	ov := moderation.OverallVerdict{Flagged: anyFlagged}
-	if haveTop {
-		ov.MaxScore = moderation.Ptr(maxScore)
-		ov.Confidence = moderation.Ptr(maxScore)
-		tc := topCategory
-		ov.TopCategory = &tc
-	}
-
+	verdict := moderation.VerdictAllow
 	switch {
-	case anyBlock:
-		ov.Verdict = moderation.VerdictBlock
-		ov.Flagged = true
-	case anyError || okFrames == 0 || !anyNonNil:
-		// Could-not-evaluate: never allow.
-		ov.Verdict = moderation.VerdictError
-		// A pure error rollup carries no flag.
-		if !anyFlagged {
-			ov.Flagged = false
-		}
+	case block:
+		verdict = moderation.VerdictBlock
+	case anyError, okFrames == 0, maxScore == nil:
+		// maxScore==nil means no non-nil score existed anywhere — that is
+		// could-not-evaluate, never allow.
+		verdict = moderation.VerdictError
 	case anyFlagged:
-		ov.Verdict = moderation.VerdictFlag
-	default:
-		ov.Verdict = moderation.VerdictAllow
+		verdict = moderation.VerdictFlag
 	}
-	return ov
+
+	var confidence *float64
+	if maxScore != nil {
+		c := *maxScore
+		confidence = &c
+	}
+	return moderation.OverallVerdict{
+		Verdict:     verdict,
+		Flagged:     anyFlagged,
+		TopCategory: topCat,
+		MaxScore:    maxScore,
+		Confidence:  confidence,
+	}
 }

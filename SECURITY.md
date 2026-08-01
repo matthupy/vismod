@@ -1,111 +1,154 @@
-# Security Policy & Threat Model
-
-> Not legal advice. This document describes vismod's security posture and the
-> threats it does and does **not** defend against, so operators can deploy it
-> with eyes open.
+# Security
 
 ## Reporting a vulnerability
 
-Report suspected vulnerabilities privately via GitHub Security Advisories
-("Report a vulnerability" on the repository's Security tab) rather than a public
-issue. Please include a reproduction and the affected version/commit. Do **not**
-include real illegal content or live secrets in a report.
+Open a private GitHub security advisory on this repository (Security →
+Report a vulnerability). Do not file public issues for exploitable bugs.
 
----
+## Threat model and hard boundaries
 
-## Secrets handling
+### FFmpeg workflows are an operator-trust boundary
 
-- **Secrets are environment-only.** API keys and bearer tokens are read solely
-  from `VISMOD_`-prefixed environment variables (e.g. `VISMOD_AZURE_KEY`). They
-  are **never** read from, or written to, the YAML config. Boot fails fast if a
-  selected adapter's required secret is missing.
-- Secrets are excluded from the `ConfigHash` provenance stamp and from all logs.
+Custom extraction workflows are configuration written by the operator —
+they are **not** untrusted user input, but vismod still enforces
+guardrails because a compromised or careless config must not become code
+execution or exfiltration:
 
-## SSRF / egress (§C)
+- Workflows are **argument-list templates**, rendered per-element and
+  passed to `exec.CommandContext`. There is **no shell** anywhere in the
+  extraction path, and `-nostdin` is always enforced.
+- Allowed placeholders only: `{{.Input}}`, `{{.WorkDir}}`,
+  `{{.MaxFrames}}`, `{{.MaxWidth}}`. Anything else fails validation.
+- `{{.Input}}` is bound to the current job's local file: exactly one
+  `-i {{.Input}}` pair; a second `-i` fails validation.
+- **Protocol deny-list**: `http:`, `https:`, `rtmp*:`, `concat:`,
+  `pipe:`, `subfile:` (including the `subfile,,opts:` comma form),
+  `data:`, `tcp:`, `udp:`, `file:`, protocol chaining (`cache:http:`),
+  and any `://` are rejected at validation time in both templates and
+  rendered args. Only plain local paths reach ffmpeg. This blocks
+  arbitrary-file reads and network exfiltration via a crafted workflow.
+- **Output confinement**: the output pattern must live under the
+  pipeline-owned per-job `WorkDir`; other absolute paths and `..`
+  traversal are rejected. `max_frames` and `timeout` are hard caps.
 
-The Azure adapter accepts an image as inline base64 `content` **or** a remote
-`blobUrl`. A remote-fetch URL is an **SSRF / egress vector**.
+`vismod workflows validate` runs the full gate and must pass at boot.
 
-- **v1 default: local-file / inline `content` only.** Remote `blobUrl` (and any
-  future `Source.Kind=url`/`s3`) is disabled.
-- If `blobUrl` is ever enabled, it **must** enforce a host/scheme **allow-list**
-  and **forbid private / link-local / metadata ranges** — RFC 1918,
-  `169.254.0.0/16` (incl. cloud metadata `169.254.169.254`), `::1`, and other
-  loopback/internal ranges.
+### SSRF / egress posture
 
-## Logging / data-exposure (§F.6, §G.2)
+Two kinds of URL exist in this system and they take **opposite** rules.
+Do not apply one rule to the other.
 
-- Structured logs carry job id, adapter, latency, and verdict — **never** media
-  bytes, PII, provider `Raw` free-text, OCR, or captions.
-- The **`Raw`** field is optional and **sanitized**: a descriptive-output
-  adapter (e.g. a future local vision-LLM) must strip natural-language image
-  descriptions before they reach the Sink, logs, or audit.
+**1. Media source URLs — untrusted, deny private ranges.**
 
-## Audit log: tamper-evidence scope (§G.5)
+- v1 sends media to providers as **inline content only**. Azure
+  `blobUrl` (and any future `url:`/`s3:` source kind) is a remote-fetch
+  vector and is disabled. If a URL source is ever added it MUST sit
+  behind a scheme+host allow-list that forbids RFC 1918 ranges,
+  169.254.0.0/16 (cloud metadata), and loopback.
+- Frame extraction rejects any input path containing a protocol scheme.
 
-The audit log (`internal/audit`) is an **append-only, hash-chained** decision
-log. Each record is
-`{seq, timestamp, prev_hash, payload, entry_hash}` where
-`entry_hash = SHA-256(seq ‖ timestamp ‖ prev_hash ‖ canonical(payload))`,
-the genesis `prev_hash` is all-zeros, fields are **length-prefixed**, and
-`canonical(payload)` is a **JCS-shaped** canonical form (sorted-key, compact,
-UTF-8) so `vismod audit verify` recomputes byte-identical hashes across
-processes and runs. **Scope:** the same canonicalizer hashes and verifies, which
-is all the chain needs; it is **not** byte-for-byte RFC 8785 (Go `json.Marshal`
-`\u`-escapes `<` `>` `&` and U+2028/2029), so the hashes are **not** a
-cross-implementation interop contract — only self-consistent.
-Appends are **idempotent per `job_id`** (no duplicate `seq`, no gap). The
-payload binds a decision to its inputs **by hash** — `SHA-256(Raw)` +
-`ModelIdentity` + verdict — and **never stores `Raw` itself**.
+**2. Operator-supplied endpoint URLs — operator config, private ranges
+expected.**
 
-**🔴 Honest scope.** A bare hash chain detects **truncation** and **in-place
-edits**. It does **NOT** detect a **full-chain rewrite by a write-capable
-insider**: anyone who can rewrite the whole file can recompute every
-`entry_hash` and present an internally-consistent forged chain.
+The cloud adapters' hosts are vendor-fixed. Two URLs in the codebase are
+operator-supplied instead: the `shieldgemma` adapter's inference endpoint
+(outbound, egress to a classifier) and the `webhook` result sink's
+receiver URL (outbound, egress of result envelopes). Both are *expected*
+to be loopback or RFC 1918 — that is the feature, and rule 1's deny-list
+must not be applied to them. The rules that govern them instead (enforced
+by `validateEndpoint` in
+`internal/moderate/adapters/shieldgemma/endpoint.go`, one test per rule):
 
-**Tamper-*resistant* upgrade (documented seam, not in v1):** sign each
-`entry_hash` (HMAC or Ed25519) with a key held **outside** the writer's trust
-boundary, **or** periodically anchor the chain head-hash to WORM / external
-storage. Either makes a silent full rewrite detectable. The chain layout already
-isolates the hash computation so this can be added without a schema break.
+- **Config-only.** The endpoint comes from `adapter.options` in yaml and
+  is never read from a job, queue payload, or intake body. With no
+  request-time URL there is no attacker-chosen destination; the endpoint
+  is in the same operator-trust class as an ffmpeg workflow.
+- `http` and `https` schemes only. `http` is permitted for loopback and
+  RFC 1918 hosts; a public host must be `https`.
+- `169.254.0.0/16` (and IPv6 link-local) rejected unconditionally, under
+  both schemes — no legitimate inference server lives on the metadata
+  range, and it is the one range where a misconfiguration turns into
+  cloud-credential theft.
+- No userinfo in the URL; credentials are env-only per the secrets rule.
+- Redirects are not followed (`CheckRedirect` errors) — a redirect is a
+  destination vismod did not choose.
 
-## Anti-abuse / evasion-oracle residual risk (§G.7)
+A hostname that is not an IP literal (other than `localhost`) is treated
+as public and therefore requires `https`: vismod cannot know at boot what
+a name will resolve to at request time. Resolution happens per request, so
+a boot-time check does not close DNS rebinding — the **config-only** rule
+above is what makes that acceptable.
 
-vismod emits the per-category `Score` and the exact `Threshold`. In theory this
-is an **evasion oracle**: an adversary can read distance-to-threshold and tune
-content to slip under it.
+See [docs/self-hosted-classifiers.md](docs/self-hosted-classifiers.md)
+for the reasoning.
 
-- **v1 accepts this risk and ships no control.** The underlying scanning models
-  are already publicly available for testing, so suppressing scores would add
-  friction without removing the adversary's capability. There is **no
-  `antiabuse.*` config key or output mode** in v1.
-- Operators exposing scores to untrusted parties should weigh this; the residual
-  risk is stated here plainly so the decision is explicit.
+#### The `webhook` result sink enforces the same rule set
 
-## Fail-safe posture (§F.5)
+`output.sinks[].url` (see `config.example.yaml`) is the second URL in
+this class. It is enforced by `validateWebhookURL` in
+`internal/config/config.go`, deliberately written as the same rule set in
+the same order as `validateEndpoint`, plus `CheckRedirect` on the client
+built by `result.NewWebhookSink`
+(`internal/result/webhook.go`). Rule by rule:
 
-vismod is security-critical and **fails safe, never silent**:
+- **Config-only.** The URL comes from the `output.sinks` block in yaml
+  and is never read from a job, queue payload, or intake body.
+- `http` and `https` schemes only. `http` is permitted for loopback and
+  RFC 1918 hosts; a public host must be `https`. A hostname that is not
+  an IP literal (other than `localhost` / `*.localhost`) is treated as
+  public.
+- `169.254.0.0/16` (and IPv6 link-local) rejected unconditionally, under
+  both schemes.
+- No userinfo in the URL; credentials are env-only.
+- Redirects are not followed (`CheckRedirect` errors).
 
-- A provider/frame/extraction failure yields `Verdict=error` (**never `allow`**)
-  and dead-letters. A partially-errored video never rolls up to `allow`.
-- A worker **panic** dead-letters that job and the pool keeps running.
-- A **sustained** provider outage flips readiness to **not-ready** (backpressure)
-  rather than flooding the human-review queue.
-- The dead-letter queue is **bounded**; at capacity new enqueues are rejected and
-  alerted — never dropped, never auto-allowed.
+Two things this rule set does **not** cover, in either place. DNS
+rebinding is not closed — resolution happens per request, and
+config-only provenance is what makes that acceptable. And there is no
+outbound authentication on the webhook POST: vismod does not sign or
+authenticate the request, so the receiver cannot verify the sender, and
+anything reachable at the configured URL will be handed result
+envelopes. Envelopes carry verdicts, scores, model identity, the source
+ref, and an error summary — never
+media bytes, provider `Raw`, or secrets — but that is still moderation
+metadata leaving the process, and choosing the receiver is the
+operator's whole control.
 
-## Container posture (§I)
+### Audit log: tamper-EVIDENT, not tamper-PROOF (honest scope)
 
-The Docker image runs **non-root**, ships only `ffmpeg`+`ffprobe` plus the static
-binary, uses a writable ephemeral `frames.workdir` (so a read-only rootfs still
-works), and drains on `SIGTERM`.
+The audit log is an append-only hash chain:
+`entry_hash = SHA-256(seq ‖ timestamp ‖ prev_hash ‖ JCS(payload))`.
 
-## Durable queue payloads (`driver=redis`, §D.3/§G.2)
+What it detects: truncation, deletion, reordering, and in-place edits —
+`vismod audit verify` reports the first broken link.
 
-The Redis (asynq) driver serializes only **opaque IDs/refs** into Redis — the job
-ID, source kind, and source `Ref` (a file path/URI). It **never** writes media
-bytes, `Raw` free-text, OCR, or captions into a task payload. Any operator UI over
-the same Redis (e.g. `asynqmon`) inherits this property but **must still be
-access-controlled** — it exposes source paths and verdict metadata. Redis is the
-durability SPOF: a Redis outage flips `/readyz` to not-ready (backpressure) rather
-than accepting jobs the system cannot durably hold.
+What it does NOT detect: a **full-chain rewrite** by an insider with
+write access to the log file, who can recompute every hash. Upgrades to
+tamper-RESISTANT are the `audit.Signer` seam: HMAC or Ed25519 signing of
+each entry hash with a key the writer does not hold, or periodic
+anchoring of the head hash to an external system (ticketing, a
+transparency log, another machine).
+
+The log stores `SHA-256(Raw)`, the `ModelIdentity`, and the verdict —
+never provider payloads, media bytes, OCR text, or captions.
+
+### Score-output / evasion-oracle residual risk
+
+v1 emits full normalized scores and thresholds in envelopes. An
+adversary who can submit media and read envelopes can probe decision
+boundaries. This is accepted for v1 because the underlying vendor models
+are already publicly testable; there is no `antiabuse.*` output mode.
+Operators exposing results to semi-trusted parties should strip scores at
+their own API layer. Revisit if a coarse-output mode is added.
+
+### Media handling
+
+- Job payloads (queue, Redis, any ops surface) carry **opaque file
+  refs/IDs, never media bytes**. Secure the Redis instance (auth +
+  network policy) — it is part of the trust boundary.
+- Per-job frame extraction happens in a transient `WorkDir` deleted on
+  every exit path before the job is acked. Nothing in the ordinary
+  result/audit path persists media.
+- Secrets are env-only (`VISMOD_*`); they never appear in yaml, logs, or
+  envelopes. Logging never includes media bytes, PII, `Raw` payloads,
+  OCR text, or captions.

@@ -3,624 +3,468 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
-	"github.com/matthupy/vismod/pkg/moderation"
+	"github.com/vismod/vismod/pkg/moderation"
 )
 
-func TestLoadDefaults(t *testing.T) {
-	c, err := Load("")
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if c.Adapter.Name != "stub" {
-		t.Errorf("default adapter = %q, want stub", c.Adapter.Name)
-	}
-	if c.Queue.Driver != "memory" {
-		t.Errorf("default driver = %q, want memory", c.Queue.Driver)
-	}
-	if c.Frames.MaxFrames != 64 {
-		t.Errorf("default max_frames = %d, want 64", c.Frames.MaxFrames)
-	}
-	if c.Queue.RetryBackoff != 500*time.Millisecond {
-		t.Errorf("retry_backoff = %v, want 500ms (duration string must decode)", c.Queue.RetryBackoff)
-	}
-	if c.Queue.DrainTimeout != 30*time.Second {
-		t.Errorf("drain_timeout = %v, want 30s", c.Queue.DrainTimeout)
-	}
-	if got := c.Thresholds.Default.FlagAt; got != 0.5 {
-		t.Errorf("default flag_at = %v, want 0.5", got)
-	}
-	if got := c.Thresholds.For(moderation.CategorySexual).BlockAt; got != 0.667 {
-		t.Errorf("SEXUAL block_at = %v, want 0.667", got)
-	}
-	// frames moderation fan-out (pipeline concurrency) is wired with a non-zero default.
-	if c.Frames.Concurrency != 4 {
-		t.Errorf("default frames.concurrency = %d, want 4", c.Frames.Concurrency)
-	}
-	// videosift extraction tuning defaults mirror videosift.DefaultConfig().
-	if c.Frames.SceneThreshold != 0.4 {
-		t.Errorf("default scene_threshold = %v, want 0.4", c.Frames.SceneThreshold)
-	}
-	if c.Frames.TemporalInterval != 2.0 {
-		t.Errorf("default temporal_interval = %v, want 2.0", c.Frames.TemporalInterval)
-	}
-	if c.Frames.MPDecimateHi != 768 || c.Frames.MPDecimateLo != 320 {
-		t.Errorf("default mpdecimate_hi/lo = %d/%d, want 768/320", c.Frames.MPDecimateHi, c.Frames.MPDecimateLo)
-	}
-	if c.Frames.MPDecimateFrac != 0.33 {
-		t.Errorf("default mpdecimate_frac = %v, want 0.33", c.Frames.MPDecimateFrac)
-	}
-	if c.Frames.HashAlgo != "phash" {
-		t.Errorf("default hash_algo = %q, want phash", c.Frames.HashAlgo)
-	}
-	if c.Frames.HammingThreshold != 8 {
-		t.Errorf("default hamming_threshold = %d, want 8", c.Frames.HammingThreshold)
-	}
-	if c.Frames.HashResizeWidth != 256 {
-		t.Errorf("default hash_resize_width = %d, want 256", c.Frames.HashResizeWidth)
-	}
-}
-
-// A config file that sets only an unrelated frames key (max_frames) must still
-// resolve every videosift tuning knob to its videosift.DefaultConfig() value —
-// an absent key must never zero a meaningful default.
-func TestLoadFramesTuningDefaultsWhenAbsent(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "c.yaml")
-	if err := os.WriteFile(path, []byte("frames:\n  max_frames: 7\n"), 0o600); err != nil {
+func writeTempYAML(t *testing.T, body string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	c, err := Load(path)
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if c.Frames.MaxFrames != 7 {
-		t.Errorf("max_frames = %d, want 7", c.Frames.MaxFrames)
-	}
-	if c.Frames.SceneThreshold != 0.4 {
-		t.Errorf("absent scene_threshold = %v, want videosift default 0.4", c.Frames.SceneThreshold)
-	}
-	if c.Frames.TemporalInterval != 2.0 {
-		t.Errorf("absent temporal_interval = %v, want 2.0", c.Frames.TemporalInterval)
-	}
-	if c.Frames.HashAlgo != "phash" {
-		t.Errorf("absent hash_algo = %q, want phash", c.Frames.HashAlgo)
-	}
-	if c.Frames.HammingThreshold != 8 {
-		t.Errorf("absent hamming_threshold = %d, want 8", c.Frames.HammingThreshold)
-	}
-	if c.Frames.HashResizeWidth != 256 {
-		t.Errorf("absent hash_resize_width = %d, want 256", c.Frames.HashResizeWidth)
-	}
-	if c.Frames.MPDecimateHi != 768 || c.Frames.MPDecimateLo != 320 || c.Frames.MPDecimateFrac != 0.33 {
-		t.Errorf("absent mpdecimate hi/lo/frac = %d/%d/%v, want 768/320/0.33",
-			c.Frames.MPDecimateHi, c.Frames.MPDecimateLo, c.Frames.MPDecimateFrac)
+	return p
+}
+
+func TestDefaultsValidate(t *testing.T) {
+	if err := Validate(Defaults()); err != nil {
+		t.Fatalf("defaults must validate: %v", err)
 	}
 }
 
-func TestLoadFileOverride(t *testing.T) {
+func TestThresholdResolveFallback(t *testing.T) {
+	th := Thresholds{
+		"default": {FlagAt: f64(0.5), BlockAt: f64(0.8)},
+		"SEXUAL":  {FlagAt: f64(0.3)}, // block_at inherits default
+	}
+	r := th.Resolve(moderation.CategorySexual)
+	if *r.FlagAt != 0.3 || *r.BlockAt != 0.8 {
+		t.Errorf("resolve = %+v", r)
+	}
+	r = th.Resolve(moderation.CategoryViolence)
+	if *r.FlagAt != 0.5 || *r.BlockAt != 0.8 {
+		t.Errorf("unlisted category must inherit default: %+v", r)
+	}
+}
+
+func TestLoadYAMLAndEnvOverlay(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "c.yaml")
+	path := filepath.Join(dir, "config.yaml")
 	yaml := `
 adapter:
-  name: azure
-queue:
-  driver: redis
-  workers: 9
+  name: microsoft
 thresholds:
-  default:
-    flag_at: 0.3
-    block_at: 0.6
-  VIOLENCE:
-    flag_at: 0.4
-    block_at: 0.7
-frames:
-  max_frames: 12
+  SEXUAL:
+    flag_at: 0.2
+ffmpeg:
+  max_frames: 32
+queue:
+  driver: memory
+  workers: 8
 `
 	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	c, err := Load(path)
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if c.Adapter.Name != "azure" {
-		t.Errorf("adapter = %q", c.Adapter.Name)
-	}
-	if c.Queue.Driver != "redis" || c.Queue.Workers != 9 {
-		t.Errorf("queue override failed: %+v", c.Queue)
-	}
-	if c.Frames.MaxFrames != 12 {
-		t.Errorf("max_frames = %d, want 12", c.Frames.MaxFrames)
-	}
-	vt := c.Thresholds.For(moderation.CategoryViolence)
-	if vt.FlagAt != 0.4 || vt.BlockAt != 0.7 {
-		t.Errorf("per-category VIOLENCE override failed: %+v", vt)
-	}
-	// Unlisted category falls back to default.
-	ht := c.Thresholds.For(moderation.CategoryHate)
-	if ht.FlagAt != 0.3 || ht.BlockAt != 0.6 {
-		t.Errorf("default fallback failed: %+v", ht)
-	}
-}
+	t.Setenv("VISMOD_QUEUE_WORKERS", "16")
 
-func TestLoadEnvOverlay(t *testing.T) {
-	t.Setenv("VISMOD_LOG_LEVEL", "debug")
-	t.Setenv("VISMOD_METRICS_ADDR", ":7777")
-	c, err := Load("")
+	cfg, err := Load(path)
 	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if c.LogLevel != "debug" {
-		t.Errorf("log level env overlay failed: %q", c.LogLevel)
-	}
-	if c.MetricsAddr != ":7777" {
-		t.Errorf("metrics addr env overlay failed: %q", c.MetricsAddr)
-	}
-}
-
-func TestLoadConfigPathFromEnv(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "c.yaml")
-	if err := os.WriteFile(path, []byte("metrics:\n  addr: \":7654\"\nframes:\n  max_frames: 10\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-
-	// Empty path arg + VISMOD_CONFIG set: the env file is read. This is the
-	// container HEALTHCHECK path (no --config flag), and it must resolve the same
-	// metrics.addr a serve started against the file would.
-	t.Setenv("VISMOD_CONFIG", path)
-	c, err := Load("")
-	if err != nil {
-		t.Fatalf("Load(\"\") with VISMOD_CONFIG: %v", err)
+	if cfg.Adapter.Name != "microsoft" {
+		t.Errorf("adapter.name = %q", cfg.Adapter.Name)
 	}
-	if c.MetricsAddr != ":7654" {
-		t.Errorf("metrics addr from VISMOD_CONFIG file = %q, want :7654", c.MetricsAddr)
+	if *cfg.Thresholds["SEXUAL"].FlagAt != 0.2 {
+		t.Errorf("yaml threshold not applied")
 	}
-}
-
-func TestLoadFlagPathBeatsEnv(t *testing.T) {
-	dir := t.TempDir()
-	envFile := filepath.Join(dir, "env.yaml")
-	flagFile := filepath.Join(dir, "flag.yaml")
-	if err := os.WriteFile(envFile, []byte("metrics:\n  addr: \":1111\"\nframes:\n  max_frames: 10\n"), 0o600); err != nil {
-		t.Fatal(err)
+	if cfg.FFmpeg.MaxFrames != 32 {
+		t.Errorf("ffmpeg.max_frames = %d", cfg.FFmpeg.MaxFrames)
 	}
-	if err := os.WriteFile(flagFile, []byte("metrics:\n  addr: \":2222\"\nframes:\n  max_frames: 10\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	// Explicit path arg (the --config flag) wins over VISMOD_CONFIG: flag > env.
-	t.Setenv("VISMOD_CONFIG", envFile)
-	c, err := Load(flagFile)
-	if err != nil {
-		t.Fatalf("Load(flagFile): %v", err)
-	}
-	if c.MetricsAddr != ":2222" {
-		t.Errorf("metrics addr = %q, want :2222 (flag must beat VISMOD_CONFIG)", c.MetricsAddr)
+	if cfg.Queue.Workers != 16 {
+		t.Errorf("env overlay must win: workers = %d, want 16", cfg.Queue.Workers)
 	}
 }
 
-func TestValidateErrors(t *testing.T) {
-	dir := t.TempDir()
-	cases := map[string]string{
-		"bad driver":  "queue:\n  driver: rabbitmq\nframes:\n  max_frames: 10\n",
-		"zero frames": "queue:\n  driver: memory\nframes:\n  max_frames: 0\n",
+func TestValidateRejectsBadConfig(t *testing.T) {
+	bad := Defaults()
+	bad.FFmpeg.MaxFrames = 0
+	if err := Validate(bad); err == nil {
+		t.Error("max_frames=0 must fail validation (required hard cap)")
 	}
-	for name, yaml := range cases {
-		t.Run(name, func(t *testing.T) {
-			path := filepath.Join(dir, name+".yaml")
-			if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := Load(path); err == nil {
-				t.Fatalf("expected validation error for %q", name)
-			}
-		})
+
+	bad = Defaults()
+	bad.Queue.Driver = "kafka"
+	if err := Validate(bad); err == nil {
+		t.Error("unknown queue driver must fail validation")
+	}
+
+	bad = Defaults()
+	bad.Thresholds["SEXUAL"] = CategoryThreshold{FlagAt: f64(1.5)}
+	if err := Validate(bad); err == nil {
+		t.Error("out-of-range threshold must fail validation")
 	}
 }
 
-// Thresholds are sanity-checked at Load for BOTH thresholds.default and every
-// per-category entry: flag_at must be in [0, 1] and block_at must be >= flag_at
-// (and >= 0). block_at is DELIBERATELY allowed to EXCEED 1.0 — that is the
-// documented "never auto-block" lever: scores are [0,1] and the rollup uses >=,
-// so block_at > 1.0 means every above-flag hit routes to manual review instead
-// of auto-removing. There is intentionally NO upper bound on block_at.
-func TestValidateThresholds(t *testing.T) {
-	dir := t.TempDir()
-
-	reject := map[string]string{
-		// flag_at above block_at: the flag boundary would sit past the block
-		// boundary, so a score could block without ever flagging — incoherent.
-		"flag_at exceeds block_at (default)": "thresholds:\n  default:\n    flag_at: 0.8\n    block_at: 0.5\n",
-		"flag_at exceeds block_at (per-cat)": "thresholds:\n  VIOLENCE:\n    flag_at: 0.8\n    block_at: 0.5\n",
-		// flag_at out of the [0,1] score range.
-		"flag_at above 1 (default)":  "thresholds:\n  default:\n    flag_at: 1.5\n    block_at: 2.0\n",
-		"flag_at above 1 (per-cat)":  "thresholds:\n  HATE:\n    flag_at: 1.5\n    block_at: 2.0\n",
-		"flag_at negative (default)": "thresholds:\n  default:\n    flag_at: -0.1\n    block_at: 0.8\n",
-		"flag_at negative (per-cat)": "thresholds:\n  HATE:\n    flag_at: -0.1\n    block_at: 0.8\n",
+func TestExtractBudget(t *testing.T) {
+	f := FFmpegConfig{MaxFrames: 15}
+	if f.ExtractBudget() != 60 {
+		t.Errorf("default budget = %d, want 4x max_frames = 60", f.ExtractBudget())
 	}
-	for name, yaml := range reject {
-		t.Run("reject "+name, func(t *testing.T) {
-			path := filepath.Join(dir, name+".yaml")
-			if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := Load(path); err == nil {
-				t.Fatalf("expected threshold validation error for %q", name)
-			}
-		})
+	f.MaxExtractFrames = 100
+	if f.ExtractBudget() != 100 {
+		t.Errorf("explicit budget = %d, want 100", f.ExtractBudget())
 	}
 
-	// The never-auto-block lever MUST pass: block_at = 2.0 with flag_at 0.5 is a
-	// valid, intentional config (scores are [0,1], so nothing ever reaches 2.0).
-	t.Run("accept block_at above 1 (never-auto-block lever)", func(t *testing.T) {
-		path := filepath.Join(dir, "never-block.yaml")
-		yaml := "thresholds:\n  HATE:\n    flag_at: 0.5\n    block_at: 2.0\n"
-		if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := Load(path); err != nil {
-			t.Fatalf("block_at=2.0 (never-auto-block lever) must be accepted: %v", err)
-		}
+	bad := Defaults()
+	bad.FFmpeg.MaxFrames = 20
+	bad.FFmpeg.MaxExtractFrames = 10 // below the scan cap
+	if err := Validate(bad); err == nil {
+		t.Error("max_extract_frames < max_frames must fail validation")
+	}
+}
+
+func TestConfigHashStableAndSensitive(t *testing.T) {
+	th := Defaults().Thresholds
+	h1 := ConfigHash("microsoft", "2024-09-01", th)
+	h2 := ConfigHash("microsoft", "2024-09-01", th)
+	if h1 != h2 {
+		t.Error("ConfigHash must be deterministic")
+	}
+	th2 := Thresholds{"default": {FlagAt: f64(0.4), BlockAt: f64(0.8)}}
+	if ConfigHash("microsoft", "2024-09-01", th2) == h1 {
+		t.Error("threshold change must change ConfigHash")
+	}
+	if ConfigHash("google", "2024-09-01", th) == h1 {
+		t.Error("adapter change must change ConfigHash")
+	}
+}
+
+func TestSecretAccessor(t *testing.T) {
+	t.Setenv("VISMOD_MICROSOFT_API_KEY", "sekrit")
+	if got := Secret()("microsoft.api_key"); got != "sekrit" {
+		t.Errorf("Secret() = %q", got)
+	}
+}
+
+func TestProviderLabelResolutionChain(t *testing.T) {
+	base := Thresholds{
+		"default": {FlagAt: f64(0.5), BlockAt: f64(0.8)},
+		"SEXUAL":  {FlagAt: f64(0.4), BlockAt: f64(0.7)},
+	}
+	th := base.Merge(ProviderThresholds{
+		Mode: ProviderModeHybrid,
+		Labels: Thresholds{
+			"yes_gambling": {FlagAt: f64(0.9)},                     // looser than default
+			"yes_genitals": {BlockAt: f64(0.6)},                    // stricter than SEXUAL
+			"YES_SMOKING":  {FlagAt: f64(0.2), BlockAt: f64(0.95)}, // mixed case key
+		},
 	})
 
-	// A normal, in-range per-category config must pass.
-	t.Run("accept normal SEXUAL thresholds", func(t *testing.T) {
-		path := filepath.Join(dir, "normal-sexual.yaml")
-		yaml := "thresholds:\n  SEXUAL:\n    flag_at: 0.5\n    block_at: 0.667\n"
-		if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := Load(path); err != nil {
-			t.Fatalf("normal SEXUAL flag_at 0.5 / block_at 0.667 must be accepted: %v", err)
-		}
-	})
-}
-
-// hash_algo is cast through videosift.HashAlgo at the seam, where an unknown
-// value silently falls back to phash. Load must reject typos so a misconfig
-// fails fast; empty and the two real algos must pass.
-func TestValidateHashAlgo(t *testing.T) {
-	dir := t.TempDir()
-	t.Run("invalid rejected", func(t *testing.T) {
-		path := filepath.Join(dir, "bad-algo.yaml")
-		yaml := "frames:\n  max_frames: 10\n  hash_algo: ahash\n"
-		if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := Load(path); err == nil {
-			t.Fatal("expected error for invalid hash_algo")
-		}
-	})
-	for _, algo := range []string{"phash", "dhash", ""} {
-		algo := algo
-		t.Run("valid "+algo, func(t *testing.T) {
-			path := filepath.Join(dir, "ok-algo-"+algo+".yaml")
-			yaml := "frames:\n  max_frames: 10\n  hash_algo: \"" + algo + "\"\n"
-			if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := Load(path); err != nil {
-				t.Fatalf("hash_algo=%q must be accepted: %v", algo, err)
-			}
-		})
+	// Label wins; the field it does not set falls through to the category,
+	// and then to default.
+	r := th.ResolveFor(moderation.CategorySexual, "yes_genitals")
+	if *r.FlagAt != 0.4 || *r.BlockAt != 0.6 {
+		t.Errorf("label block_at over category flag_at: %+v", r)
+	}
+	// A label looser than what it would inherit still wins — full override
+	// is the documented semantic, not a clamp.
+	r = th.ResolveFor(moderation.CategoryOther, "yes_gambling")
+	if *r.FlagAt != 0.9 || *r.BlockAt != 0.8 {
+		t.Errorf("looser label override must apply: %+v", r)
+	}
+	// Labels match case-insensitively: vendors disagree on casing.
+	r = th.ResolveFor(moderation.CategoryAlcoholTobacco, "yes_smoking")
+	if *r.FlagAt != 0.2 || *r.BlockAt != 0.95 {
+		t.Errorf("label lookup must be case-insensitive: %+v", r)
+	}
+	// An unlisted label is untouched by the feature.
+	r = th.ResolveFor(moderation.CategorySexual, "general_nsfw")
+	if *r.FlagAt != 0.4 || *r.BlockAt != 0.7 {
+		t.Errorf("unlisted label must resolve exactly as before: %+v", r)
 	}
 }
 
-// scene_threshold and mpdecimate_frac must be in (0, 1] — lower bound EXCLUSIVE.
-// An explicit 0 is degenerate (videosift re-defaults 0 -> 0.4 / 0.33), so it is
-// rejected at Load alongside <0 and >1; in-range is accepted. An ABSENT key is
-// fine: setDefaults seeds both, so validate sees the resolved default (see
-// TestLoadFramesTuningDefaultsWhenAbsent / TestLoadDefaults which exercise absent
-// keys).
+func TestProviderModeOffIgnoresLabels(t *testing.T) {
+	base := Thresholds{"default": {FlagAt: f64(0.5), BlockAt: f64(0.8)}}
+	th := base.Merge(ProviderThresholds{
+		Mode:   ProviderModeOff,
+		Labels: Thresholds{"yes_gambling": {FlagAt: f64(0.1)}},
+	})
+	r := th.ResolveFor(moderation.CategoryOther, "yes_gambling")
+	if *r.FlagAt != 0.5 {
+		t.Errorf("mode=off must ignore labels entirely: %+v", r)
+	}
+}
+
+func TestProviderModeOverrideDropsCategories(t *testing.T) {
+	base := Thresholds{
+		"default": {FlagAt: f64(0.5), BlockAt: f64(0.8)},
+		"SEXUAL":  {FlagAt: f64(0.4), BlockAt: f64(0.7)},
+	}
+	th := base.Merge(ProviderThresholds{
+		Mode:   ProviderModeOverride,
+		Labels: Thresholds{"yes_gambling": {FlagAt: f64(0.9), BlockAt: f64(0.95)}},
+	})
+	r := th.ResolveFor(moderation.CategoryOther, "yes_gambling")
+	if *r.FlagAt != 0.9 || *r.BlockAt != 0.95 {
+		t.Errorf("configured label must apply in override mode: %+v", r)
+	}
+	// The documented consequence: an unconfigured label has NO boundaries
+	// in override mode, so it cannot flag or block. Category and default
+	// are gone.
+	r = th.ResolveFor(moderation.CategorySexual, "general_nsfw")
+	if r.FlagAt != nil || r.BlockAt != nil {
+		t.Errorf("override mode must drop category and default thresholds: %+v", r)
+	}
+}
+
+func TestProviderThresholdValidation(t *testing.T) {
+	cfg := Defaults()
+	cfg.ProviderThresholds = ProviderThresholds{Mode: "sometimes"}
+	if err := Validate(cfg); err == nil {
+		t.Error("unknown mode must fail validation")
+	}
+	// override with no labels disarms the classifier entirely.
+	cfg.ProviderThresholds = ProviderThresholds{Mode: ProviderModeOverride}
+	if err := Validate(cfg); err == nil {
+		t.Error("override mode with no labels must fail validation")
+	}
+	// labels configured but mode left off is a silent no-op, so it is an error.
+	cfg.ProviderThresholds = ProviderThresholds{Labels: Thresholds{"a": {FlagAt: f64(0.5)}}}
+	if err := Validate(cfg); err == nil {
+		t.Error("labels without a mode must fail validation rather than be ignored")
+	}
+	cfg.ProviderThresholds = ProviderThresholds{
+		Mode:   ProviderModeHybrid,
+		Labels: Thresholds{"a": {FlagAt: f64(1.5)}},
+	}
+	if err := Validate(cfg); err == nil {
+		t.Error("out-of-range label threshold must fail validation")
+	}
+}
+
+// TestUnarmedLabelsLoad pins how an operator writes down "this label is
+// reviewed and deliberately has no boundaries".
 //
-// temporal_interval/mpdecimate_hi/mpdecimate_lo share the same reject-0 contract:
-// videosift re-defaults their explicit 0 (2.0 / 768 / 320), so a typed 0 is
-// silently swapped — Load rejects <= 0. hamming_threshold/hash_resize_width are
-// the exception: videosift honors their 0 as a "disable" signal (dedup / rescale
-// off), so 0 must PASS Load and only < 0 is rejected.
-func TestValidateFramesRanges(t *testing.T) {
+// It cannot be spelled `some_label: {}` under labels: viper drops a yaml
+// key whose value has no scalar leaf, so the entry never reaches the
+// decoded struct at all (verified 2026-07-29 against `{}`, a nil value,
+// `null`, and `flag_at: null` — every one loses the key). Hence the
+// explicit unarmed_labels list, which viper does carry. Load folds each
+// name in as a keyed entry with no boundaries, so the boot-time
+// completeness check in internal/cli sees a KEY and config_hash covers the
+// decision.
+func TestUnarmedLabelsLoad(t *testing.T) {
 	dir := t.TempDir()
-	reject := map[string]string{
-		"scene_threshold zero": "frames:\n  max_frames: 10\n  scene_threshold: 0.0\n",
-		"scene_threshold neg":  "frames:\n  max_frames: 10\n  scene_threshold: -0.1\n",
-		"scene_threshold high": "frames:\n  max_frames: 10\n  scene_threshold: 1.5\n",
-		"mpdecimate_frac zero": "frames:\n  max_frames: 10\n  mpdecimate_frac: 0.0\n",
-		"mpdecimate_frac neg":  "frames:\n  max_frames: 10\n  mpdecimate_frac: -0.2\n",
-		"mpdecimate_frac high": "frames:\n  max_frames: 10\n  mpdecimate_frac: 2.0\n",
-		// videosift re-defaults an explicit 0 for these, so a typed 0 is silently
-		// swapped — reject <= 0.
-		"temporal_interval zero": "frames:\n  max_frames: 10\n  temporal_interval: 0.0\n",
-		"temporal_interval neg":  "frames:\n  max_frames: 10\n  temporal_interval: -1.0\n",
-		"mpdecimate_hi zero":     "frames:\n  max_frames: 10\n  mpdecimate_hi: 0\n",
-		"mpdecimate_hi neg":      "frames:\n  max_frames: 10\n  mpdecimate_hi: -1\n",
-		"mpdecimate_lo zero":     "frames:\n  max_frames: 10\n  mpdecimate_lo: 0\n",
-		"mpdecimate_lo neg":      "frames:\n  max_frames: 10\n  mpdecimate_lo: -1\n",
-		// hamming_threshold/hash_resize_width honor 0 as "disable"; only < 0 is invalid.
-		"hamming_threshold neg": "frames:\n  max_frames: 10\n  hamming_threshold: -1\n",
-		"hash_resize_width neg": "frames:\n  max_frames: 10\n  hash_resize_width: -1\n",
+	path := filepath.Join(dir, "vismod.yaml")
+	yaml := `
+adapter:
+  name: shieldgemma
+provider_thresholds:
+  mode: override
+  labels:
+    sexually_explicit:
+      flag_at: 0.6
+  unarmed_labels:
+    - dangerous_content
+ffmpeg:
+  max_frames: 8
+queue:
+  driver: memory
+`
+	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
 	}
-	for name, yaml := range reject {
-		t.Run("reject "+name, func(t *testing.T) {
-			path := filepath.Join(dir, name+".yaml")
-			if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := Load(path); err == nil {
-				t.Fatalf("expected range error for %q", name)
-			}
-		})
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
 	}
-	t.Run("in-range accepted", func(t *testing.T) {
-		path := filepath.Join(dir, "in-range.yaml")
-		yaml := "frames:\n  max_frames: 10\n  scene_threshold: 0.4\n  mpdecimate_frac: 0.33\n"
-		if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := Load(path); err != nil {
-			t.Fatalf("in-range scene_threshold/mpdecimate_frac must be accepted: %v", err)
-		}
-	})
-	// The disable contract must not regress: hamming_threshold:0 (dedup off) and
-	// hash_resize_width:0 (rescale off) are valid values videosift honors, so Load
-	// must accept them.
-	t.Run("hamming/resize zero accepted (disable)", func(t *testing.T) {
-		path := filepath.Join(dir, "disable.yaml")
-		yaml := "frames:\n  max_frames: 10\n  hamming_threshold: 0\n  hash_resize_width: 0\n"
-		if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := Load(path); err != nil {
-			t.Fatalf("hamming_threshold:0 / hash_resize_width:0 must be accepted (disable): %v", err)
-		}
-	})
-}
-
-func TestConfigHashDeterministicAndSensitive(t *testing.T) {
-	c, _ := Load("")
-	base := c.ConfigHash("v1")
-
-	if base != c.ConfigHash("v1") {
-		t.Fatal("ConfigHash not deterministic for identical inputs")
+	entry, ok := cfg.ProviderThresholds.Labels["dangerous_content"]
+	if !ok {
+		t.Fatal("an unarmed_labels entry must appear as a keyed label")
 	}
-	if base == c.ConfigHash("v2") {
-		t.Fatal("ConfigHash must change with model version")
+	if entry.FlagAt != nil || entry.BlockAt != nil {
+		t.Errorf("an unarmed label must have NO boundaries: %+v", entry)
 	}
-
-	c2, _ := Load("")
-	c2.Thresholds.Default.BlockAt = 0.99
-	if base == c2.ConfigHash("v1") {
-		t.Fatal("ConfigHash must change when a verdict-affecting threshold changes")
+	// It reaches the merged runtime map, so config_hash changes with the
+	// decision and the tuning stays attributable.
+	if _, ok := cfg.Thresholds[ProviderLabelKey("dangerous_content")]; !ok {
+		t.Error("an unarmed label must still reach the merged map")
+	}
+	// And it stays unable to flag or block, which is the whole point.
+	r := cfg.Thresholds.ResolveFor(moderation.CategoryOther, "dangerous_content")
+	if r.FlagAt != nil || r.BlockAt != nil {
+		t.Errorf("an unarmed label must not acquire boundaries: %+v", r)
 	}
 }
 
-func TestModelFingerprintDeterministicAndSensitive(t *testing.T) {
-	c, _ := Load("")
-	base := c.ModelFingerprint()
-
-	if base != c.ModelFingerprint() {
-		t.Fatal("ModelFingerprint not deterministic for identical inputs")
+func TestUnarmedLabelValidation(t *testing.T) {
+	cfg := Defaults()
+	// Armed and unarmed at once is a contradiction, not a precedence puzzle.
+	cfg.ProviderThresholds = ProviderThresholds{
+		Mode:          ProviderModeOverride,
+		Labels:        Thresholds{"a": {FlagAt: f64(0.5)}},
+		UnarmedLabels: []string{"a"},
 	}
-
-	// Sensitive to the adapter name (the deployed model).
-	cName, _ := Load("")
-	cName.Adapter.Name = "azure"
-	if base == cName.ModelFingerprint() {
-		t.Fatal("ModelFingerprint must change when adapter.name changes")
+	if err := Validate(cfg); err == nil {
+		t.Error("a label that is both armed and unarmed must fail validation")
 	}
-
-	// Sensitive to a verdict-affecting adapter.options key (api_version/endpoint/
-	// auth_mode/model live here, so a model change => different fingerprint).
-	cOpt, _ := Load("")
-	cOpt.Adapter.Options = map[string]any{"api_version": "2024-09-01"}
-	if base == cOpt.ModelFingerprint() {
-		t.Fatal("ModelFingerprint must change when a verdict-affecting adapter.options key changes")
+	// Unarmed labels with no mode are a silent no-op, like labels.
+	cfg.ProviderThresholds = ProviderThresholds{UnarmedLabels: []string{"a"}}
+	if err := Validate(cfg); err == nil {
+		t.Error("unarmed_labels without a mode must fail validation")
 	}
-
-	// Sensitive to a verdict-affecting threshold.
-	cThr, _ := Load("")
-	cThr.Thresholds.Default.BlockAt = 0.99
-	if base == cThr.ModelFingerprint() {
-		t.Fatal("ModelFingerprint must change when a threshold changes")
+	// Override mode is satisfied by unarmed labels alone only if something
+	// else is armed: an all-unarmed override can never flag or block.
+	cfg.ProviderThresholds = ProviderThresholds{
+		Mode:          ProviderModeOverride,
+		UnarmedLabels: []string{"a"},
 	}
-
-	// Distinct purpose from ConfigHash — do NOT collapse the two.
-	if c.ModelFingerprint() == c.ConfigHash("v1") {
-		t.Fatal("ModelFingerprint and ConfigHash must be distinct hashes")
+	if err := Validate(cfg); err == nil {
+		t.Error("override mode with only unarmed labels must fail validation")
 	}
 }
 
-// Each verdict-affecting key, changed in isolation, must move the fingerprint.
-// Guards against a whitelist that silently drops a key (e.g. endpoint/auth_mode/
-// model) and stops guarding a real model swap.
-func TestModelFingerprintSensitiveToEachVerdictKey(t *testing.T) {
-	for _, key := range []string{"api_version", "model", "model_id", "endpoint", "auth_mode"} {
-		base, _ := Load("")
-		baseFP := base.ModelFingerprint()
-
-		c, _ := Load("")
-		c.Adapter.Options = map[string]any{key: "changed-value"}
-		if baseFP == c.ModelFingerprint() {
-			t.Errorf("ModelFingerprint must change when verdict key %q is set", key)
-		}
+func TestOutputDefaultsToStdout(t *testing.T) {
+	cfg, err := Load(writeTempYAML(t, `
+ffmpeg:
+  max_frames: 8
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Output.Sinks) != 1 || cfg.Output.Sinks[0].Type != "stdout" {
+		t.Errorf("absent output block must default to stdout, got %+v", cfg.Output.Sinks)
 	}
 }
 
-// Operational-only knobs (rps, max_retries, timeout, retry/backoff) have no
-// verdict impact. Tuning them in a rolling deploy must NOT change the fingerprint,
-// or it would spuriously trip the §L dead-letter guard.
-func TestModelFingerprintIgnoresOperationalKeys(t *testing.T) {
-	base, _ := Load("")
-	baseFP := base.ModelFingerprint()
+func TestOutputSinksParse(t *testing.T) {
+	cfg, err := Load(writeTempYAML(t, `
+ffmpeg:
+  max_frames: 8
+output:
+  sinks:
+    - type: stdout
+    - type: file
+      path: /tmp/results.jsonl
+    - type: webhook
+      url: https://collector.internal/results
+      timeout: 5s
+      max_attempts: 4
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Output.Sinks) != 3 {
+		t.Fatalf("want 3 sinks, got %d", len(cfg.Output.Sinks))
+	}
+	if cfg.Output.Sinks[1].Path != "/tmp/results.jsonl" {
+		t.Errorf("file path: got %q", cfg.Output.Sinks[1].Path)
+	}
+	if cfg.Output.Sinks[2].Timeout != 5*time.Second || cfg.Output.Sinks[2].MaxAttempts != 4 {
+		t.Errorf("webhook opts: got %+v", cfg.Output.Sinks[2])
+	}
+}
 
-	for _, kv := range []map[string]any{
-		{"rps": 50.0},
-		{"max_retries": 7},
-		{"timeout": "30s"},
-		{"retry_backoff": "500ms"},
+func TestOutputSinkNegativeCases(t *testing.T) {
+	for name, body := range map[string]string{
+		"unknown type": `
+output:
+  sinks:
+    - type: carrier-pigeon
+`,
+		"file without path": `
+output:
+  sinks:
+    - type: file
+`,
+		"webhook without url": `
+output:
+  sinks:
+    - type: webhook
+`,
+		"webhook with userinfo": `
+output:
+  sinks:
+    - type: webhook
+      url: https://user:pw@collector.internal/results
+`,
+		"webhook on metadata range": `
+output:
+  sinks:
+    - type: webhook
+      url: http://169.254.169.254/results
+`,
+		"negative max_attempts": `
+output:
+  sinks:
+    - type: webhook
+      url: https://collector.internal/results
+      max_attempts: -1
+`,
+		// SECURITY.md's operator-endpoint rules: http is inward-only.
+		"plaintext http to a public hostname": `
+output:
+  sinks:
+    - type: webhook
+      url: http://collector.example.com/results
+`,
+		"plaintext http to a public IP literal": `
+output:
+  sinks:
+    - type: webhook
+      url: http://203.0.113.10/results
+`,
 	} {
-		c, _ := Load("")
-		c.Adapter.Options = kv
-		if baseFP != c.ModelFingerprint() {
-			t.Errorf("ModelFingerprint must NOT change for operational-only option %v", kv)
-		}
-	}
-}
-
-// A verdict key must dominate: even alongside operational noise, only the
-// verdict key's value drives the fingerprint, and operational churn around a
-// fixed verdict key leaves it stable.
-func TestModelFingerprintScopesToVerdictKeysOnly(t *testing.T) {
-	withNoise := func(rps float64, retries int) Config {
-		c, _ := Load("")
-		c.Adapter.Options = map[string]any{
-			"endpoint":    "https://x.cognitiveservices.azure.com",
-			"api_version": "2024-09-01",
-			"rps":         rps,
-			"max_retries": retries,
-		}
-		return c
-	}
-	a := withNoise(10, 3)
-	b := withNoise(99, 1) // same verdict keys, different operational knobs
-	if a.ModelFingerprint() != b.ModelFingerprint() {
-		t.Fatal("ModelFingerprint must ignore operational knobs when verdict keys match")
-	}
-}
-
-// The #1 correctness landmine: adapter.options is a map[string]any, and naive Go
-// map formatting yields random key order => a non-deterministic hash => replicas
-// with identical config dead-letter each other. json.Marshal sorts keys
-// recursively, so the fingerprint must be invariant to map insertion order, even
-// for nested maps.
-func TestModelFingerprintStableAcrossOptionMapOrder(t *testing.T) {
-	mk := func(build func(m map[string]any)) Config {
-		c, _ := Load("")
-		opts := map[string]any{}
-		build(opts)
-		c.Adapter.Options = opts
-		return c
-	}
-
-	// Same logical options, keys inserted in two different orders, with a nested map.
-	a := mk(func(m map[string]any) {
-		m["api_version"] = "2024-09-01"
-		m["endpoint"] = "https://x.cognitiveservices.azure.com"
-		m["retry"] = map[string]any{"max": 3, "backoff": "500ms"}
-	})
-	b := mk(func(m map[string]any) {
-		m["retry"] = map[string]any{"backoff": "500ms", "max": 3}
-		m["endpoint"] = "https://x.cognitiveservices.azure.com"
-		m["api_version"] = "2024-09-01"
-	})
-
-	if a.ModelFingerprint() != b.ModelFingerprint() {
-		t.Fatal("ModelFingerprint must be invariant to adapter.options map key order (incl. nested)")
-	}
-}
-
-// --- Adapter-option registry guard (PR #14 issue 5: whitelist fail-open) ---
-//
-// verdictAffectingOptionKeys is FAIL-OPEN: an adapter.options key absent from it
-// is silently un-guarded by ModelFingerprint, so a model swap via that key could
-// slip a rolling deploy without dead-lettering (§L). The registry below is the
-// single source of truth that partitions EVERY known adapter.options key into
-// verdict-affecting vs operational-only; these tests back the 🔴 MAINTENANCE
-// comment in load.go with a mechanical check so adding a key without classifying
-// it fails CI instead of going unguarded.
-
-// TestOptionRegistryPartitionWellFormed asserts the two partitions of the
-// registry are internally consistent: each is sorted with no duplicates, and no
-// key is classified as BOTH verdict-affecting and operational (which would make
-// the classification ambiguous). verdictAffectingOptionKeys must equal the
-// verdict partition so ModelFingerprint stays derived from — not divergent
-// from — the registry.
-func TestOptionRegistryPartitionWellFormed(t *testing.T) {
-	assertSortedUnique := func(name string, keys []string) {
-		t.Helper()
-		seen := map[string]bool{}
-		for i, k := range keys {
-			if seen[k] {
-				t.Errorf("%s contains duplicate key %q", name, k)
+		t.Run(name, func(t *testing.T) {
+			if _, err := Load(writeTempYAML(t, "ffmpeg:\n  max_frames: 8\n"+body)); err == nil {
+				t.Fatal("want boot refusal, got nil error")
 			}
-			seen[k] = true
-			if i > 0 && keys[i-1] > k {
-				t.Errorf("%s is not sorted: %q before %q", name, keys[i-1], k)
+		})
+	}
+}
+
+// TestOutputEmptySinkListRefusesBoot pins the observed viper behavior for
+// `output.sinks: []`: unlike a map key with no scalar leaf (which viper
+// drops before decoding — see the unarmed_labels gotcha above), an empty
+// YAML LIST survives decoding as a genuine zero-length slice. Load must
+// therefore refuse to boot rather than silently falling back to the
+// stdout default (probed empirically 2026-07-31: Load returned
+// len(cfg.Output.Sinks)==0 and a non-nil error).
+func TestOutputEmptySinkListRefusesBoot(t *testing.T) {
+	_, err := Load(writeTempYAML(t, "ffmpeg:\n  max_frames: 8\noutput:\n  sinks: []\n"))
+	if err == nil {
+		t.Fatal("an explicitly empty sinks list must refuse to boot")
+	}
+	if !strings.Contains(err.Error(), "output.sinks") {
+		t.Errorf("error must name the offending key, got %v", err)
+	}
+}
+
+func TestConfigHashCoversProviderThresholds(t *testing.T) {
+	base := Thresholds{"default": {FlagAt: f64(0.5), BlockAt: f64(0.8)}}
+	h1 := ConfigHash("hive", "v2", base)
+	h2 := ConfigHash("hive", "v2", base.Merge(ProviderThresholds{
+		Mode:   ProviderModeHybrid,
+		Labels: Thresholds{"yes_gambling": {FlagAt: f64(0.9)}},
+	}))
+	if h1 == h2 {
+		t.Error("a provider-label threshold must change ConfigHash, or the audit trail cannot attribute the verdict")
+	}
+}
+
+// TestOutputWebhookPlaintextInwardIsAllowed pins the other half of the
+// http rule fixed alongside the public-host refusal: a receiver on
+// loopback or an RFC 1918 range is exactly the deployment `http` exists
+// for, and must keep booting. Same rule set as the shieldgemma adapter's
+// validateEndpoint.
+func TestOutputWebhookPlaintextInwardIsAllowed(t *testing.T) {
+	for _, u := range []string{
+		"http://localhost:9000/results",
+		"http://collector.localhost/results",
+		"http://127.0.0.1:9000/results",
+		"http://10.1.2.3/results",
+		"http://192.168.4.5:8080/results",
+		"https://collector.example.com/results",
+	} {
+		t.Run(u, func(t *testing.T) {
+			body := "ffmpeg:\n  max_frames: 8\noutput:\n  sinks:\n    - type: webhook\n      url: " + u + "\n"
+			if _, err := Load(writeTempYAML(t, body)); err != nil {
+				t.Fatalf("want boot, got %v", err)
 			}
-		}
-	}
-	assertSortedUnique("verdictAffectingOptionKeys", verdictAffectingOptionKeys)
-	assertSortedUnique("operationalOptionKeys", operationalOptionKeys)
-
-	verdict := map[string]bool{}
-	for _, k := range verdictAffectingOptionKeys {
-		verdict[k] = true
-	}
-	for _, k := range operationalOptionKeys {
-		if verdict[k] {
-			t.Errorf("key %q is classified as BOTH verdict-affecting and operational", k)
-		}
-	}
-}
-
-// TestKnownOptionKeysPinned pins the EXACT full set of classified adapter.options
-// keys. This is the mechanical guard the 🔴 MAINTENANCE comment relies on: adding
-// a new key that an adapter reads (see internal/moderate/adapters/*/options.go)
-// without adding it to the registry — i.e. without DELIBERATELY classifying it as
-// verdict-affecting or operational — fails here. The fix is never to edit this
-// expectation blindly; it is to decide "does this key change the score a model
-// returns?" and put it in the right partition, then update this pin in the SAME
-// commit. The keys mirror what azure/hive decodeOptions actually read today:
-// azure → endpoint, auth_mode, api_version, rps, max_retries, retry_backoff;
-// hive → endpoint, rps, max_retries, retry_backoff; plus the forward-looking
-// verdict selectors model/model_id and the documented operational knob timeout.
-func TestKnownOptionKeysPinned(t *testing.T) {
-	want := map[string]bool{
-		// verdict-affecting
-		"api_version": true,
-		"auth_mode":   true,
-		"endpoint":    true,
-		"model":       true,
-		"model_id":    true,
-		// operational-only
-		"max_retries":   true,
-		"retry_backoff": true,
-		"rps":           true,
-		"timeout":       true,
-	}
-	got := map[string]bool{}
-	for _, k := range knownOptionKeys() {
-		got[k] = true
-	}
-	for k := range want {
-		if !got[k] {
-			t.Errorf("known option key %q missing from registry — classify it in load.go", k)
-		}
-	}
-	for k := range got {
-		if !want[k] {
-			t.Errorf("registry has unpinned key %q — add it here and confirm its partition", k)
-		}
-	}
-}
-
-func TestExampleConfigLoads(t *testing.T) {
-	// The shipped example must be valid.
-	if _, err := Load(filepath.Join("..", "..", "config.example.yaml")); err != nil {
-		t.Fatalf("config.example.yaml failed to load: %v", err)
-	}
-}
-
-func TestRedisDriverRequiresAddr(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "c.yaml")
-	if err := os.WriteFile(path, []byte("queue:\n  driver: redis\n  redis_addr: \"\"\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := Load(path); err == nil {
-		t.Fatal("redis driver with empty redis_addr must fail validation")
+		})
 	}
 }

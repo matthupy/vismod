@@ -1,448 +1,474 @@
-// Package pipeline orchestrates one job end-to-end:
+// Package pipeline wires the per-job flow:
 //
-//	HashMatcher pre-stage -> frames -> per-frame fan-out -> Moderator ->
-//	normalize (thresholds) -> asset rollup -> Sink.
+//	frames -> bounded fan-out -> Moderator
+//	  -> normalize/thresholds -> rollup -> Sink -> ack/DLQ
 //
-// It is fail-safe: any provider/frame/extraction failure yields Verdict=error,
-// never allow. Per-frame errors never cancel sibling frames (each frame is an
-// independent evidence sample).
+// Retry policy: transient provider errors (429/5xx/timeouts) are retried
+// with bounded backoff inside the adapter's HTTP client; once those are
+// exhausted a frame error is final and the job dead-letters with
+// Verdict=error (fail safe — never allow). The queue-level Retry
+// disposition is reserved for job-level transient infrastructure failures
+// (e.g. Sink write errors), where no result has been emitted yet.
 package pipeline
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
-	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
-	"github.com/matthupy/vismod/internal/audit"
-	"github.com/matthupy/vismod/internal/config"
-	"github.com/matthupy/vismod/internal/frames"
-	"github.com/matthupy/vismod/internal/result"
-	"github.com/matthupy/vismod/internal/review"
-	"github.com/matthupy/vismod/pkg/moderation"
 	"golang.org/x/sync/errgroup"
+
+	"github.com/vismod/vismod/internal/config"
+	"github.com/vismod/vismod/internal/frames"
+	"github.com/vismod/vismod/internal/queue"
+	"github.com/vismod/vismod/internal/result"
+	"github.com/vismod/vismod/pkg/moderation"
 )
 
-// JobRecorder counts finished jobs by overall verdict for observability
-// (§F.6 vismod_jobs_total{verdict}). Optional — a nil Metrics is a no-op, so
-// the one-shot scan path needs no metrics server. observe.Metrics satisfies it.
-type JobRecorder interface {
-	RecordJob(verdict moderation.Verdict)
+// AuditSink receives one audit record per completed job. Implementations
+// must be idempotent per JobID. Nil disables auditing.
+type AuditSink interface {
+	Record(ctx context.Context, env result.ResultEnvelope) error
 }
 
-// Deduper provides durable cross-process once-only job recording (§L, issue #9).
-// Optional: a nil Deduper falls back to the in-memory Sink/audit guards — the
-// single-process scan/memq path. The redis-backed impl (internal/dedup) makes
-// dedup survive a restart and span replicas under the at-least-once redis queue.
-//
-// ORDERING: Process checks Done BEFORE the writes and calls Commit only AFTER
-// Sink+audit succeed (write-then-commit) — fail-safe: a crash before Commit
-// redelivers and redoes the job, never a silent loss.
-type Deduper interface {
-	Done(ctx context.Context, jobID string) (bool, error)
-	Commit(ctx context.Context, jobID string) error
+// EventSink records operational audit events (audit.Log satisfies it).
+type EventSink interface {
+	AppendEvent(kind string, fields map[string]string) error
 }
 
-// DivertFailureRecorder counts flagged-frame diverts that failed to reach the
-// review channel (§G.8 vismod_divert_failures_total). It is an OPTIONAL
-// capability discovered by type-asserting the wired Metrics — a recorder that
-// does not implement it (or a nil Metrics) makes the bump a no-op, so the divert
-// stays fail-safe. observe.Metrics satisfies it.
-type DivertFailureRecorder interface {
-	RecordDivertFailure()
-}
+// errEmptyVideoSkipped signals the gated §F.5 override path: zero frames
+// extracted AND the operator enabled allow_empty_video_skip. The job is
+// acked with NO verdict emitted (an operational skip, not a Verdict
+// value) and a prominent audit event.
+var errEmptyVideoSkipped = errors.New("empty video skipped by operator override")
 
-// Pipeline holds the wired dependencies for processing jobs. One active
-// Moderator per process; its shared rate limiter (M1) gates all fan-out.
+// Pipeline processes jobs. All collaborators sit behind interfaces and
+// swap via config with zero call-site changes.
 type Pipeline struct {
-	Moderator moderation.Moderator
-	Frames    frames.FrameSource
-	Matcher   moderation.HashMatcher
-	Sink      result.Sink
-	Cfg       config.Config
-	Log       *slog.Logger
-	Metrics   JobRecorder     // optional; nil = no metrics
-	Audit     *audit.Log      // optional; nil = no audit trail (CLI scan default)
-	Diverter  review.Diverter // optional; nil = no flagged-frame divert (§G.8)
-	Dedup     Deduper         // optional; nil = in-memory guards only (scan/memq)
+	Moderator   moderation.Moderator
+	FrameSource frames.FrameSource
+	Sink        result.Sink
+	Audit       AuditSink
+	Thresholds  config.Thresholds
+	Concurrency int // frame fan-out bound (frames.concurrency)
+	ModelID     result.ModelIdentity
+	Log         *slog.Logger
+	// Events receives operational audit events (gated override use).
+	Events EventSink
+	// AllowEmptyVideoSkip enables the audited §F.5 zero-frames override.
+	AllowEmptyVideoSkip bool
+	// Dedup enables the post-extraction near-duplicate filter; frames
+	// within DedupThreshold Hamming distance (dHash) of a kept frame are
+	// dropped before the moderation fan-out.
+	Dedup          bool
+	DedupThreshold int
+	// MaxScanFrames caps frames per video reaching the moderation
+	// fan-out, applied AFTER post-processing (dedup) so duplicates are
+	// removed before anything is cut for budget. 0 = no cap.
+	MaxScanFrames int
 }
 
-// Process handles one job: it builds and writes the ResultEnvelope to the Sink.
-// The returned error is non-nil only on an infrastructure failure that should
-// be retried/dead-lettered by the caller; a "could not evaluate" decision is a
-// successful write of an error-verdict envelope (fail-safe).
-func (p *Pipeline) Process(ctx context.Context, jobID result.JobID, src moderation.Source) error {
-	started := time.Now().UTC()
-
-	// Cross-process dedup gate (§L, issue #9): skip a job already durably
-	// recorded so a redelivery to a fresh process/replica does not re-analyze or
-	// double-write the Sink/audit. A Done error is an infra failure, not a
-	// verdict — return it so the job is retried/dead-lettered (never auto-allow,
-	// never silently skip).
-	if p.Dedup != nil {
-		done, err := p.Dedup.Done(ctx, string(jobID))
-		if err != nil {
-			return fmt.Errorf("dedup done check: %w", err)
-		}
-		if done {
-			return nil
-		}
+func (p *Pipeline) log() *slog.Logger {
+	if p.Log != nil {
+		return p.Log
 	}
+	return slog.Default()
+}
 
-	mediaType := detectMediaType(src)
-	meta := jobMeta{ID: string(jobID), AssetID: assetID(jobID, src)}
-	res, procErr := p.analyze(ctx, mediaType, src, meta)
+// Handler adapts Process to the queue.Handler signature.
+func (p *Pipeline) Handler() queue.Handler {
+	return func(ctx context.Context, j queue.Job) (queue.Disposition, error) {
+		return p.Process(ctx, j)
+	}
+}
 
-	// Stamp normalizer-owned provenance fields.
-	res.SchemaVersion = moderation.SchemaVersion
-	res.Provider = p.Moderator.Name()
-	res.MediaType = mediaType
-	res.AssetID = assetID(jobID, src)
+// Process runs one job end-to-end and maps the outcome to a Disposition.
+func (p *Pipeline) Process(ctx context.Context, j queue.Job) (queue.Disposition, error) {
+	_, disp, err := p.ProcessJob(ctx, j)
+	return disp, err
+}
 
-	// Apply thresholds and roll up the asset verdict.
-	p.applyThresholds(&res)
-	res.Overall = p.rollup(res.Frames)
+// ProcessJob is Process plus the emitted envelope (used by the one-shot
+// CLI for exit codes).
+func (p *Pipeline) ProcessJob(ctx context.Context, j queue.Job) (result.ResultEnvelope, queue.Disposition, error) {
+	started := time.Now().UTC()
+	p.log().Info("job started",
+		"job_id", j.ID, "adapter", p.ModelID.Adapter,
+		"media_type", j.Source.MediaType, "ref", j.Source.Ref,
+		"workflows", workflowsLabel(j.Workflows))
 
-	env := result.ResultEnvelope{
-		JobID:  jobID,
-		Source: src,
-		ModelID: result.ModelIdentity{
-			Adapter:      p.Moderator.Name(),
-			ModelVersion: res.ModelVersion,
-			ConfigHash:   p.Cfg.ConfigHash(res.ModelVersion),
-		},
-		Result:     &res,
-		StartedAt:  started.Format(time.RFC3339),
-		FinishedAt: time.Now().UTC().Format(time.RFC3339),
+	var res moderation.NormalizedResult
+	var procErr error
+	switch j.Source.MediaType {
+	case "video":
+		res, procErr = p.processVideo(ctx, j)
+	default:
+		res, procErr = p.processImage(ctx, j)
+	}
+	if errors.Is(procErr, errEmptyVideoSkipped) {
+		// Gated §F.5 override: ack with no verdict, prominent audit event.
+		p.log().Warn("OPERATOR OVERRIDE: empty video skipped without verdict (failsafe.allow_empty_video_skip)",
+			"job_id", j.ID, "asset", j.Source.Ref)
+		if p.Events != nil {
+			if err := p.Events.AppendEvent("empty_video_skip_override", map[string]string{
+				"job_id":      string(j.ID),
+				"asset_id":    j.Source.Ref,
+				"adapter":     p.ModelID.Adapter,
+				"config_hash": p.ModelID.ConfigHash,
+			}); err != nil {
+				return result.ResultEnvelope{}, queue.DeadLetter, fmt.Errorf("override audit event failed: %w", err)
+			}
+		}
+		return result.ResultEnvelope{JobID: j.ID, Source: j.Source, ModelID: p.ModelID, StartedAt: started, FinishedAt: time.Now().UTC()}, queue.Ack, nil
 	}
 	if procErr != nil {
-		env.Error = procErr.Error()
+		// Could-not-evaluate before any per-frame evidence existed
+		// (unreadable input, extraction failure, zero frames). Fail safe:
+		// error verdict, dead-letter, never allow.
+		res = p.errorResult(j, procErr)
+	}
+
+	// Stamp normalizer-owned fields (the adapter leaves them empty).
+	res.SchemaVersion = moderation.SchemaVersion
+	if res.AssetID = j.Source.Ref; res.AssetID == "" {
+		res.AssetID = string(j.ID)
+	}
+	if res.MediaType == "" {
+		res.MediaType = j.Source.MediaType
+	}
+	res.Overall = Rollup(res.Frames, p.Thresholds)
+
+	env := result.ResultEnvelope{
+		JobID:      j.ID,
+		Source:     j.Source,
+		ModelID:    p.ModelID,
+		Result:     &res,
+		StartedAt:  started,
+		FinishedAt: time.Now().UTC(),
+	}
+	if res.Overall.Verdict == moderation.VerdictError {
+		env.Error = p.frameErrors(res.Frames, procErr)
 	}
 
 	if err := p.Sink.Write(ctx, env); err != nil {
-		return fmt.Errorf("sink write: %w", err)
+		// With MultiSink an error does NOT mean nothing was emitted: every
+		// sink is attempted, so some may already have written. Retry is
+		// safe because each sink is idempotent per JobID within this
+		// process — not because the write did not happen. Note the audit
+		// record is NOT written on this path; see the sink gotcha in
+		// AGENTS.md before changing this disposition.
+		return env, queue.Retry, fmt.Errorf("sink write: %w", err)
 	}
-
-	// Tamper-evident audit (§G.5): bind the decision to its inputs BY HASH after
-	// the Sink commits. Idempotent per JobID within one process (in-memory `seen`),
-	// so in-process retry never double-appends. Stores SHA-256(Raw) + ModelIdentity
-	// + verdict — NEVER Raw itself (§G.2). An audit failure is an infra error: the
-	// job is retried (Sink and audit are both idempotent per JobID, so retry is
-	// safe). SEQUENTIAL cross-process redelivery (a fresh process/replica picking
-	// up the job AFTER the first worker died) is gated earlier by p.Dedup so it
-	// never reaches this append twice (§L, issue #9). KNOWN RESIDUAL: the gate
-	// orders writes vs. the durable claim but provides NO mutual exclusion, so it
-	// does not stop a genuinely CONCURRENT second worker (asynq lease-recovery can
-	// re-queue a job past JobTimeout while the first goroutine is still draining
-	// after ctx-cancel — both see Done=false). That overlap, like a crash strictly
-	// between the writes and Commit, is an accepted v1 residual; a SETNX claim/lease
-	// (Deduper godoc, design doc) is the future hardening seam if it must close.
-	// SEPARATE CONCERN: the dedup gate only covers SAME-job redelivery. It does
-	// NOT cover DIFFERENT-job concurrent writers across replicas appending to ONE
-	// shared audit chain file — audit.Log idempotency/ordering is a per-process
-	// `mu` only (see audit.Log godoc). Deployment invariant: each replica owns its
-	// own chain file (or audit writers are serialized) before sharing one.
 	if p.Audit != nil {
-		pl := audit.Payload{
-			JobID:        string(jobID),
-			Verdict:      string(res.Overall.Verdict),
-			RawSHA256:    audit.RawSHA256(res.Raw),
-			Adapter:      env.ModelID.Adapter,
-			ModelVersion: env.ModelID.ModelVersion,
-			ConfigHash:   env.ModelID.ConfigHash,
-		}
-		if _, _, err := p.Audit.Append(pl, env.FinishedAt); err != nil {
-			return fmt.Errorf("audit append: %w", err)
+		if err := p.Audit.Record(ctx, env); err != nil {
+			p.log().Error("audit record failed", "job_id", j.ID, "err", err)
+			return env, queue.DeadLetter, fmt.Errorf("audit append: %w", err)
 		}
 	}
 
-	// Commit the cross-process dedup claim only AFTER Sink+audit succeed
-	// (write-then-commit, §L). A Commit failure is an infra error: return it so
-	// the job retries; the next attempt re-writes (Sink/audit are idempotent per
-	// JobID within a process) and re-commits. Fail-safe: never auto-allow.
-	if p.Dedup != nil {
-		if err := p.Dedup.Commit(ctx, string(jobID)); err != nil {
-			return fmt.Errorf("dedup commit: %w", err)
-		}
-	}
+	p.logScanComplete(j, res, started)
 
-	// Count only AFTER a successful emit. Counting earlier would (a) inflate
-	// jobs_total for a job whose envelope never reached the sink and (b) double
-	// count on queue retry, since a sink-write failure re-runs Process. Recording
-	// here makes vismod_jobs_total = jobs successfully emitted, once each.
-	if p.Metrics != nil {
-		p.Metrics.RecordJob(res.Overall.Verdict)
+	if res.Overall.Verdict == moderation.VerdictError {
+		return env, queue.DeadLetter, fmt.Errorf("verdict=error: %s", env.Error)
 	}
-	return nil
+	return env, queue.Ack, nil
 }
 
-// analyze produces an un-thresholded NormalizedResult (frames + raw categories).
-// It never returns an error that maps to "allow": on failure it returns a
-// result whose frames carry Status=error.
-func (p *Pipeline) analyze(ctx context.Context, mediaType string, src moderation.Source, meta jobMeta) (moderation.NormalizedResult, error) {
-	if mediaType == "video" {
-		// Prefer a video-native adapter when one is present.
-		if vm, ok := p.Moderator.(moderation.VideoModerator); ok && p.Moderator.Capabilities().SupportsVideo {
-			res, err := vm.AnalyzeVideo(ctx, src)
-			if err != nil {
-				return errorResult(nil, err), err
-			}
-			return res, nil
-		}
-		return p.analyzeVideoByFrames(ctx, src, meta)
-	}
-	return p.analyzeImage(ctx, src, meta)
-}
-
-// analyzeImage moderates a single still image (one frame, TimestampSec nil).
-func (p *Pipeline) analyzeImage(ctx context.Context, src moderation.Source, meta jobMeta) (moderation.NormalizedResult, error) {
-	img, err := loadImage(src.Ref)
+// processImage handles a still image: one FrameResult, TimestampSec nil.
+func (p *Pipeline) processImage(ctx context.Context, j queue.Job) (moderation.NormalizedResult, error) {
+	fr, err := p.evaluateFrame(ctx, j.Source.Ref, nil)
 	if err != nil {
-		return errorResult(nil, err), err
+		return moderation.NormalizedResult{}, err
 	}
-	fr := p.moderateFrame(ctx, img, nil, meta)
-	res := moderation.NormalizedResult{Frames: []moderation.FrameResult{fr}}
-	if fr.Status == moderation.FrameStatusError {
-		return res, fmt.Errorf("%s", fr.Error)
-	}
-	return res, nil
+	return moderation.NormalizedResult{
+		Provider:     p.Moderator.Name(),
+		ModelVersion: p.ModelID.ModelVersion,
+		MediaType:    "image",
+		Frames:       []moderation.FrameResult{fr},
+	}, nil
 }
 
-// analyzeVideoByFrames extracts frames, then moderates each as an independent
-// image. One frame's error never cancels its siblings.
-func (p *Pipeline) analyzeVideoByFrames(ctx context.Context, src moderation.Source, meta jobMeta) (moderation.NormalizedResult, error) {
-	fr, cleanup, err := p.Frames.Frames(ctx, src.Ref)
-	// LIFECYCLE: delete the WorkDir on every exit path (error, cancel, panic).
-	defer func() {
-		if cerr := cleanup(); cerr != nil {
-			p.Log.Warn("frame cleanup failed", "err", cerr)
+// processVideo prefers a video-native adapter; otherwise extracts frames
+// and moderates each as an image.
+func (p *Pipeline) processVideo(ctx context.Context, j queue.Job) (moderation.NormalizedResult, error) {
+	if vm, ok := p.Moderator.(moderation.VideoModerator); ok && p.Moderator.Capabilities().SupportsVideo {
+		res, err := vm.AnalyzeVideo(ctx, j.Source)
+		if err != nil {
+			return moderation.NormalizedResult{}, fmt.Errorf("video-native analyze: %w", err)
 		}
-	}()
-	if err != nil {
-		// Extraction failure (incl. ErrNoFrames) is could-not-evaluate -> error,
-		// never allow.
-		return errorResult(nil, fmt.Errorf("frame extraction: %w", err)),
-			fmt.Errorf("frame extraction: %w", err)
-	}
-	if len(fr) == 0 {
-		return errorResult(nil, fmt.Errorf("no frames extracted")),
-			fmt.Errorf("no frames extracted")
+		for i := range res.Frames {
+			res.Frames[i].Categories = ApplyThresholds(res.Frames[i].Categories, p.Thresholds)
+		}
+		return res, nil
 	}
 
-	results := make([]moderation.FrameResult, len(fr))
+	if p.FrameSource == nil {
+		return moderation.NormalizedResult{}, fmt.Errorf("no frame source configured for video input")
+	}
+	fs, cleanup, err := p.FrameSource.Frames(ctx, j.Source.Ref, j.Workflows)
+	if err != nil {
+		if cleanup != nil {
+			p.runCleanup(j.ID, cleanup)
+		}
+		return moderation.NormalizedResult{}, fmt.Errorf("frame extraction: %w", err)
+	}
+	// Lifecycle contract: cleanup is deferred BEFORE any fan-out so the
+	// WorkDir is deleted on every exit path (error, ctx-cancel, panic).
+	defer p.runCleanup(j.ID, cleanup)
+
+	if len(fs) == 0 {
+		// Zero frames is could-not-evaluate, never clean: a static or
+		// looping harmful video must not pass by producing no frames.
+		// Only the gated, audited operator override downgrades this to an
+		// operational skip (job acked, NO verdict emitted).
+		if p.AllowEmptyVideoSkip {
+			return moderation.NormalizedResult{}, errEmptyVideoSkipped
+		}
+		return moderation.NormalizedResult{}, fmt.Errorf("frame extraction produced zero frames")
+	}
+
+	// Optional post-processing: drop visually near-duplicate frames
+	// (Hamming distance over dHash) before spending moderation calls.
+	// The first occurrence always survives, so this can never produce an
+	// empty set out of a non-empty one. The job may override the config:
+	// nil inherits; 0..64 enables at that threshold; negative disables.
+	enabled, threshold := p.Dedup, p.DedupThreshold
+	if j.DedupThreshold != nil {
+		enabled = *j.DedupThreshold >= 0
+		threshold = *j.DedupThreshold
+	}
+	if enabled {
+		var removed int
+		fs, removed = frames.Dedup(fs, threshold)
+		if removed > 0 {
+			p.log().Info("near-duplicate frames removed before moderation",
+				"job_id", j.ID, "removed", removed, "kept", len(fs),
+				"hamming_threshold", threshold)
+		}
+	}
+
+	// Scan cap (max_frames), applied AFTER post-processing so dedup got
+	// to collapse duplicates first. Truncation keeps the earliest frames
+	// in workflow order — the tail of the video goes unscanned, hence
+	// the WARN: this is a cost backstop, not a tuning lever.
+	if p.MaxScanFrames > 0 && len(fs) > p.MaxScanFrames {
+		p.log().Warn("post-processed frames exceed max_frames; truncating (video tail unscanned)",
+			"job_id", j.ID, "post_processed", len(fs), "max_frames", p.MaxScanFrames)
+		fs = fs[:p.MaxScanFrames]
+	}
+
+	results := make([]moderation.FrameResult, len(fs))
 	g, gctx := errgroup.WithContext(ctx)
-	conc := p.Cfg.Frames.Concurrency
-	if conc <= 0 {
-		conc = 4
-	}
-	g.SetLimit(conc)
-
-	for i, f := range fr {
+	g.SetLimit(p.concurrency())
+	for i, f := range fs {
 		g.Go(func() error {
-			// Lazy decode INSIDE the task so at most `conc` images are resident.
-			img, derr := loadImage(f.Path)
-			ts := f.TimestampSec
-			if derr != nil {
-				results[i] = moderation.FrameResult{
-					TimestampSec: &ts,
-					Status:       moderation.FrameStatusError,
-					Error:        derr.Error(),
+			// Each frame is an independent evidence sample: capture the
+			// outcome and return nil so one frame's failure never cancels
+			// siblings. Lazy decode: bytes are read inside the task, so at
+			// most Concurrency frames are resident at once.
+			defer func() {
+				if r := recover(); r != nil {
+					ts := f.TimestampSec
+					results[i] = moderation.FrameResult{
+						TimestampSec: &ts,
+						Status:       moderation.FrameError,
+						Error:        fmt.Sprintf("frame task panic: %v", r),
+						Categories:   []moderation.CategoryResult{},
+					}
 				}
-				return nil // never cancel siblings
+			}()
+			ts := f.TimestampSec
+			fr, err := p.evaluateFrame(gctx, f.Path, &ts)
+			if err != nil {
+				fr = moderation.FrameResult{
+					TimestampSec: &ts,
+					Status:       moderation.FrameError,
+					Error:        err.Error(),
+					Categories:   []moderation.CategoryResult{},
+				}
 			}
-			res := p.moderateFrame(gctx, img, &ts, meta)
-			results[i] = res
+			results[i] = fr
 			return nil
 		})
 	}
-	_ = g.Wait() // no task returns a non-nil error; errors live in FrameResults
+	_ = g.Wait() // tasks always return nil; outcomes are in results
 
-	return moderation.NormalizedResult{Frames: results}, nil
+	sort.SliceStable(results, func(a, b int) bool {
+		ta, tb := results[a].TimestampSec, results[b].TimestampSec
+		if ta == nil || tb == nil {
+			return ta != nil
+		}
+		return *ta < *tb
+	})
+
+	return moderation.NormalizedResult{
+		Provider:     p.Moderator.Name(),
+		ModelVersion: p.ModelID.ModelVersion,
+		MediaType:    "video",
+		Frames:       results,
+	}, nil
 }
 
-// moderateFrame runs the hash-match pre-stage then (if no match) the classifier
-// for one decoded image. Pre-flight oversize rejection is terminal per frame.
-func (p *Pipeline) moderateFrame(ctx context.Context, img moderation.Image, ts *float64, meta jobMeta) moderation.FrameResult {
-	// Pre-stage: CSAM hash match short-circuits the classifier.
-	if m, err := p.Matcher.Match(ctx, img); err == nil && m.Matched {
-		return moderation.FrameResult{
-			TimestampSec: ts,
-			Status:       moderation.FrameStatusOK,
-			Categories: []moderation.CategoryResult{{
-				Category:    moderation.CategoryCSAMHashMatch,
-				ScoreOrigin: moderation.ScoreOriginListMembership,
-				Score:       nil,
-				Threshold:   nil,
-				Flagged:     true,
-				MatchType:   m.Algo,
-				MatchList:   m.ListName,
-			}},
-		}
+// evaluateFrame runs one image (a still or one extracted frame) through
+// pre-flight, the Moderator, and threshold application.
+func (p *Pipeline) evaluateFrame(ctx context.Context, path string, ts *float64) (moderation.FrameResult, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return moderation.FrameResult{}, fmt.Errorf("read %s: %w", path, err)
 	}
+	img := moderation.Image{Bytes: raw, MIME: sniffMIME(raw)}
 
-	// Pre-flight: reject oversize images before calling the classifier.
-	if maxBytes := p.Moderator.Capabilities().MaxImageBytes; maxBytes > 0 && int64(len(img.Bytes)) > maxBytes {
-		return moderation.FrameResult{
-			TimestampSec: ts,
-			Status:       moderation.FrameStatusError,
-			Error:        fmt.Sprintf("image %d bytes exceeds adapter limit %d", len(img.Bytes), maxBytes),
-		}
+	// Pre-flight oversize images before the adapter (and before its rate
+	// limiter spends a token).
+	caps := p.Moderator.Capabilities()
+	if caps.MaxImageBytes > 0 && int64(len(raw)) > caps.MaxImageBytes {
+		return moderation.FrameResult{}, fmt.Errorf("image is %d bytes, adapter %s max is %d (terminal)",
+			len(raw), p.Moderator.Name(), caps.MaxImageBytes)
 	}
 
 	res, err := p.Moderator.AnalyzeImage(ctx, img)
 	if err != nil {
-		return moderation.FrameResult{TimestampSec: ts, Status: moderation.FrameStatusError, Error: err.Error()}
+		return moderation.FrameResult{}, fmt.Errorf("analyze: %w", err)
 	}
-	var cats []moderation.CategoryResult
-	if len(res.Frames) > 0 {
-		cats = res.Frames[0].Categories
+	if len(res.Frames) == 0 {
+		return moderation.FrameResult{}, fmt.Errorf("adapter %s returned no frame result", p.Moderator.Name())
 	}
-	// §G.8: a frame whose category score lands in the flag band ([flag_at,
-	// block_at)) is flagged for manual review. Divert it to human review BEFORE
-	// Sink.Write, carrying only SHA-256(frame) — never the frame bytes or Raw
-	// (§G.2). Scores >= block_at auto-block and are NOT diverted.
-	//
-	// DELIVERY CONTRACT — AT-LEAST-ONCE (unlike Sink.Write + Audit.Append, which
-	// are idempotent per JobID). Divert fires here inside analyze, which re-runs
-	// in full whenever Process is retried (a transient sink/audit failure
-	// dead-letters and redelivers the whole job). The pipeline cannot dedup across
-	// that retry: redelivery may land on a different worker, so any in-process
-	// seen-set is lost. The (JobID, FrameSHA256, Category) triple on review.Item is
-	// the stable dedup key — the downstream Diverter (durable review queue) MUST
-	// collapse repeats on it. A frame flagged in N categories emits N Items that
-	// share (JobID, FrameSHA256) but differ in Category, so all N survive while a
-	// retry's identical re-emission still collapses. v1 LogDiverter is dedup-exempt
-	// (a repeated WARN is harmless).
-	p.divertFlagged(ctx, meta, img, ts, cats)
-	return moderation.FrameResult{TimestampSec: ts, Status: moderation.FrameStatusOK, Categories: cats}
+	fr := res.Frames[0]
+	fr.TimestampSec = ts
+	fr.Status = moderation.FrameOK
+	fr.Categories = ApplyThresholds(fr.Categories, p.Thresholds)
+	return fr, nil
 }
 
-// jobMeta carries per-job identity into the frame fan-out so a divert can be
-// attributed without re-threading the whole Source/JobID.
-type jobMeta struct {
-	ID      string
-	AssetID string
-}
+// logScanComplete emits the INFO summary (overall rollup) and, at DEBUG,
+// one line per frame with its per-category scores. Fields carry scores,
+// verdicts, and refs only — never media bytes, Raw, or free text.
+func (p *Pipeline) logScanComplete(j queue.Job, res moderation.NormalizedResult, started time.Time) {
+	log := p.log()
+	log.Info("scan complete",
+		"job_id", j.ID, "adapter", p.ModelID.Adapter,
+		"media_type", res.MediaType, "verdict", res.Overall.Verdict,
+		"flagged", res.Overall.Flagged,
+		"top_category", derefCategory(res.Overall.TopCategory),
+		"max_score", derefScore(res.Overall.MaxScore),
+		"confidence", derefScore(res.Overall.Confidence),
+		"frames", len(res.Frames), "latency", time.Since(started))
 
-// divertFlagged routes a frame to human review when any category score lands in
-// the flag band [flag_at, block_at) for that category (§G.8). Scores >= block_at
-// auto-block and are NOT diverted; scores < flag_at allow. It is a no-op when no
-// Diverter is configured.
-//
-// Flagged is not yet stamped on the CategoryResult here (applyThresholds runs
-// later in Process), so the band is computed inline from the per-category config.
-func (p *Pipeline) divertFlagged(ctx context.Context, meta jobMeta, img moderation.Image, ts *float64, cats []moderation.CategoryResult) {
-	if p.Diverter == nil {
+	if !log.Enabled(context.Background(), slog.LevelDebug) {
 		return
 	}
-	// SHA-256 over the frame bytes is identical for every in-band category, and
-	// frames can be MB — so hash at most ONCE per frame, lazily on the first
-	// match, and reuse the hex digest for every emitted Item.
-	var frameSHA string
-	for _, c := range cats {
-		if c.Score == nil {
-			continue
+	for i, fr := range res.Frames {
+		attrs := []any{
+			"job_id", j.ID, "frame", i,
+			"timestamp_sec", derefScore(fr.TimestampSec),
+			"status", fr.Status,
 		}
-		ct := p.Cfg.Thresholds.For(c.Category)
-		if *c.Score < ct.FlagAt || *c.Score >= ct.BlockAt {
-			continue
+		if fr.Error != "" {
+			attrs = append(attrs, "error", fr.Error)
 		}
-		if frameSHA == "" {
-			sum := sha256.Sum256(img.Bytes)
-			frameSHA = hex.EncodeToString(sum[:])
-		}
-		score := *c.Score
-		it := review.Item{
-			JobID:        meta.ID,
-			AssetID:      meta.AssetID,
-			FrameSHA256:  frameSHA,
-			TimestampSec: ts,
-			Category:     string(c.Category),
-			Score:        &score,
-			Reason:       "flagged: flag_at <= score < block_at",
-		}
-		if err := p.Diverter.Divert(ctx, it); err != nil {
-			// FAIL-SAFE: a dropped divert must NOT block the job (the §G.8 seam is
-			// best-effort by contract). But a silently-lost flagged frame is the one
-			// thing §G.8 must not hide, so make the drop observable via a counter an
-			// operator can alert on — log alone is not alertable.
-			p.Log.Warn("flagged frame divert failed", "job_id", meta.ID, "err", err)
-			// TODO(v1.1): p.Metrics is nil on the scan path, so a real erroring
-			// Diverter's failure goes uncounted here (only logged). Harmless today
-			// (LogDiverter never errors); wire a Metrics sink on the scan path
-			// before shipping a Diverter that can fail.
-			if r, ok := p.Metrics.(DivertFailureRecorder); ok {
-				r.RecordDivertFailure()
+		var cats strings.Builder
+		for ci, c := range fr.Categories {
+			if ci > 0 {
+				cats.WriteByte(' ')
+			}
+			cats.WriteString(string(c.Category))
+			cats.WriteByte('=')
+			if c.Score == nil {
+				cats.WriteString("null")
+			} else {
+				fmt.Fprintf(&cats, "%.3f", *c.Score)
+			}
+			if c.Flagged {
+				cats.WriteString("(flagged)")
 			}
 		}
-		// No early return: one Item per in-band category. The dedup key
-		// (JobID, FrameSHA256, Category) keeps these distinct downstream.
+		attrs = append(attrs, "categories", cats.String())
+		log.Debug("frame result", attrs...)
 	}
 }
 
-// errorResult builds a single-frame error result (could-not-evaluate).
-func errorResult(ts *float64, err error) moderation.NormalizedResult {
+func derefScore(f *float64) any {
+	if f == nil {
+		return "null"
+	}
+	return *f
+}
+
+func derefCategory(c *moderation.Category) any {
+	if c == nil {
+		return "null"
+	}
+	return string(*c)
+}
+
+func workflowsLabel(w []string) string {
+	if len(w) == 0 {
+		return "(default)"
+	}
+	return strings.Join(w, ",")
+}
+
+func (p *Pipeline) runCleanup(id queue.JobID, cleanup func() error) {
+	if cleanup == nil {
+		return
+	}
+	// Cleanup errors are logged but never change the verdict.
+	if err := cleanup(); err != nil {
+		p.log().Error("frame workdir cleanup failed", "job_id", id, "err", err)
+	}
+}
+
+// errorResult builds the fail-safe could-not-evaluate result.
+func (p *Pipeline) errorResult(j queue.Job, cause error) moderation.NormalizedResult {
+	name := ""
+	if p.Moderator != nil {
+		name = p.Moderator.Name()
+	}
 	return moderation.NormalizedResult{
+		Provider:     name,
+		ModelVersion: p.ModelID.ModelVersion,
+		MediaType:    j.Source.MediaType,
 		Frames: []moderation.FrameResult{{
-			TimestampSec: ts,
-			Status:       moderation.FrameStatusError,
-			Error:        err.Error(),
+			TimestampSec: nil,
+			Status:       moderation.FrameError,
+			Error:        cause.Error(),
+			Categories:   []moderation.CategoryResult{},
 		}},
 	}
 }
 
-// DetectMediaType resolves a Source to "image" or "video" (honoring an explicit
-// MediaType, else by extension). Exported so commands can pre-flight the video
-// path (e.g. boot-probe ffmpeg only when a video is involved).
-func DetectMediaType(src moderation.Source) string { return detectMediaType(src) }
-
-func detectMediaType(src moderation.Source) string {
-	if src.MediaType == "image" || src.MediaType == "video" {
-		return src.MediaType
+func (p *Pipeline) frameErrors(frs []moderation.FrameResult, procErr error) string {
+	if procErr != nil {
+		return procErr.Error()
 	}
-	switch strings.ToLower(filepath.Ext(src.Ref)) {
-	case ".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".mpeg", ".mpg":
-		return "video"
-	default:
-		return "image"
+	var msgs []string
+	for _, f := range frs {
+		if f.Status == moderation.FrameError && f.Error != "" {
+			msgs = append(msgs, f.Error)
+		}
 	}
+	if len(msgs) == 0 {
+		return "could not evaluate (no scorable signal)"
+	}
+	return strings.Join(msgs, "; ")
 }
 
-func assetID(jobID result.JobID, src moderation.Source) string {
-	if src.Ref != "" {
-		return src.Ref
+func (p *Pipeline) concurrency() int {
+	if p.Concurrency > 0 {
+		return p.Concurrency
 	}
-	return string(jobID)
+	return 4
 }
 
-func loadImage(path string) (moderation.Image, error) {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return moderation.Image{}, fmt.Errorf("read image %q: %w", path, err)
+func sniffMIME(b []byte) string {
+	if len(b) > 512 {
+		b = b[:512]
 	}
-	return moderation.Image{Bytes: b, MIME: mimeFromExt(path)}, nil
-}
-
-func mimeFromExt(path string) string {
-	switch strings.ToLower(filepath.Ext(path)) {
-	case ".jpg", ".jpeg":
-		return "image/jpeg"
-	case ".png":
-		return "image/png"
-	case ".gif":
-		return "image/gif"
-	case ".bmp":
-		return "image/bmp"
-	case ".webp":
-		return "image/webp"
-	case ".tif", ".tiff":
-		return "image/tiff"
-	default:
-		return "application/octet-stream"
-	}
+	return http.DetectContentType(b)
 }

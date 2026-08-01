@@ -1,0 +1,66 @@
+# vismod config for the compose stacks.
+#
+#   cp deploy/compose/config.compose.example.yaml deploy/compose/config.compose.yaml
+#
+# then set adapter.options.endpoint to your own resource. The copy is
+# gitignored. Secrets NEVER go in this file — the API key comes from .env
+# as VISMOD_MICROSOFT_API_KEY.
+#
+# A config file is REQUIRED. The VISMOD_* env overlay can only override
+# keys this file already sets, so there is no env-only configuration:
+# with no file, boot fails with `unknown adapter ""`.
+
+adapter:
+  name: microsoft
+  options:
+    endpoint: https://REPLACE-ME.cognitiveservices.azure.com/
+    api_version: "2024-09-01"
+    auth_mode: key
+    # Budgeted across the TWO replicas in compose.yaml, per the
+    # global_quota / max_replicas rule in deploy/README.md. Azure F0 is
+    # 5 RPS, so 2 each leaves headroom. The limiter is PER PROCESS —
+    # change this if you change the replica count.
+    rate_limit_rps: 2
+    max_attempts: 3
+
+thresholds:
+  default:
+    flag_at: 0.4
+    block_at: 0.7
+
+ffmpeg:
+  max_frames: 32
+
+frames:
+  concurrency: 4
+  dedup:
+    enabled: true
+    hamming_threshold: 14
+
+queue:
+  driver: redis            # the point of this stack: durable, multi-replica
+  workers: 4
+  max_retries: 3
+  retry_backoff: 2s
+  drain_timeout: 30s
+  job_timeout: 5m
+  deadletter_max: 1000
+  redis:
+    addr: redis:6379       # compose service name
+    db: 0
+
+audit:
+  enabled: true
+  path: audit.log          # resolves under /home/vismod — one volume PER replica
+
+log_level: info
+metrics_addr: ":9090"      # scraped by prometheus over the compose network
+
+# 0.0.0.0, not the 127.0.0.1 default: a loopback bind inside a container
+# is unreachable from a published port.
+intake_addr: "0.0.0.0:8080"
+
+ui:
+  enabled: true
+  addr: "0.0.0.0:8081"
+  auth: basic              # credentials env-only: VISMOD_UI_USER / VISMOD_UI_PASSWORD

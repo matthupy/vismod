@@ -2,56 +2,33 @@ package cli
 
 import (
 	"fmt"
-	"net"
 	"net/http"
 	"time"
 
-	"github.com/matthupy/vismod/internal/config"
 	"github.com/spf13/cobra"
 )
 
-// newHealthcheckCmd is a self-contained liveness probe for the container
-// HEALTHCHECK (§I). It GETs /healthz on metrics.addr and exits non-zero on
-// failure, so the slim runtime image needs no curl/wget. It loads the same
-// config as serve, so a custom metrics.addr is respected: the HEALTHCHECK has no
-// --config flag, but config.Load falls back to the VISMOD_CONFIG env var, so an
-// operator who points serve at a mounted config file via VISMOD_CONFIG gets a
-// matching probe target for free.
-func newHealthcheckCmd() *cobra.Command {
-	return &cobra.Command{
-		Use:    "healthcheck",
-		Short:  "Probe /healthz on metrics.addr (for container HEALTHCHECK)",
-		Hidden: true,
-		RunE: func(cmd *cobra.Command, _ []string) error {
-			cfg, err := config.Load(configPath)
-			if err != nil {
-				return err
-			}
-			return probeHealthz(cfg.MetricsAddr)
-		},
-	}
+var healthURL string
+
+var healthcheckCmd = &cobra.Command{
+	Use:   "healthcheck",
+	Short: "Probe a running vismod serve instance (used by Docker HEALTHCHECK)",
+	Args:  cobra.NoArgs,
+	RunE: func(_ *cobra.Command, _ []string) error {
+		client := &http.Client{Timeout: 3 * time.Second}
+		resp, err := client.Get(healthURL)
+		if err != nil {
+			return fmt.Errorf("healthcheck: %w", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("healthcheck: %s returned %d", healthURL, resp.StatusCode)
+		}
+		return nil
+	},
 }
 
-// probeHealthz GETs http://<host>/healthz, normalizing a bare ":9090"-style
-// addr to localhost. Returns an error unless the endpoint answers 2xx.
-func probeHealthz(addr string) error {
-	host, port, err := net.SplitHostPort(addr)
-	if err != nil {
-		return fmt.Errorf("healthcheck: bad metrics.addr %q: %w", addr, err)
-	}
-	if host == "" || host == "0.0.0.0" || host == "::" {
-		host = "127.0.0.1"
-	}
-	url := fmt.Sprintf("http://%s/healthz", net.JoinHostPort(host, port))
-
-	client := &http.Client{Timeout: 3 * time.Second}
-	resp, err := client.Get(url)
-	if err != nil {
-		return fmt.Errorf("healthcheck: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("healthcheck: %s returned HTTP %d", url, resp.StatusCode)
-	}
-	return nil
+func init() {
+	healthcheckCmd.Flags().StringVar(&healthURL, "url", "http://127.0.0.1:9090/healthz", "health endpoint to probe")
+	rootCmd.AddCommand(healthcheckCmd)
 }

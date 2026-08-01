@@ -1,76 +1,74 @@
 # Contributing to vismod
 
-Thanks for helping build open trust & safety infrastructure. vismod is a public
-good with **no commercial goals**; correctness, safety, and auditability come
-first.
+Thanks for helping build a safety-critical public good. A few rules keep
+it safe to iterate on.
+
+Working with a coding agent? [AGENTS.md](AGENTS.md) holds the machine-
+facing version of these rules — invariants, the done gate, and the
+architecture map. [CLAUDE.md](CLAUDE.md) is the orientation page.
 
 ## Ground rules
 
-- **Never test against real or suspected CSAM**, and never commit illegal,
-  harmful, or copyrighted media. Use synthetic / clearly-legal fixtures. See
-  [RESPONSIBLE_USE.md](RESPONSIBLE_USE.md).
-- **No secrets in the repo.** Secrets are environment-only (`VISMOD_` prefix).
-  Never put keys/tokens in YAML, tests, or fixtures.
-- By contributing you agree your contribution is licensed under
-  **Apache-2.0** (see [LICENSE](LICENSE)), and you follow the
-  [Code of Conduct](CODE_OF_CONDUCT.md).
+- **Never test against real illegal material.** Use the fakes
+  (`fakeModerator`, `fakeFrameSource`), synthesized media
+  (`ffmpeg -f lavfi testsrc`), and fixture JSON. See RESPONSIBLE_USE.md.
+- **Fail safe is non-negotiable.** No change may create a path where a
+  provider/extraction failure, an all-null score set, or an empty frame
+  set produces `allow`. The rollup tests encode this; don't weaken them.
+- **The full test suite runs with no network and no credentials.**
+  Provider clients are tested with `httptest`; Redis with miniredis;
+  ffmpeg integration tests skip when the binary is absent.
 
 ## Development
 
-```bash
+```sh
 go build ./...
-go test ./...                 # CI also runs -race (needs cgo/gcc)
 go vet ./...
-gofmt -l .                    # must print nothing
+go test ./...            # add -update to regenerate golden files
 ```
 
-Video framing depends on `github.com/matthupy/videosift`, which is
-**tracked at latest, never pinned** (it is co-developed). A local
-`replace => ../videosift` is active for tandem development — keep a sibling
-checkout. videosift execs external `ffmpeg`+`ffprobe`; install both to run the
-video path locally.
+Keep `main` green: land features with their tests as one coherent unit.
 
-## Engineering conventions
+## Adding a vendor adapter (the designed extension point)
 
-- **Tests land with features.** Table-driven tests, interface fakes, golden files
-  for normalization, `httptest` for provider clients. The pipeline must be
-  runnable and testable **without network or credentials** (use the `stub`
-  adapter). New behavior is **test-first**.
-- **Code to interfaces.** Every external concern (moderator, queue, frame source,
-  sink, hash matcher, diverter) sits behind an interface so implementations swap
-  via config with no call-site change.
-- **Fail safe, never fail silent.** On any provider/frame failure, never emit
-  `allow` — emit `error` and route to dead-letter / human review.
-- **Don't leak media.** Never log or persist media bytes, PII, or `Raw`
-  free-text/OCR/captions. The audit log stores hashes, not content.
-- **Small, reviewable PRs** that keep `main` green. Match the surrounding code's
-  style and comment density.
+1. Create `internal/moderate/adapters/<name>/` with a factory
+   `func New(cfg moderate.AdapterConfig) (moderation.Moderator, error)`
+   and `moderate.Register("<name>", New)` in `init()`.
+2. Secrets come ONLY from `cfg.Secret("<name>.<key>")` (env-backed);
+   options from `cfg.Options`. Fail fast on missing credentials.
+3. Normalize into the `pkg/moderation` schema:
+   - tag every score with the correct `ScoreOrigin`;
+   - unknown/unsupported values are `nil`, never `0`;
+   - unmapped provider labels go to `OTHER` with `ProviderLabel`
+     preserved — never drop a signal;
+   - `Raw` must be sanitized: no free text, OCR, captions, media bytes.
+4. Add a blank import in `internal/cli/root.go` (the only wiring point;
+   the registry never imports adapters).
+5. Ship golden tests: raw fixture JSON → `NormalizedResult` →
+   `testdata/*.golden`, plus retry/terminal classification tests via
+   `httptest` if you use REST.
+6. Document the score semantics in MODEL_LIMITATIONS.md
+   (scores are per-provider; thresholds are not portable).
 
-## Pull requests
+Zero pipeline changes should be needed — if you find yourself editing
+`internal/pipeline`, the interface is missing something; open an issue
+first.
 
-Open PRs against `main`. GitHub pre-fills the
-[pull request template](.github/pull_request_template.md) — **fill in every
-section** (Links, Description, Technical Solution, Testing). Do not delete
-headings; if a section does not apply, say so (e.g. "No change to
-functionality"). The Testing section carries a **required safety checkbox** —
-confirm no media bytes, PII, or secrets were added to code, tests, or fixtures
-before requesting review.
+## Dependencies
 
-## Adding a moderation adapter
+The dependency set is deliberately small (cobra, viper, errgroup,
+prometheus, the Google Vision SDK, go-redis; miniredis test-only). Every
+new import is a decision, not a reflex — justify it in the PR
+description.
 
-1. Implement `moderation.Moderator` (and optionally `moderation.VideoModerator`)
-   in `internal/moderate/adapters/<name>/`.
-2. Self-register via `init()` → `moderate.Register("<name>", factory)`; the
-   composition root blank-imports it. The registry never imports adapters.
-3. Normalize the provider's output into the canonical schema (`pkg/moderation`),
-   tagging every score with its `ScoreOrigin`. Map unknown labels to `OTHER`
-   (preserve the raw label) — **never drop a result**, never emit `0` for an
-   unknown score (use `nil`).
-4. Ship golden-file tests (`testdata/<provider>/*.json → normalize → *.golden`)
-   and `httptest` coverage incl. retry/backoff/error-mapping.
-5. Remember: **thresholds are per-adapter, not portable** — document the score
-   scale in [MODEL_AND_HASH_LIMITATIONS.md](MODEL_AND_HASH_LIMITATIONS.md).
+## Commit / PR expectations
 
-## Reporting security issues
+- Table-driven tests where they fit; golden files for normalization.
+- No secrets in code, config examples, tests, or fixtures.
+- Update the docs that ship with behavior you change (README, CLAUDE,
+  AGENTS, SECURITY, RESPONSIBLE_USE, MODEL_LIMITATIONS, this file).
 
-Use GitHub Security Advisories, not a public issue. See [SECURITY.md](SECURITY.md).
+## Code of conduct
+
+See CODE_OF_CONDUCT.md. Moderation tooling attracts hard discussions;
+keep them kind and evidence-based.

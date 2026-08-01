@@ -1,33 +1,51 @@
 package result
 
-import "context"
+import (
+	"context"
+	"fmt"
+)
 
-// Compile-time assertion: *MultiSink must satisfy Sink.
-var _ Sink = (*MultiSink)(nil)
-
-// MultiSink fans each envelope out to every wrapped Sink. It is the tee that
-// lets the result/DLQ pipeline feed both the JSONL sink and the queryable job
-// store introduced in VISMOD-6.
+// MultiSink fans one envelope out to every configured sink.
+//
+// Failure policy: EVERY sink is attempted and the FIRST error is
+// returned. Not fail-fast — a webhook outage must never suppress the
+// local JSONL record. The returned error reaches the pipeline's queue
+// Retry disposition, so the job redelivers; the sinks that already
+// succeeded are no-ops on the second pass because each is idempotent per
+// JobID.
 type MultiSink struct {
-	sinks []Sink
+	sinks  []Sink
+	names  []string
+	onFail func(sinkType string)
 }
 
-// NewMultiSink returns a MultiSink that writes to each of the provided sinks in
-// order. Calling Write on a zero-sink MultiSink is a no-op.
-func NewMultiSink(sinks ...Sink) *MultiSink {
-	return &MultiSink{sinks: sinks}
+// NewMultiSink pairs each sink with its config type name (used for error
+// messages and the failure metric). names must be the same length as
+// sinks — a mismatch is an error, not a tolerated defect, because the
+// name is what tells an operator WHICH destination failed during an
+// outage. onFail may be nil.
+func NewMultiSink(sinks []Sink, names []string, onFail func(sinkType string)) (*MultiSink, error) {
+	if len(sinks) != len(names) {
+		return nil, fmt.Errorf("result: MultiSink needs one name per sink, got %d sinks and %d names", len(sinks), len(names))
+	}
+	return &MultiSink{sinks: sinks, names: names, onFail: onFail}, nil
 }
 
-// Write calls Write on every wrapped Sink in order. It always attempts all
-// sinks — a failure in one sink does not skip the remaining ones. The first
-// non-nil error encountered is returned; subsequent errors are discarded so
-// that no single slow or failing sink starves the others.
 func (m *MultiSink) Write(ctx context.Context, env ResultEnvelope) error {
-	var first error
-	for _, s := range m.sinks {
-		if err := s.Write(ctx, env); err != nil && first == nil {
-			first = err
+	var firstErr error
+	for i, s := range m.sinks {
+		if err := s.Write(ctx, env); err != nil {
+			// Indexing is safe without a bounds fallback: NewMultiSink is
+			// the only constructor and it refuses a length mismatch.
+			if m.onFail != nil {
+				m.onFail(m.names[i])
+			}
+			if firstErr == nil {
+				firstErr = fmt.Errorf("result: sink %s: %w", m.names[i], err)
+			}
 		}
 	}
-	return first
+	return firstErr
 }
+
+var _ Sink = (*MultiSink)(nil)

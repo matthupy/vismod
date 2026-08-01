@@ -5,48 +5,54 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/matthupy/vismod/pkg/moderation"
+	"github.com/vismod/vismod/pkg/moderation"
 )
 
-type fakeMod struct{ name string }
+type stubModerator struct{ name string }
 
-func (f fakeMod) Name() string                  { return f.name }
-func (f fakeMod) Capabilities() moderation.Caps { return moderation.Caps{} }
-func (f fakeMod) Close() error                  { return nil }
-func (f fakeMod) AnalyzeImage(context.Context, moderation.Image) (moderation.NormalizedResult, error) {
+func (s stubModerator) Name() string { return s.name }
+func (s stubModerator) AnalyzeImage(context.Context, moderation.Image) (moderation.NormalizedResult, error) {
 	return moderation.NormalizedResult{}, nil
 }
+func (s stubModerator) Capabilities() moderation.Caps { return moderation.Caps{} }
+func (s stubModerator) Close() error                  { return nil }
 
-func TestRegisterAndNew(t *testing.T) {
-	Register("fake_reg_test", func(cfg AdapterConfig) (moderation.Moderator, error) {
-		return fakeMod{name: cfg.Name}, nil
+func TestRegistryRegisterAndNew(t *testing.T) {
+	Register("test-a", func(cfg AdapterConfig) (moderation.Moderator, error) {
+		if cfg.Name != "test-a" {
+			t.Errorf("factory got Name=%q, want test-a", cfg.Name)
+		}
+		return stubModerator{name: "test-a"}, nil
+	})
+	Register("test-b", func(AdapterConfig) (moderation.Moderator, error) {
+		return stubModerator{name: "test-b"}, nil
 	})
 
-	m, err := New("fake_reg_test", AdapterConfig{Name: "fake_reg_test"})
+	m, err := New("test-a", AdapterConfig{})
 	if err != nil {
-		t.Fatalf("New: %v", err)
+		t.Fatalf("New(test-a): %v", err)
 	}
-	if m.Name() != "fake_reg_test" {
-		t.Fatalf("got name %q", m.Name())
+	if m.Name() != "test-a" {
+		t.Errorf("got %q, want test-a", m.Name())
 	}
 }
 
-func TestNewUnknownListsRegistered(t *testing.T) {
-	_, err := New("does_not_exist", AdapterConfig{})
+func TestRegistryUnknownAdapterListsRegistered(t *testing.T) {
+	_, err := New("nope", AdapterConfig{})
 	if err == nil {
-		t.Fatal("expected error for unknown adapter")
+		t.Fatal("want error for unknown adapter")
 	}
-	if !strings.Contains(err.Error(), "unknown adapter") {
-		t.Fatalf("error should name the problem: %v", err)
+	if !strings.Contains(err.Error(), "unknown adapter") || !strings.Contains(err.Error(), "test-a") {
+		t.Errorf("error should name the unknown adapter and list registered ones, got: %v", err)
 	}
 }
 
-func TestRegisterDuplicatePanics(t *testing.T) {
+func TestRegistryDuplicatePanics(t *testing.T) {
 	defer func() {
 		if recover() == nil {
-			t.Fatal("expected panic on duplicate registration")
+			t.Fatal("duplicate Register should panic")
 		}
 	}()
-	Register("dup_test", func(AdapterConfig) (moderation.Moderator, error) { return nil, nil })
-	Register("dup_test", func(AdapterConfig) (moderation.Moderator, error) { return nil, nil })
+	Register("dup", func(AdapterConfig) (moderation.Moderator, error) { return nil, nil })
+	Register("dup", func(AdapterConfig) (moderation.Moderator, error) { return nil, nil })
 }

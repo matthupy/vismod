@@ -1,160 +1,223 @@
-# vismod — open-source visual content moderation pipeline
+# vismod
 
-Scans **images and video** for harmful content using a pluggable visual-moderation
-model, normalizes wildly different provider outputs into one schema, and runs as a
-one-shot CLI (`vismod scan`) and a long-running worker (`vismod serve`).
+**Open-source visual content moderation pipeline.** Scans images and
+video for harmful content using a pluggable visual-moderation model
+(Azure AI Content Safety, Google Cloud Vision SafeSearch, or thehive.ai),
+normalizes their wildly different outputs into **one common scoring
+schema**, and runs as a one-shot CLI or a long-running containerized
+worker that scales horizontally by queue depth.
 
-A public good for trust & safety. Positioned as the **Classification** stage in the
-Hash Matching → Classification → Review → Investigation taxonomy (cf. ROOST), feeding
-a review console / rules engine downstream.
+vismod is a public good with no commercial goals, built for trust &
+safety organizations and smaller platforms without in-house moderation
+infrastructure. It is designed **fail-safe first**: a provider outage, a
+broken video, or an unscorable frame yields `verdict: "error"` and human
+review — never a silent `allow`.
 
-> **Status: M4 (responsible-use & docs).** The full pipeline runs end-to-end with
-> the credential-free `stub` adapter, Azure (M1), Hive (M5), or Google Cloud Vision
-> SafeSearch (M5); video inputs are framed by the
-> real `videosift` extractor (M2); the worker ships a Docker image, boot
-> validation, and Prometheus metrics + `/healthz`/`/readyz` (M3); and the
-> tamper-evident audit log, responsible-use/security/licensing docs, and the
-> potential-CSAM divert seam land in M4; a durable, at-least-once Redis queue
-> (`driver=redis`, asynq-backed) lands in M5. **CSAM detection is NOT
-> implemented (v1.1) — read [RESPONSIBLE_USE.md](RESPONSIBLE_USE.md) before any
-> deployment, and never test against real illegal content.**
+> Read [RESPONSIBLE_USE.md](RESPONSIBLE_USE.md) before deploying. All
+> content detection — including any special-category detection and
+> protections — is performed by the configured scanning vendor under
+> that vendor's terms. This project's docs are not legal advice.
+
+---
 
 ## Quick start
 
-```bash
+```sh
 go build -o vismod ./cmd/vismod
 
-./vismod adapters                 # list registered models + capabilities
-./vismod scan path/to/image.jpg   # one-shot, prints a NormalizedResult envelope (JSONL)
-printf 'a.jpg\nb.mp4\n' | ./vismod serve --config config.example.yaml   # worker; drains on SIGTERM
-./vismod audit verify audit.log   # recompute the tamper-evident decision chain
+# configure a provider (secrets are env-only, never yaml)
+export VISMOD_MICROSOFT_API_KEY=<key>
+cp config.example.yaml config.yaml   # set adapter.options.endpoint
+
+# one-shot scan (exit code: 0 allow, 1 flag/block, 2 error)
+./vismod -c config.yaml scan photo.jpg clip.mp4
+
+# long-running worker (metrics on :9090, dev intake on 127.0.0.1:8080)
+./vismod -c config.yaml serve
 ```
 
-Configure via `config.example.yaml`. **Secrets are env-only** (`VISMOD_` prefix), never yaml.
+Docker (one image, both modes — bundles ffmpeg/ffprobe, non-root):
 
-## Docker (M3)
+```sh
+docker build -t vismod .
 
-One image, both modes. The runtime stage bundles `ffmpeg`+`ffprobe` (videosift execs
-them — a static binary alone is insufficient), runs **non-root**, and drains on
-`SIGTERM`.
+# A config file is REQUIRED — mount it. There is no usable env-only
+# configuration: the VISMOD_* overlay only overrides keys the yaml
+# already sets, so with no file the adapter name is empty and boot
+# fails with `unknown adapter ""`.
+docker run -e VISMOD_MICROSOFT_API_KEY -v "$PWD:/data" \
+  vismod scan -c /data/config.yaml /data/clip.mp4
 
-> 🔴 **Build context is the PARENT directory**, not this repo. `go.mod` has
-> `replace … => ../videosift`, so the sibling checkout must be in the context (the
-> same layout CI uses). Lay the repos out as siblings:
-
-```bash
-parent/
-  vismod/      # this repo
-  videosift/   # git clone https://github.com/matthupy/videosift
-
-docker build -f vismod/Dockerfile -t vismod:dev parent/
-
-# serve (default): metrics/health on :9090, frames workdir is an ephemeral volume
-docker run --rm -p 9090:9090 vismod:dev
-
-# one-shot scan
-docker run --rm -v "$PWD/data:/data" vismod:dev scan /data/clip.mp4
+docker run -e VISMOD_MICROSOFT_API_KEY -p 9090:9090 -v "$PWD:/data" \
+  vismod serve -c /data/config.yaml   # :9090 = /metrics /healthz /readyz
 ```
 
-> **Config in-container:** the image bakes no config file. Override via the
-> `VISMOD_` env overlay, or mount a file and point at it with `VISMOD_CONFIG`
-> (e.g. `-v "$PWD/config.yaml:/etc/vismod.yaml" -e VISMOD_CONFIG=/etc/vismod.yaml`).
-> The `HEALTHCHECK` runs `vismod healthcheck` with no `--config` flag, so a config
-> that moves `metrics.addr` must be reachable via `VISMOD_CONFIG` (or `VISMOD_METRICS_ADDR`)
-> for the probe to target the right port.
+`intake_addr` defaults to `127.0.0.1:8080`, which inside a container is
+reachable only from within it; publishing that port does nothing until
+you set the address to `0.0.0.0:8080`. The dev intake has no auth — read
+[SECURITY.md](SECURITY.md) before exposing it.
 
-## Observability (M3)
+Compose (two replicas, durable Redis queue, Prometheus + Grafana):
 
-`serve` exposes one HTTP server on `metrics.addr` (default `:9090`):
+```sh
+cp deploy/compose/env.example .env                                        # set your API key
+cp deploy/compose/config.compose.example.yaml deploy/compose/config.compose.yaml   # set your endpoint
+docker compose up --build     # intake :8080, UI :8081, Prometheus :9090, Grafana :3000
+```
 
-| Endpoint | Purpose |
-|---|---|
-| `/healthz` | Liveness — always 200 while the process is up. |
-| `/readyz`  | Readiness — JSON `{ready, adapter_name, checks, warnings}`; 503 until boot validation passes. `checks` are health verdicts only (e.g. `"adapter":"ok"`); the active adapter's identity is the separate `adapter_name`. Carries the memq non-durability warning. |
-| `/metrics` | Prometheus text exposition. |
+See [deploy/compose/README.md](deploy/compose/README.md), and
+[deploy/README.md](deploy/README.md) for Kubernetes.
 
-Metrics: `vismod_jobs_total{verdict}`, `vismod_adapter_request_seconds{adapter}`,
-`vismod_adapter_errors_total{adapter,code}`, `vismod_queue_depth`,
-`vismod_deadletter_depth`, `vismod_jobs_active`, `vismod_jobs_completed_total`,
-`vismod_jobs_failed_total`, `vismod_jobs_model_mismatch_total{reason}`. The
-`vismod_jobs_*` family is queue-layer and largely driver-uniform: `active` is in-flight
-(pulled, not yet acked — surfaces a stuck/slow worker that `queue_depth` can't, as
-backlog reads 0 while a job is wedged), but diverges by driver for jobs in retry-backoff —
-memq counts a backing-off job as active, the redis/asynq driver does not (asynq's
-retry state ≠ active), so a backoff-driven dip in this gauge is expected, not a leak;
-`completed_total`/`failed_total` count
-acks vs dead-letters (a dead-lettered job carries no verdict, so it is invisible in
-`jobs_total`); `model_mismatch_total{reason}` counts the §L deploy guard firing
-(`reason=mismatch` wrong model deployed, `reason=unstamped` pre-feature job).
-Adapter latency/errors are recorded by an instrumenting
-decorator that wraps the active `Moderator`, so the pipeline stays adapter-agnostic.
-The container `HEALTHCHECK` uses the self-contained `vismod healthcheck` subcommand
-(no curl/wget in the image).
+Other commands: `adapters` (registry + capabilities), `workflows
+list|validate`, `audit verify`, `version`, `healthcheck`.
 
-## Design notes (carried into later milestones)
+## How it works
 
-- **One model per process**, chosen at startup; restart-to-change. The registry never
-  imports adapter packages — adapters self-register and are blank-imported at the
-  composition root.
-- **Fail-safe, never fail-silent.** Any provider/frame/extraction failure yields
-  `Verdict=error` (never `allow`) and dead-letters. A worker panic dead-letters that
-  job and the pool keeps running.
-- **FIFO is a queue property:** dequeue order == enqueue order. With >1 worker,
-  **completion order is not guaranteed** — strict ordering needs `workers=1`.
-- **memq is non-durable, single-process (dev/CLI only).** A crash loses jobs.
-  Production intake uses `driver=redis` (M5): durable + at-least-once, deduped per
-  `job_id`. The driver swap is behavior-preserving — the same handler `Disposition`
-  yields the same retry/DLQ outcome on both. A Redis outage flips `/readyz` to
-  not-ready (backpressure) rather than accepting jobs it cannot durably hold.
-- **One model cluster-wide (§L deploy guard).** Each enqueued job is stamped with a
-  boot-knowable **model fingerprint** (`config.ModelFingerprint`: a hash over adapter
-  name + verdict-affecting `adapter.options` keys + thresholds). A worker dequeuing a job whose fingerprint
-  ≠ its own loaded model **dead-letters it** instead of silently moderating with the
-  wrong model during a rolling deploy. It is a **misconfiguration / rollout-skew
-  guard, not authentication** — a malicious enqueuer can stamp any value (same honest
-  scope as the audit-log threat model). memq is single-process so the guard is a
-  no-op there. See [deploy strategy](MODEL_AND_HASH_LIMITATIONS.md#multi-replica-deploys-l)
-  for the safe rollout paths (drain-first or per-model-version queue namespacing) — a
-  naive requeue of mismatches onto the shared queue re-archives in a loop.
-- **Scores are within-provider comparable only.** A `0.667` threshold means different
-  things per provider; thresholds are per-adapter and **not portable**.
-- **CSAM** is handled by a hash-match pre-stage seam (no-op in v1; PDQ/TMK in v1.1),
-  never the classifier. The schema ships the `CSAM_HASH_MATCH` category + `match_*`
-  fields now.
+```
+            video   ┌───────────────┐
+ job ──────────────▶│ FFmpegSource  │─ frames ─┐
+      │             │ (workflows)   │          │
+      │             └───────────────┘          ▼
+      │ image                        ┌───────────────────┐
+      └─────────────────────────────▶│ Moderator adapter │
+                                     │ (exactly 1 active)│
+                                     └─────────┬─────────┘
+                                               ▼
+                          normalize → thresholds → rollup
+                                               ▼
+                                  Sink → audit → ack/DLQ
+```
 
-## Responsible use, safety & licensing (M4)
+- **One model active per process**, selected by `adapter.name` at
+  startup; restart to change. Unknown names fail fast listing the
+  registered adapters. Adding a vendor = one adapter package + golden
+  tests, zero pipeline changes ([CONTRIBUTING.md](CONTRIBUTING.md)).
+- **Registered adapters:** `microsoft` (Azure AI Content Safety),
+  `google` (Cloud Vision SafeSearch), `hive` (thehive.ai), and
+  `shieldgemma` — **self-hosted**: you run an inference server serving
+  `google/shieldgemma-2-4b-it` and vismod speaks HTTP to it, with no
+  per-call billing and no media leaving your network. It requires
+  `provider_thresholds.mode: override` and an explicit `model_version`,
+  and it has never been run against a real server
+  ([docs/agent/UNVERIFIED.md](docs/agent/UNVERIFIED.md)).
+- **Video** is frame-extracted via direct `ffmpeg`/`ffprobe`
+  (config-driven, guardrailed workflows —
+  [docs/custom-ffmpeg-workflows.md](docs/custom-ffmpeg-workflows.md)),
+  then each frame is moderated as an image. Jobs may select one or more
+  workflows (`scan --workflow …` / `"workflows":[…]` on the intake);
+  frames are the union, capped by `max_frames`. An optional
+  `frames.dedup` stage drops near-duplicate frames (dHash Hamming
+  distance) before they spend moderation calls. Video-native adapters
+  can implement `VideoModerator` and skip extraction.
+- **Normalization**: every provider signal becomes a `CategoryResult`
+  with a canonical category, the raw `provider_label`, a normalized
+  score in [0,1] (or **null** for could-not-evaluate — never 0), and its
+  `score_origin`. Unmapped labels land in `OTHER`; nothing is dropped.
+- **Verdicts** roll up per asset with strict precedence
+  `block > error > flag > allow`; any errored frame, zero frames, or an
+  all-null score set is `error` — never `allow`.
 
-This tool may encounter illegal content (especially **CSAM**). Read these before
-deploying — they are acceptance criteria, not optional reading:
+### Example envelope (one JSON line per job)
 
-- [RESPONSIBLE_USE.md](RESPONSIBLE_USE.md) — not-legal-advice disclaimer, reporting
-  guidance (e.g. NCMEC CyberTipline), "do not test against real CSAM", and the
-  **potential-CSAM** policy (a high-severity `SEXUAL` hit is diverted to human
-  review, never auto-actioned, and its frame bytes are never persisted).
-- [SECURITY.md](SECURITY.md) — threat model: SSRF/egress posture, the audit-log
-  tamper-evidence scope (what a hash chain does and does **not** detect), and the
-  score/threshold anti-abuse residual risk.
-- [MODEL_AND_HASH_LIMITATIONS.md](MODEL_AND_HASH_LIMITATIONS.md) — classifier
-  false-positives/bias, perceptual-hash evadability, and cross-provider score
-  non-portability.
-- [LICENSE](LICENSE) (Apache-2.0) + [NOTICE](NOTICE).
-- [CONTRIBUTING.md](CONTRIBUTING.md), [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
+```json
+{"job_id":"scan-...","source":{"kind":"file","ref":"/data/clip.mp4","media_type":"video"},
+ "model_id":{"adapter":"microsoft","model_version":"2024-09-01","config_hash":"9b6f…"},
+ "result":{"schema_version":"1.1.0","provider":"microsoft","media_type":"video",
+   "asset_id":"/data/clip.mp4",
+   "frames":[{"timestamp_sec":2.0,"status":"ok","categories":[
+     {"category":"SEXUAL","provider_label":"Sexual","score":0.333,
+      "score_origin":"severity","threshold":0.4,"flagged":false}]}],
+   "overall":{"verdict":"allow","flagged":false,"top_category":"SEXUAL",
+     "max_score":0.333,"confidence":0.333}},
+ "started_at":"…","finished_at":"…"}
+```
 
-**Audit trail.** Set `audit.path` in config to enable the append-only,
-hash-chained decision log (§G.5). Each record binds a decision to its inputs by
-hash — `SHA-256(Raw)` + `ModelIdentity` + verdict, **never the media or `Raw`
-text**. `vismod audit verify <path>` recomputes the chain and reports the first
-broken link.
+## Things you must know before production
 
-## Contributing
+- **Scores are not portable across providers.** `severity/6`, a
+  likelihood bucket, and a head probability are different quantities;
+  thresholds are per-adapter and must be retuned on switch. Details:
+  [MODEL_LIMITATIONS.md](MODEL_LIMITATIONS.md).
+- **FIFO ≠ completion order.** Dequeue order equals enqueue order, but
+  with `queue.workers > 1` completion order is not guaranteed. Strict
+  end-to-end ordering needs `workers: 1` (or per-key serialization
+  upstream).
+- **The memory queue driver is not for production intake.** It is
+  single-process, non-durable, at-most-once: a crash loses queued and
+  in-flight jobs. `serve` warns at boot and in `/readyz`. Production and
+  any multi-replica deployment require `queue.driver: redis` (durable,
+  at-least-once, crash-recovering).
+- **At-least-once means redelivery happens, and sink idempotency is
+  per-process.** Every result sink is idempotent per `job_id` within a
+  process lifetime, so a redelivery to a running worker never
+  double-writes. That guarantee does NOT survive a restart: the dedupe
+  set is in memory, so a job redelivered after a crash or a rolling
+  restart gets a second line in the `file` sink (and a second POST to a
+  `webhook` receiver). The audit log is the exception — `audit.Open`
+  replays its file and rebuilds the seen-set before appending, so its
+  per-`job_id` guarantee holds across restarts. Downstream consumers of
+  the `file` and `webhook` sinks must dedupe on `job_id` themselves.
+- **Result envelope destinations are configurable.** `output.sinks`
+  (`config.example.yaml`) fans each envelope out to any combination of
+  stdout, an append-only JSONL file, and an HTTP webhook. Every sink is
+  attempted and the first failure is what triggers redelivery — a
+  webhook outage never suppresses the local record. Omit the `output`
+  block for the stdout-only default every earlier release used. A `file`
+  sink needs one path per replica ([deploy/README.md](deploy/README.md)).
+- **Custom FFmpeg workflows are an operator-trust boundary.** They are
+  validated hard (no shell, single bound input, protocol deny-list,
+  output confinement — [SECURITY.md](SECURITY.md)), but review workflow
+  changes like code.
+- **Rate limits**: the token bucket is shared across all workers and
+  frame fan-out in one process, but replicas multiply it — budget
+  `global_quota / max_replicas` per replica or add a shared limiter
+  ([deploy/README.md](deploy/README.md)).
 
-Read [CONTRIBUTING.md](CONTRIBUTING.md) first. PRs are opened against `main` and
-use the repo's [pull request template](.github/pull_request_template.md), which
-GitHub pre-fills automatically — complete every section, including the Testing
-safety checkbox (no media bytes, PII, or secrets in code/tests/fixtures).
+## Scaling out
 
-## Internal dependency
+Each replica runs a fixed pool of `queue.workers` goroutines; horizontal
+scale is replica-count driven by the **`vismod_queue_depth`** gauge.
+KEDA `ScaledObject` and HPA examples, the drain-on-deploy contract, and
+the rate-limit budgeting note live in [deploy/](deploy/README.md).
 
-Video framing uses `github.com/matthupy/videosift` (MIT) — **tracked at latest, never
-pinned** (co-developed). A local `replace => ../videosift` is active for tandem dev.
-videosift execs external `ffmpeg`+`ffprobe`; the runtime must provide both.
+Observability: Prometheus `/metrics` (`vismod_jobs_total{verdict}`,
+`vismod_adapter_request_seconds`, `vismod_adapter_errors_total`,
+`vismod_queue_depth`, `vismod_deadletter_depth`,
+`vismod_workers_active`), `/healthz` liveness, `/readyz` readiness —
+which also flips not-ready under sustained provider failure
+(backpressure with hysteresis) so ingress backs off instead of
+black-holing jobs.
+
+## Audit log
+
+Every decision appends to a hash-chained, append-only audit log binding
+the verdict to its inputs **by hash** (`SHA-256(Raw)` + model identity +
+config hash — never media or provider payloads). `vismod audit verify`
+recomputes the chain and reports the first broken link. Scope honesty:
+tamper-evident, not tamper-proof — see [SECURITY.md](SECURITY.md).
+
+## Development
+
+```sh
+go test ./...     # no network, no credentials: fakes, httptest, miniredis
+go vet ./...
+```
+
+Golden files regenerate with `go test -update ./internal/moderate/...`.
+FFmpeg integration tests skip automatically when ffmpeg is absent.
+
+## Docs
+
+[SECURITY.md](SECURITY.md) ·
+[RESPONSIBLE_USE.md](RESPONSIBLE_USE.md) ·
+[AGENTS.md](AGENTS.md) ·
+[MODEL_LIMITATIONS.md](MODEL_LIMITATIONS.md) ·
+[CONTRIBUTING.md](CONTRIBUTING.md) ·
+[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) ·
+[config.example.yaml](config.example.yaml) ·
+[docs/custom-ffmpeg-workflows.md](docs/custom-ffmpeg-workflows.md) ·
+[deploy/README.md](deploy/README.md)
+
+## License
+
+Apache-2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE).

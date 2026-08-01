@@ -1,0 +1,69 @@
+{
+  "schema_version": "",
+  "provider": "google",
+  "model_version": "vision-v1-safesearch",
+  "media_type": "",
+  "asset_id": "",
+  "frames": [
+    {
+      "timestamp_sec": null,
+      "status": "ok",
+      "categories": [
+        {
+          "category": "SEXUAL",
+          "provider_label": "adult:VERY_LIKELY",
+          "score": 1,
+          "score_origin": "likelihood_enum",
+          "threshold": null,
+          "flagged": false
+        },
+        {
+          "category": "SPOOF",
+          "provider_label": "spoof:UNLIKELY",
+          "score": 0.25,
+          "score_origin": "likelihood_enum",
+          "threshold": null,
+          "flagged": false
+        },
+        {
+          "category": "MEDICAL",
+          "provider_label": "medical:POSSIBLE",
+          "score": 0.5,
+          "score_origin": "likelihood_enum",
+          "threshold": null,
+          "flagged": false
+        },
+        {
+          "category": "VIOLENCE",
+          "provider_label": "violence:LIKELY",
+          "score": 0.75,
+          "score_origin": "likelihood_enum",
+          "threshold": null,
+          "flagged": false
+        },
+        {
+          "category": "SUGGESTIVE_RACY",
+          "provider_label": "racy:VERY_UNLIKELY",
+          "score": 0,
+          "score_origin": "likelihood_enum",
+          "threshold": null,
+          "flagged": false
+        }
+      ]
+    }
+  ],
+  "overall": {
+    "verdict": "",
+    "flagged": false,
+    "top_category": null,
+    "max_score": null,
+    "confidence": null
+  },
+  "raw": {
+    "adult": "VERY_LIKELY",
+    "medical": "POSSIBLE",
+    "racy": "VERY_UNLIKELY",
+    "spoof": "UNLIKELY",
+    "violence": "LIKELY"
+  }
+}

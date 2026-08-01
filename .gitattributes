@@ -1,7 +1,0 @@
-# Normalize line endings: store text as LF in the repo (Linux CI runs gofmt/lint).
-* text=auto eol=lf
-
-# Treat known binaries as binary (none yet, but future-proof for test fixtures).
-*.png binary
-*.jpg binary
-*.mp4 binary

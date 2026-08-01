@@ -1,0 +1,72 @@
+# vismod — MINIMAL production example. Copy it, do not run it as-is.
+#
+#   docker compose -f deploy/compose/compose.prod.example.yaml up -d
+#
+# Start from deploy/compose/config.compose.example.yaml for config.yaml,
+# and re-budget rate_limit_rps: it ships as 2, budgeted for the local
+# stack's TWO replicas against Azure F0's 5 RPS quota — a single replica
+# here can take more.
+#
+# What this gives you: one vismod worker on a durable, persisted Redis
+# queue, restarted on failure, with a graceful-drain window and a
+# persisted audit log.
+#
+# What this does NOT give you, and you must add yourself:
+#   - TLS anywhere.
+#   - Authentication on the intake or the operator UI. Both are off here
+#     for that reason.
+#   - Backups of the audit log or the Redis append-only file.
+#   - Multi-host, or more than one replica. A second replica on this file
+#     would share the audit volume and corrupt the hash chain; give each
+#     replica its OWN audit volume (see compose.yaml at the repo root).
+#   - Shared cross-replica rate limiting. The limiter is per process; see
+#     deploy/README.md.
+# Read SECURITY.md before exposing any port, and deploy/README.md for the
+# Kubernetes path, which is the reference deployment.
+
+name: vismod-prod
+
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 512M
+
+  vismod:
+    image: vismod:latest        # build and tag it yourself; no floating build here
+    command: ["serve", "-c", "/etc/vismod/config.yaml"]
+    env_file: .env              # secrets ONLY here, never in yaml
+    volumes:
+      - ./config.yaml:/etc/vismod/config.yaml:ro
+      - ./media:/data:ro
+      - audit:/home/vismod      # audit log is an append-only hash chain: persist it
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    # Must exceed queue.drain_timeout, or SIGTERM drain gets killed
+    # mid-job and work is left for orphan recovery unnecessarily.
+    stop_grace_period: 60s
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 2G
+    # No ports published. The intake and UI have no TLS and the intake
+    # has no auth; publish them only behind something that does.
+
+volumes:
+  redis-data:
+  audit:

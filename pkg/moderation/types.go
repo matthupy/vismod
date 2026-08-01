@@ -1,11 +1,10 @@
-// Package moderation defines the public, model-agnostic contract for the
-// visual content moderation pipeline: the normalized result schema that every
-// adapter produces and that external consumers bind to, plus the Moderator /
-// VideoModerator / HashMatcher interfaces adapters implement.
+// Package moderation defines the public contract types that external
+// consumers of vismod bind to. It has no dependencies on internal packages.
 //
-// This package has NO internal dependencies. It is the stable seam between
-// provider-specific adapters (which map wildly different outputs into this
-// schema) and downstream consumers (review consoles, rules engines).
+// Scores are normalized to [0,1] but are within-provider comparable ONLY:
+// a Microsoft severity/6, a Google likelihood bucket, and a Hive head
+// probability are not the same quantity. Thresholds are per-adapter and
+// not portable across providers. See MODEL_LIMITATIONS.md.
 package moderation
 
 import (
@@ -13,27 +12,29 @@ import (
 	"encoding/json"
 )
 
-// SchemaVersion is the current NormalizedResult schema version. The normalizer
-// stamps it on every result; adapters never set it. Additive fields / additive
-// Category values bump the minor; a removal/rename/meaning-change bumps major.
-const SchemaVersion = "1.0"
+// SchemaVersion is stamped by the normalizer (the pipeline), never by an
+// adapter. Additive fields/values bump the minor version; any
+// remove/rename/meaning change bumps the major version.
+// 1.1.0: added the GAMBLING, ALCOHOL_TOBACCO, OFFENSIVE_GESTURE and
+// ANIMATED_SYNTHETIC categories (additive values only; no field or
+// meaning changed).
+const SchemaVersion = "1.1.0"
 
-// Verdict is the overall asset decision. Precedence is strict:
-// block > error > flag > allow. "error" means could-not-evaluate and MUST be
-// emitted instead of "allow" on any failure (fail-safe, never fail-silent).
+// Verdict is the final decision for an asset.
+// Precedence at rollup is strict: block > error > flag > allow.
 type Verdict string
 
 const (
 	VerdictAllow Verdict = "allow"
 	VerdictFlag  Verdict = "flag"
 	VerdictBlock Verdict = "block"
+	// VerdictError means could-not-evaluate. Fail safe: an errored or
+	// partially-errored asset is never "allow".
 	VerdictError Verdict = "error"
 )
 
-// Category is the canonical, provider-independent harm taxonomy. Any provider
-// label with no canonical mapping normalizes to OTHER (raw label preserved in
-// ProviderLabel) — a result is never dropped. Consumers MUST tolerate unknown
-// future Category values by treating them as OTHER.
+// Category is the canonical, model-agnostic category taxonomy.
+// Consumers MUST tolerate unknown future values by treating them as OTHER.
 type Category string
 
 const (
@@ -44,88 +45,114 @@ const (
 	CategoryWeapons        Category = "WEAPONS"
 	CategorySelfHarm       Category = "SELF_HARM"
 	CategoryHate           Category = "HATE"
+	// CategoryDrugs is illicit drugs only. Legal vice (alcohol, tobacco)
+	// is CategoryAlcoholTobacco — the two carry different policy weight
+	// and most operators threshold them differently.
 	CategoryDrugs          Category = "DRUGS"
-	// MEDICAL and SPOOF carry Google Vision SafeSearch's medical/spoof signals
-	// only; they are NOT harm signals — document provenance to consumers.
-	CategoryMedical Category = "MEDICAL"
-	CategorySpoof   Category = "SPOOF"
-	// CSAMHashMatch is reserved for the HashMatcher pre-stage. No classifier
-	// emits it. A hit is binary list-membership (Score=nil), never a score.
-	CategoryCSAMHashMatch Category = "CSAM_HASH_MATCH"
-	CategoryOther         Category = "OTHER"
+	CategoryAlcoholTobacco Category = "ALCOHOL_TOBACCO"
+	CategoryGambling       Category = "GAMBLING"
+	// CategoryOffensiveGesture covers rude-gesture signals (e.g. Hive's
+	// yes_middle_finger). Distinct from HATE: offensive, not targeted at a
+	// protected group.
+	CategoryOffensiveGesture Category = "OFFENSIVE_GESTURE"
+	// CategoryMedical, CategorySpoof and CategoryAnimatedSynthetic are
+	// provenance carriers, NOT harm signals; do not treat them as
+	// moderation categories. MEDICAL and SPOOF carry Google SafeSearch's
+	// medical/spoof signals. ANIMATED_SYNTHETIC carries "is this drawn,
+	// rendered, or otherwise not a photograph" signals, which change how a
+	// harm score should be read (animated gore is not filmed gore) but are
+	// not themselves harm.
+	CategoryMedical           Category = "MEDICAL"
+	CategorySpoof             Category = "SPOOF"
+	CategoryAnimatedSynthetic Category = "ANIMATED_SYNTHETIC"
+	// CategoryOther is the fallback for any provider label with no
+	// canonical mapping. The raw label is preserved in ProviderLabel and
+	// its score is carried. Results are never dropped.
+	CategoryOther Category = "OTHER"
 )
 
-// ScoreOrigin tags how a normalized Score was derived so consumers know its
-// provenance. Scores are within-provider comparable ONLY — a 0.667 threshold
-// means different things across origins; thresholds are not portable.
+// Canonicalize maps an arbitrary category value onto the canonical set,
+// folding unknown (e.g. future) values to OTHER.
+func Canonicalize(c Category) Category {
+	switch c {
+	case CategorySexual, CategorySuggestiveRacy, CategoryViolence,
+		CategoryGoreGraphic, CategoryWeapons, CategorySelfHarm,
+		CategoryHate, CategoryDrugs, CategoryAlcoholTobacco,
+		CategoryGambling, CategoryOffensiveGesture, CategoryMedical,
+		CategorySpoof, CategoryAnimatedSynthetic, CategoryOther:
+		return c
+	default:
+		return CategoryOther
+	}
+}
+
+// ScoreOrigin records what kind of quantity a normalized Score was derived
+// from. Scores with different origins are not comparable.
 type ScoreOrigin string
 
 const (
-	ScoreOriginProbability    ScoreOrigin = "probability"
-	ScoreOriginConfidencePct  ScoreOrigin = "confidence_pct"
-	ScoreOriginLikelihoodEnum ScoreOrigin = "likelihood_enum"
-	ScoreOriginSeverity       ScoreOrigin = "severity"
-	ScoreOriginListMembership ScoreOrigin = "list_membership"
+	OriginProbability    ScoreOrigin = "probability"
+	OriginConfidencePct  ScoreOrigin = "confidence_pct"
+	OriginLikelihoodEnum ScoreOrigin = "likelihood_enum"
+	OriginSeverity       ScoreOrigin = "severity"
 )
 
-// FrameStatus records whether a single frame could be evaluated. An "error"
-// frame never contributes an "allow" to the asset rollup.
+// FrameStatus reports whether a single frame was successfully evaluated.
 type FrameStatus string
 
 const (
-	FrameStatusOK    FrameStatus = "ok"
-	FrameStatusError FrameStatus = "error"
+	FrameOK    FrameStatus = "ok"
+	FrameError FrameStatus = "error"
 )
 
-// CategoryResult is one provider signal mapped onto the canonical taxonomy.
+// CategoryResult is one provider signal normalized into the common schema.
 //
-// Nullable scalars (Score, Threshold) serialize as explicit JSON null, never
-// omitted — consumers read null, not an absent field. A flagged hash-match row
-// emits score:null, threshold:null, flagged:true.
+// Nullable scalars serialize as JSON null, never omitted: nil Score means
+// could-not-evaluate / unknown. Never emit 0 for unknown.
 type CategoryResult struct {
 	Category      Category    `json:"category"`
-	ProviderLabel string      `json:"provider_label"` // raw native class/Name/enum
-	Score         *float64    `json:"score"`          // normalized 0..1; nil = unknown/unsupported/list-membership
+	ProviderLabel string      `json:"provider_label"`
+	Score         *float64    `json:"score"`
 	ScoreOrigin   ScoreOrigin `json:"score_origin"`
-	Threshold     *float64    `json:"threshold"`            // flag_at boundary; nil for list_membership rows
-	Flagged       bool        `json:"flagged"`              // (Score!=nil && Threshold!=nil && *Score>=*Threshold) OR list-membership match
-	MatchType     string      `json:"match_type,omitempty"` // list_membership only, e.g. "pdq"/"md5"
-	MatchList     string      `json:"match_list,omitempty"` // list_membership only, e.g. "ncmec"/"iwf"
+	Threshold     *float64    `json:"threshold"`
+	Flagged       bool        `json:"flagged"`
 }
 
-// FrameResult holds the categories for one frame (one still image => one frame
-// with TimestampSec nil).
+// FrameResult is the evaluation of one frame (or the single frame of a
+// still image, in which case TimestampSec is nil).
 type FrameResult struct {
-	TimestampSec *float64         `json:"timestamp_sec"` // nil for still images
+	TimestampSec *float64         `json:"timestamp_sec"`
 	Status       FrameStatus      `json:"status"`
 	Error        string           `json:"error,omitempty"`
 	Categories   []CategoryResult `json:"categories"`
 }
 
-// OverallVerdict is the asset-level rollup across all frames. MaxScore and
-// Confidence are nil (never 0.0) when no non-nil score exists.
+// OverallVerdict is the asset-level rollup over ok frames.
 type OverallVerdict struct {
 	Verdict     Verdict   `json:"verdict"`
 	Flagged     bool      `json:"flagged"`
 	TopCategory *Category `json:"top_category"`
-	MaxScore    *float64  `json:"max_score"`
-	Confidence  *float64  `json:"confidence"`
+	// MaxScore and Confidence are nil when NO non-nil score exists across
+	// all frames. They are never collapsed to 0.0.
+	MaxScore   *float64 `json:"max_score"`
+	Confidence *float64 `json:"confidence"`
 }
 
-// NormalizedResult is the single model-agnostic schema every adapter produces.
-// SchemaVersion and ModelVersion are set by the normalizer, never the adapter.
+// NormalizedResult is the one common scoring schema every adapter maps into.
 type NormalizedResult struct {
-	SchemaVersion string          `json:"schema_version"`
-	Provider      string          `json:"provider"`
-	ModelVersion  string          `json:"model_version"` // api-version/model id; "" if none
-	MediaType     string          `json:"media_type"`    // "image" | "video"
-	AssetID       string          `json:"asset_id"`      // stamped by pipeline from Source.Ref
-	Frames        []FrameResult   `json:"frames"`
-	Overall       OverallVerdict  `json:"overall"`
-	Raw           json.RawMessage `json:"raw,omitempty"` // OPTIONAL + SANITIZED (no free-text/OCR/captions)
+	SchemaVersion string         `json:"schema_version"`
+	Provider      string         `json:"provider"`
+	ModelVersion  string         `json:"model_version"`
+	MediaType     string         `json:"media_type"` // "image" | "video"
+	AssetID       string         `json:"asset_id"`
+	Frames        []FrameResult  `json:"frames"`
+	Overall       OverallVerdict `json:"overall"`
+	// Raw is optional and SANITIZED. It must never carry free-text, OCR
+	// output, captions, or media bytes.
+	Raw json.RawMessage `json:"raw,omitempty"`
 }
 
-// Image is a single decoded image handed to an adapter.
+// Image is the pipeline-owned in-memory image handed to a Moderator.
 type Image struct {
 	Bytes  []byte
 	MIME   string
@@ -134,24 +161,28 @@ type Image struct {
 	Meta   map[string]string
 }
 
-// Source describes what to moderate. Kind "file" is the v1 default; "url"/"s3"
-// require an SSRF allow-list before they are enabled.
-type Source struct {
-	Kind      string `json:"kind"`       // "file" (v1); "url"/"s3" later
-	Ref       string `json:"ref"`        // path or URI
-	MediaType string `json:"media_type"` // "image" | "video" | "" (auto-detect)
-}
-
-// Caps declares an adapter's capabilities so the pipeline can dispatch and
-// pre-flight correctly.
+// Caps declares a Moderator's capabilities.
 type Caps struct {
-	SupportsVideo bool       // true => pipeline prefers AnalyzeVideo (if impl)
-	MaxImageBytes int64      // pipeline pre-flights oversize images (0 = no limit)
-	Categories    []Category // canonical categories this adapter can emit
+	// SupportsVideo means the pipeline prefers AnalyzeVideo (when the
+	// impl also satisfies VideoModerator) over frame-by-frame.
+	SupportsVideo bool
+	// MaxImageBytes lets the pipeline pre-flight oversize images before
+	// AnalyzeImage. Zero means no limit.
+	MaxImageBytes int64
+	// Categories are the canonical categories this adapter can emit.
+	Categories []Category
 }
 
-// Moderator is the one interface every adapter implements. Exactly one
-// Moderator is active per process, selected from config at startup.
+// Source identifies an input asset. Kind is "file" in v1; "url"/"s3" are
+// future kinds and require an SSRF allow-list before being enabled.
+type Source struct {
+	Kind      string `json:"kind"`
+	Ref       string `json:"ref"`
+	MediaType string `json:"media_type"` // "image" | "video"
+}
+
+// Moderator is the single-model moderation contract. Exactly one Moderator
+// is active per process, selected from config at startup.
 type Moderator interface {
 	Name() string
 	AnalyzeImage(ctx context.Context, img Image) (NormalizedResult, error)
@@ -159,33 +190,9 @@ type Moderator interface {
 	Close() error
 }
 
-// VideoModerator is an OPTIONAL second interface for video-native providers.
-// The pipeline type-asserts for it. Do NOT fold AnalyzeVideo into Moderator —
-// that would break every existing adapter.
+// VideoModerator is an OPTIONAL second interface for video-native
+// providers. The pipeline type-asserts for it. AnalyzeVideo must never be
+// added to Moderator itself (that would break every implementation).
 type VideoModerator interface {
 	AnalyzeVideo(ctx context.Context, video Source) (NormalizedResult, error)
 }
-
-// CodedError is an OPTIONAL interface an adapter error may implement to expose a
-// provider error code (e.g. Azure's x-ms-error-code). Observability uses it to
-// label vismod_adapter_errors_total{code}; absent, the code is "unknown".
-type CodedError interface {
-	error
-	ErrorCode() string
-}
-
-// HashMatch is a binary list-membership result, NOT a score.
-type HashMatch struct {
-	Matched  bool
-	ListName string // -> CategoryResult.MatchList
-	Algo     string // -> CategoryResult.MatchType
-}
-
-// HashMatcher is the CSAM pre-stage seam. v1 ships a no-op default; the
-// PDQ/TMK matcher is v1.1. A match short-circuits the classifier.
-type HashMatcher interface {
-	Match(ctx context.Context, img Image) (HashMatch, error)
-}
-
-// Ptr returns a pointer to v. Helper for building nullable scalars.
-func Ptr[T any](v T) *T { return &v }

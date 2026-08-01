@@ -3,32 +3,35 @@ package cli
 import (
 	"fmt"
 
-	"github.com/matthupy/vismod/internal/audit"
 	"github.com/spf13/cobra"
+
+	"github.com/vismod/vismod/internal/audit"
 )
 
-func newAuditCmd() *cobra.Command {
-	cmd := &cobra.Command{
-		Use:   "audit",
-		Short: "Inspect the tamper-evident decision audit log",
-	}
-	cmd.AddCommand(newAuditVerifyCmd())
-	return cmd
+var auditCmd = &cobra.Command{
+	Use:   "audit",
+	Short: "Audit-log operations",
 }
 
-func newAuditVerifyCmd() *cobra.Command {
-	return &cobra.Command{
-		Use:   "verify <log-path>",
-		Short: "Recompute the audit hash chain and report the first broken link",
-		Args:  cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			broken, err := audit.Verify(args[0])
-			if err != nil {
-				fmt.Fprintf(cmd.OutOrStdout(), "FAIL: chain broken at seq %d: %v\n", broken, err)
-				return err
-			}
-			fmt.Fprintln(cmd.OutOrStdout(), "OK: audit chain intact")
-			return nil
-		},
-	}
+var auditVerifyCmd = &cobra.Command{
+	Use:   "verify [path]",
+	Short: "Recompute the audit hash chain and report the first broken link",
+	Args:  cobra.MaximumNArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		path := cfg.Audit.Path
+		if len(args) == 1 {
+			path = args[0]
+		}
+		valid, err := audit.Verify(path)
+		if err != nil {
+			return fmt.Errorf("%w (%d records verified before the break)", err, valid)
+		}
+		fmt.Fprintf(cmd.OutOrStdout(), "audit chain OK: %d records verified (%s)\n", valid, path)
+		return nil
+	},
+}
+
+func init() {
+	auditCmd.AddCommand(auditVerifyCmd)
+	rootCmd.AddCommand(auditCmd)
 }

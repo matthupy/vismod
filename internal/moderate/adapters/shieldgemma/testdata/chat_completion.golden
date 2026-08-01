@@ -1,0 +1,51 @@
+{
+  "schema_version": "",
+  "provider": "shieldgemma",
+  "model_version": "shieldgemma-2-4b-it@test",
+  "media_type": "",
+  "asset_id": "",
+  "frames": [
+    {
+      "timestamp_sec": null,
+      "status": "ok",
+      "categories": [
+        {
+          "category": "OTHER",
+          "provider_label": "dangerous_content",
+          "score": 0.12000000000000001,
+          "score_origin": "probability",
+          "threshold": null,
+          "flagged": false
+        },
+        {
+          "category": "SEXUAL",
+          "provider_label": "sexually_explicit",
+          "score": 0.93,
+          "score_origin": "probability",
+          "threshold": null,
+          "flagged": false
+        },
+        {
+          "category": "GORE_GRAPHIC",
+          "provider_label": "violence_gore",
+          "score": 0.44,
+          "score_origin": "probability",
+          "threshold": null,
+          "flagged": false
+        }
+      ]
+    }
+  ],
+  "overall": {
+    "verdict": "",
+    "flagged": false,
+    "top_category": null,
+    "max_score": null,
+    "confidence": null
+  },
+  "raw": {
+    "dangerous_content": 0.12000000000000001,
+    "sexually_explicit": 0.93,
+    "violence_gore": 0.44
+  }
+}

@@ -1,18 +1,7 @@
-// Command vismod is the single binary for the visual content moderation
-// pipeline. It runs both as a one-shot CLI (`vismod scan`) and a long-running
-// worker (`vismod serve`) via subcommands.
+// vismod is the one binary for both modes: one-shot CLI (scan) and
+// long-running containerized worker (serve).
 package main
 
-import (
-	"fmt"
-	"os"
+import "github.com/vismod/vismod/internal/cli"
 
-	"github.com/matthupy/vismod/internal/cli"
-)
-
-func main() {
-	if err := cli.Execute(); err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
-		os.Exit(1)
-	}
-}
+func main() { cli.Execute() }

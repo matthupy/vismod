@@ -1,0 +1,27 @@
+# HPA alternative to KEDA: requires a Prometheus adapter exposing
+# vismod_queue_depth through the custom/external metrics API.
+# Multi-replica REQUIRES queue.driver=redis (see deploy/README.md).
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: vismod-worker
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: vismod-worker
+  minReplicas: 1
+  maxReplicas: 10
+  metrics:
+    - type: External
+      external:
+        metric:
+          name: vismod_queue_depth
+        target:
+          # AverageValue divides the external metric by replica count:
+          # scale until queue-depth-per-replica <= 10.
+          type: AverageValue
+          averageValue: "10"
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 120  # let drains finish before scale-in

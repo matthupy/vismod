@@ -1,0 +1,74 @@
+{
+  "schema_version": "",
+  "provider": "microsoft",
+  "model_version": "2024-09-01",
+  "media_type": "",
+  "asset_id": "",
+  "frames": [
+    {
+      "timestamp_sec": null,
+      "status": "ok",
+      "categories": [
+        {
+          "category": "HATE",
+          "provider_label": "Hate",
+          "score": 0,
+          "score_origin": "severity",
+          "threshold": null,
+          "flagged": false
+        },
+        {
+          "category": "SELF_HARM",
+          "provider_label": "SelfHarm",
+          "score": 0,
+          "score_origin": "severity",
+          "threshold": null,
+          "flagged": false
+        },
+        {
+          "category": "SEXUAL",
+          "provider_label": "Sexual",
+          "score": 0.3333333333333333,
+          "score_origin": "severity",
+          "threshold": null,
+          "flagged": false
+        },
+        {
+          "category": "VIOLENCE",
+          "provider_label": "Violence",
+          "score": 1,
+          "score_origin": "severity",
+          "threshold": null,
+          "flagged": false
+        }
+      ]
+    }
+  ],
+  "overall": {
+    "verdict": "",
+    "flagged": false,
+    "top_category": null,
+    "max_score": null,
+    "confidence": null
+  },
+  "raw": {
+    "categoriesAnalysis": [
+      {
+        "category": "Hate",
+        "severity": 0
+      },
+      {
+        "category": "SelfHarm",
+        "severity": 0
+      },
+      {
+        "category": "Sexual",
+        "severity": 2
+      },
+      {
+        "category": "Violence",
+        "severity": 6
+      }
+    ]
+  }
+}

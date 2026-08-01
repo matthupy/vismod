@@ -1,0 +1,23 @@
+# KEDA ScaledObject: scale vismod serve replicas by queue depth.
+# The scaling signal is the vismod_queue_depth gauge (pending + delayed
+# retries), scraped by Prometheus from each replica's /metrics.
+# Multi-replica REQUIRES queue.driver=redis (see deploy/README.md).
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: vismod-worker
+spec:
+  scaleTargetRef:
+    name: vismod-worker          # your Deployment of `vismod serve`
+  minReplicaCount: 1             # floor of 1: keep consuming during quiet periods
+  maxReplicaCount: 10            # match rate-limit budget (README: rate limits)
+  cooldownPeriod: 120            # settle before scaling in (drain is graceful)
+  triggers:
+    - type: prometheus
+      metadata:
+        serverAddress: http://prometheus.monitoring:9090
+        metricName: vismod_queue_depth
+        # Target depth-per-replica: add a replica for every ~10 queued jobs.
+        # max() because every replica exports the same shared Redis depth.
+        query: max(vismod_queue_depth)
+        threshold: "10"

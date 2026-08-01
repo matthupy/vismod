@@ -1,0 +1,219 @@
+{
+  "schema_version": "",
+  "provider": "hive",
+  "model_version": "visual-moderation-v2",
+  "media_type": "",
+  "asset_id": "",
+  "frames": [
+    {
+      "timestamp_sec": null,
+      "status": "ok",
+      "categories": [
+        {
+          "category": "SEXUAL",
+          "provider_label": "general_nsfw",
+          "score": 0.97,
+          "score_origin": "probability",
+          "threshold": null,
+          "flagged": false
+        },
+        {
+          "category": "SUGGESTIVE_RACY",
+          "provider_label": "general_suggestive",
+          "score": 0.42,
+          "score_origin": "probability",
+          "threshold": null,
+          "flagged": false
+        },
+        {
+          "category": "WEAPONS",
+          "provider_label": "gun_in_hand",
+          "score": 0.11,
+          "score_origin": "probability",
+          "threshold": null,
+          "flagged": false
+        },
+        {
+          "category": "WEAPONS",
+          "provider_label": "knife_not_in_hand",
+          "score": 0.08,
+          "score_origin": "probability",
+          "threshold": null,
+          "flagged": false
+        },
+        {
+          "category": "GORE_GRAPHIC",
+          "provider_label": "very_bloody",
+          "score": 0.03,
+          "score_origin": "probability",
+          "threshold": null,
+          "flagged": false
+        },
+        {
+          "category": "GORE_GRAPHIC",
+          "provider_label": "a_little_bloody",
+          "score": 0.07,
+          "score_origin": "probability",
+          "threshold": null,
+          "flagged": false
+        },
+        {
+          "category": "DRUGS",
+          "provider_label": "yes_marijuana",
+          "score": 0.21,
+          "score_origin": "probability",
+          "threshold": null,
+          "flagged": false
+        },
+        {
+          "category": "ALCOHOL_TOBACCO",
+          "provider_label": "yes_smoking",
+          "score": 0.3,
+          "score_origin": "probability",
+          "threshold": null,
+          "flagged": false
+        },
+        {
+          "category": "GAMBLING",
+          "provider_label": "yes_gambling",
+          "score": 0.15,
+          "score_origin": "probability",
+          "threshold": null,
+          "flagged": false
+        },
+        {
+          "category": "OFFENSIVE_GESTURE",
+          "provider_label": "yes_middle_finger",
+          "score": 0.6,
+          "score_origin": "probability",
+          "threshold": null,
+          "flagged": false
+        },
+        {
+          "category": "ANIMATED_SYNTHETIC",
+          "provider_label": "animated",
+          "score": 0.88,
+          "score_origin": "probability",
+          "threshold": null,
+          "flagged": false
+        },
+        {
+          "category": "MEDICAL",
+          "provider_label": "medical_injectables",
+          "score": 0.12,
+          "score_origin": "probability",
+          "threshold": null,
+          "flagged": false
+        },
+        {
+          "category": "OTHER",
+          "provider_label": "yes_female_swimwear",
+          "score": 0.71,
+          "score_origin": "probability",
+          "threshold": null,
+          "flagged": false
+        },
+        {
+          "category": "OTHER",
+          "provider_label": "yes_child_present",
+          "score": 0.33,
+          "score_origin": "probability",
+          "threshold": null,
+          "flagged": false
+        },
+        {
+          "category": "OTHER",
+          "provider_label": "no_sexual_activity",
+          "score": 0.02,
+          "score_origin": "probability",
+          "threshold": null,
+          "flagged": false
+        },
+        {
+          "category": "OTHER",
+          "provider_label": "brand_new_future_head",
+          "score": 0.5,
+          "score_origin": "probability",
+          "threshold": null,
+          "flagged": false
+        }
+      ]
+    }
+  ],
+  "overall": {
+    "verdict": "",
+    "flagged": false,
+    "top_category": null,
+    "max_score": null,
+    "confidence": null
+  },
+  "raw": {
+    "time": 0,
+    "classes": [
+      {
+        "class": "general_nsfw",
+        "score": 0.97
+      },
+      {
+        "class": "general_suggestive",
+        "score": 0.42
+      },
+      {
+        "class": "gun_in_hand",
+        "score": 0.11
+      },
+      {
+        "class": "knife_not_in_hand",
+        "score": 0.08
+      },
+      {
+        "class": "very_bloody",
+        "score": 0.03
+      },
+      {
+        "class": "a_little_bloody",
+        "score": 0.07
+      },
+      {
+        "class": "yes_marijuana",
+        "score": 0.21
+      },
+      {
+        "class": "yes_smoking",
+        "score": 0.3
+      },
+      {
+        "class": "yes_gambling",
+        "score": 0.15
+      },
+      {
+        "class": "yes_middle_finger",
+        "score": 0.6
+      },
+      {
+        "class": "animated",
+        "score": 0.88
+      },
+      {
+        "class": "medical_injectables",
+        "score": 0.12
+      },
+      {
+        "class": "yes_female_swimwear",
+        "score": 0.71
+      },
+      {
+        "class": "yes_child_present",
+        "score": 0.33
+      },
+      {
+        "class": "no_sexual_activity",
+        "score": 0.02
+      },
+      {
+        "class": "brand_new_future_head",
+        "score": 0.5
+      }
+    ]
+  }
+}

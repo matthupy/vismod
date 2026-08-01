@@ -1,39 +1,59 @@
-// Package cli wires the cobra command tree and the composition root. Adapters
-// are pulled in here by blank import so they self-register; the registry never
-// imports adapter packages.
+// Package cli is the cobra composition root. Adapters self-register via
+// init(); the blank imports below are the ONLY place adapter packages are
+// pulled in (the registry itself never imports them).
 package cli
 
 import (
+	"fmt"
+	"os"
+
 	"github.com/spf13/cobra"
 
-	// Blank imports: each adapter self-registers via init(). This is the ONLY
-	// place that knows the concrete adapter set.
-	_ "github.com/matthupy/vismod/internal/moderate/adapters/azure"
-	_ "github.com/matthupy/vismod/internal/moderate/adapters/google"
-	_ "github.com/matthupy/vismod/internal/moderate/adapters/hive"
-	_ "github.com/matthupy/vismod/internal/moderate/adapters/stub"
+	"github.com/vismod/vismod/internal/config"
+	// Adapter self-registration: blank imports pull each adapter's init()
+	// into the binary. This is the ONLY coupling point.
+	_ "github.com/vismod/vismod/internal/moderate/adapters/google"
+	_ "github.com/vismod/vismod/internal/moderate/adapters/hive"
+	_ "github.com/vismod/vismod/internal/moderate/adapters/microsoft"
+	_ "github.com/vismod/vismod/internal/moderate/adapters/shieldgemma"
 )
 
-// Version is overridden at build time via -ldflags.
-var Version = "0.0.0-dev"
+var (
+	cfgPath string
+	cfg     config.Config
+)
 
-var configPath string
-
-func newRootCmd() *cobra.Command {
-	root := &cobra.Command{
-		Use:   "vismod",
-		Short: "Open-source visual content moderation pipeline",
-		Long: "vismod scans images and video for harmful content using a pluggable " +
-			"visual-moderation model and normalizes provider outputs into one schema.",
-		SilenceUsage: true,
-	}
-	root.PersistentFlags().StringVar(&configPath, "config", "", "path to config file (yaml)")
-
-	root.AddCommand(newScanCmd(), newServeCmd(), newAdaptersCmd(), newAuditCmd(), newVersionCmd(), newHealthcheckCmd())
-	return root
+var rootCmd = &cobra.Command{
+	Use:   "vismod",
+	Short: "vismod — open-source visual content moderation pipeline",
+	Long: `vismod scans images and video for harmful content using a pluggable
+visual-moderation model, normalizes provider outputs into one common
+scoring schema, and runs as a one-shot CLI or a long-running worker.`,
+	SilenceUsage:  true,
+	SilenceErrors: true,
+	PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
+		// version/healthcheck don't need config.
+		switch cmd.Name() {
+		case "version", "healthcheck":
+			return nil
+		}
+		var err error
+		cfg, err = config.Load(cfgPath)
+		if err != nil {
+			return err
+		}
+		return nil
+	},
 }
 
-// Execute runs the root command.
-func Execute() error {
-	return newRootCmd().Execute()
+func init() {
+	rootCmd.PersistentFlags().StringVarP(&cfgPath, "config", "c", "", "path to config yaml (env VISMOD_* overlays it)")
+}
+
+// Execute runs the CLI.
+func Execute() {
+	if err := rootCmd.Execute(); err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(2)
+	}
 }

@@ -1,33 +1,16 @@
 vismod — open-source visual content moderation pipeline
-Copyright 2026 vismod contributors
+Copyright 2026 The vismod Authors
 
-This product includes software developed as a public good for trust & safety,
-positioned as the Classification stage in the Hash Matching → Classification →
-Review → Investigation taxonomy (cf. ROOST — Robust Open Online Safety Tools).
+This product includes software developed by The vismod Authors and
+contributors, licensed under the Apache License, Version 2.0.
 
-Licensed under the Apache License, Version 2.0. See the LICENSE file.
+vismod invokes the external FFmpeg and FFprobe binaries at runtime for
+video frame extraction. FFmpeg is a trademark of Fabrice Bellard and is
+licensed separately (LGPL/GPL depending on build); vismod does not bundle
+or link FFmpeg — the Docker image installs it from the distribution's
+package repository.
 
---------------------------------------------------------------------------------
-Third-party components
---------------------------------------------------------------------------------
-
-This software depends on, but does not bundle, the following components. Each
-is governed by its own license; this NOTICE does not relicense them.
-
-- github.com/matthupy/videosift (MIT) — video frame extraction. Execs the
-  external ffmpeg and ffprobe binaries at runtime.
-- github.com/spf13/cobra, github.com/spf13/viper (Apache-2.0) — CLI + config.
-- github.com/prometheus/client_golang (Apache-2.0) — metrics.
-- golang.org/x/sync (BSD-3-Clause) — errgroup.
-- github.com/hibiken/asynq (MIT) — Redis-backed queue (M5; not yet wired).
-
-The Azure AI Content Safety adapter calls Microsoft's hosted REST API and is
-subject to Microsoft's terms. Per Microsoft policy, Azure AI Content Safety
-MUST NOT be used to detect child sexual abuse material (CSAM); CSAM is handled
-by the hash-match seam (not the classifier) — see RESPONSIBLE_USE.md.
-
-ffmpeg and ffprobe are NOT distributed with this source. The Docker runtime
-stage installs them from the base image's package repository under their own
-licenses (LGPL/GPL depending on build).
-
-PhotoDNA is licensed-access only and is NEVER bundled or redistributed here.
+Third-party Go modules are used under their respective licenses (see
+go.mod); notable direct dependencies: spf13/cobra, spf13/viper,
+prometheus/client_golang, cloud.google.com/go/vision, redis/go-redis,
+golang.org/x/sync (all Apache-2.0, BSD-3-Clause, or MIT).

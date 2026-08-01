@@ -2,307 +2,256 @@ package queue
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/matthupy/vismod/internal/result"
 )
 
-// ErrQueueClosed is returned by Enqueue after Close has begun.
-var ErrQueueClosed = errors.New("queue: closed")
-
-// ErrDeadLetterFull is returned by Enqueue when the DLQ is at capacity.
-// At capacity we reject new intake (never drop, never auto-allow).
-var ErrDeadLetterFull = errors.New("queue: dead-letter queue at capacity")
-
-// jobState tracks a job's lifecycle for observability.
-type jobState string
-
-const (
-	statePending    jobState = "pending"
-	stateProcessing jobState = "processing"
-	stateAcked      jobState = "acked"
-	stateDeadLetter jobState = "dead_letter"
-)
-
-// memQueue is the prototype in-memory FIFO queue.
+// Memq is the in-process dev/CLI driver: a buffered channel (FIFO by
+// construction) plus a fixed worker pool, with a real DLQ and bounded
+// in-memory retry.
 //
-// DURABILITY BOUNDARY: at-most-once, non-durable, single-process — dev/CLI
-// only. A crash loses enqueued AND in-flight jobs. Production intake MUST use
-// driver=redis (M5). serve warns at boot and reports not-ready when this driver
-// backs a long-running worker.
-type memQueue struct {
+// Memq is NON-DURABLE, at-most-once, single-process. A crash loses
+// enqueued and in-flight jobs. It is not for production intake; serve mode
+// warns at boot and in /readyz when driver=memory.
+type Memq struct {
 	cfg QueueConfig
 	log *slog.Logger
 
-	ch       chan Job // buffered => FIFO by construction (dequeue order == enqueue order)
-	seq      atomic.Uint64
-	dlqLen   atomic.Int64
-	inflight atomic.Int64 // jobs currently in process() (in-flight, incl. retry backoff)
+	jobs chan queuedJob
+	stop chan struct{} // closed on Close: workers stop pulling
+
+	closed  atomic.Bool
+	started atomic.Bool
+	pending atomic.Int64 // buffered + scheduled-for-retry
+	active  atomic.Int64 // jobs currently in a handler
+
+	workers sync.WaitGroup
+	timers  sync.WaitGroup
 
 	mu     sync.Mutex
-	states map[result.JobID]jobState
-	closed bool
-
-	wg       sync.WaitGroup
-	startCtx context.Context
+	states map[JobID]string // job states: queued|running|retrying|done|dead
 }
 
-// NewMemQueue builds an in-memory FIFO queue. DeadLetter must be non-nil.
-func NewMemQueue(cfg QueueConfig, log *slog.Logger) (*memQueue, error) {
+type queuedJob struct {
+	job      Job
+	attempts int // completed handler attempts so far
+}
+
+// NewMemq builds the in-memory driver. A nil DLQ gets a MemDLQ.
+func NewMemq(cfg QueueConfig, log *slog.Logger) *Memq {
+	cfg.applyDefaults()
 	if cfg.DeadLetter == nil {
-		return nil, errors.New("queue: QueueConfig.DeadLetter sink is required")
-	}
-	if cfg.Workers <= 0 {
-		cfg.Workers = 1
-	}
-	if cfg.Buffer <= 0 {
-		cfg.Buffer = 64
-	}
-	if cfg.DeadLetterMax <= 0 {
-		cfg.DeadLetterMax = 1024
+		cfg.DeadLetter = NewMemDLQ()
 	}
 	if log == nil {
 		log = slog.Default()
 	}
-	return &memQueue{
+	return &Memq{
 		cfg:    cfg,
 		log:    log,
-		ch:     make(chan Job, cfg.Buffer),
-		states: make(map[result.JobID]jobState),
-	}, nil
+		jobs:   make(chan queuedJob, cfg.Buffer),
+		stop:   make(chan struct{}),
+		states: map[JobID]string{},
+	}
 }
 
-func (q *memQueue) setState(id result.JobID, s jobState) {
+// DLQ exposes the dead-letter sink (for depth metrics and tests).
+func (q *Memq) DLQ() DeadLetterSink { return q.cfg.DeadLetter }
+
+func (q *Memq) setState(id JobID, s string) {
 	q.mu.Lock()
 	q.states[id] = s
 	q.mu.Unlock()
 }
 
-// Enqueue appends a job in arrival order. Blocks on a full buffer until space
-// frees or ctx is done. Rejects when closed or the DLQ is at capacity.
-func (q *memQueue) Enqueue(ctx context.Context, j Job) (result.JobID, error) {
+// States returns a snapshot of job states (for the UI/tests).
+func (q *Memq) States() map[JobID]string {
 	q.mu.Lock()
-	if q.closed {
-		q.mu.Unlock()
+	defer q.mu.Unlock()
+	out := make(map[JobID]string, len(q.states))
+	for k, v := range q.states {
+		out[k] = v
+	}
+	return out
+}
+
+func (q *Memq) Enqueue(ctx context.Context, j Job) (JobID, error) {
+	if q.closed.Load() {
 		return "", ErrQueueClosed
 	}
-	q.mu.Unlock()
-
-	if q.dlqLen.Load() >= int64(q.cfg.DeadLetterMax) {
+	depth, err := q.cfg.DeadLetter.Depth(ctx)
+	if err != nil {
+		return "", fmt.Errorf("memq: dlq depth: %w", err)
+	}
+	if depth >= q.cfg.DeadLetterMax {
+		// Fail-safe backpressure: never drop dead letters, never
+		// auto-allow; reject intake with a retryable signal instead.
+		q.log.Error("dead-letter queue at capacity; rejecting enqueue",
+			"dlq_depth", depth, "dlq_max", q.cfg.DeadLetterMax)
 		return "", ErrDeadLetterFull
 	}
-
-	if j.ID == "" {
-		j.ID = result.JobID(fmt.Sprintf("job-%d", q.seq.Add(1)))
-	}
-	if j.SubmittedAt.IsZero() {
-		j.SubmittedAt = time.Now().UTC()
-	}
-	q.setState(j.ID, statePending)
-
 	select {
-	case q.ch <- j:
+	case q.jobs <- queuedJob{job: j}:
+		q.pending.Add(1)
+		q.setState(j.ID, "queued")
 		return j.ID, nil
-	case <-ctx.Done():
-		return "", ctx.Err()
+	default:
+		return "", ErrQueueFull
 	}
 }
 
-// Start launches the worker pool. It returns immediately; workers run until
-// Close. startCtx cancels the pulling of NEW work; per-job processing uses a
-// separate child ctx so in-flight jobs can finish during drain.
-func (q *memQueue) Start(ctx context.Context, handler Handler) error {
-	if handler == nil {
-		return errors.New("queue: nil handler")
+func (q *Memq) Start(ctx context.Context, handler Handler) error {
+	if !q.started.CompareAndSwap(false, true) {
+		return fmt.Errorf("memq: Start called twice")
 	}
-	q.startCtx = ctx
 	for i := 0; i < q.cfg.Workers; i++ {
-		q.wg.Add(1)
-		go q.worker(handler)
+		q.workers.Add(1)
+		go q.worker(ctx, handler)
 	}
 	return nil
 }
 
-func (q *memQueue) worker(handler Handler) {
-	defer q.wg.Done()
+func (q *Memq) worker(ctx context.Context, handler Handler) {
+	defer q.workers.Done()
 	for {
 		select {
-		case <-q.startCtx.Done():
+		case <-q.stop:
 			return
-		case j, ok := <-q.ch:
-			if !ok {
-				return
-			}
-			q.process(handler, j)
+		case <-ctx.Done():
+			return
+		case qj := <-q.jobs:
+			q.pending.Add(-1)
+			q.process(qj, handler)
 		}
 	}
 }
 
-// process runs a job with bounded retry, per-job timeout and panic recovery.
-// A retry-exhausted, terminal, or panicked job is dead-lettered with an error
-// envelope (Verdict could-not-evaluate — never allow).
-func (q *memQueue) process(handler Handler, j Job) {
-	q.inflight.Add(1)
-	defer q.inflight.Add(-1)
-	q.setState(j.ID, stateProcessing)
+func (q *Memq) process(qj queuedJob, handler Handler) {
+	q.active.Add(1)
+	defer q.active.Add(-1)
+	q.setState(qj.job.ID, "running")
 
-	attempts := 0
-	for {
-		// Thread the 0-based attempt into the Job so the handler can gate
-		// per-job-once side effects (e.g. §L "unstamped" accounting) to the first
-		// dequeue. attempts == 0 on the first call, then 1/2/… on each retry.
-		j.Attempt = attempts
-		disp, err := q.invoke(handler, j)
-		switch disp {
-		case Ack:
-			q.setState(j.ID, stateAcked)
-			recordCompleted(q.cfg.Metrics)
-			return
-		case DeadLetter:
-			q.deadLetter(j, err)
-			return
-		case Retry:
-			if attempts >= q.cfg.MaxRetries {
-				q.deadLetter(j, fmt.Errorf("retry exhausted after %d attempts: %w", attempts, err))
-				return
-			}
-			attempts++
-			q.backoff(attempts)
-			continue
-		default:
-			q.deadLetter(j, fmt.Errorf("unknown disposition %v: %w", disp, err))
+	// The per-job ctx derives from Background, not the lifecycle ctx: a
+	// job pulled before shutdown keeps its full JobTimeout to finish,
+	// Sink.Write, and ack during the drain window.
+	ctx, cancel := context.WithTimeout(context.Background(), q.cfg.JobTimeout)
+	disp, err := runHandler(ctx, handler, qj.job)
+	cancel()
+	qj.attempts++
+
+	switch disp {
+	case Ack:
+		q.setState(qj.job.ID, "done")
+	case Retry:
+		if qj.attempts > q.cfg.MaxRetries {
+			q.deadLetter(qj, fmt.Sprintf("max retries (%d) exceeded: %v", q.cfg.MaxRetries, err))
 			return
 		}
+		q.scheduleRetry(qj, err)
+	default: // DeadLetter (and any unknown disposition fails safe)
+		q.deadLetter(qj, fmt.Sprintf("dead-lettered: %v", err))
 	}
 }
 
-// invoke calls the handler under panic recovery and an optional per-job
-// timeout. A panic is converted to a DeadLetter disposition (poison message) so
-// the pool never crashes.
-func (q *memQueue) invoke(handler Handler, j Job) (disp Disposition, err error) {
-	ctx := context.Background()
-	var cancel context.CancelFunc
-	if q.cfg.JobTimeout > 0 {
-		ctx, cancel = context.WithTimeout(ctx, q.cfg.JobTimeout)
-		defer cancel()
-	}
-
+// runHandler isolates panic recovery: a panicking job dead-letters and the
+// pool keeps running.
+func runHandler(ctx context.Context, handler Handler, j Job) (d Disposition, err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			disp = DeadLetter
-			err = fmt.Errorf("panic in handler: %v", r)
+			d = DeadLetter
+			err = fmt.Errorf("handler panic: %v", r)
 		}
 	}()
-
 	return handler(ctx, j)
 }
 
-func (q *memQueue) backoff(attempt int) {
-	d := q.cfg.RetryBackoff
-	if d <= 0 {
-		return
-	}
-	// Linear backoff is enough for the in-memory prototype.
-	time.Sleep(time.Duration(attempt) * d)
+func (q *Memq) scheduleRetry(qj queuedJob, cause error) {
+	q.setState(qj.job.ID, "retrying")
+	q.pending.Add(1)
+	q.timers.Add(1)
+	backoff := q.cfg.RetryBackoff * time.Duration(qj.attempts)
+	q.log.Warn("job retry scheduled", "job_id", qj.job.ID,
+		"attempt", qj.attempts, "backoff", backoff, "cause", fmt.Sprint(cause))
+	go func() {
+		defer q.timers.Done()
+		t := time.NewTimer(backoff)
+		defer t.Stop()
+		select {
+		case <-q.stop:
+			q.pending.Add(-1)
+			q.log.Warn("pending retry abandoned on shutdown (memq is non-durable)",
+				"job_id", qj.job.ID, "attempts", qj.attempts)
+		case <-t.C:
+			select {
+			case q.jobs <- qj:
+				q.setState(qj.job.ID, "queued")
+			case <-q.stop:
+				q.pending.Add(-1)
+				q.log.Warn("pending retry abandoned on shutdown (memq is non-durable)",
+					"job_id", qj.job.ID, "attempts", qj.attempts)
+			}
+		}
+	}()
 }
 
-func (q *memQueue) deadLetter(j Job, cause error) {
-	q.setState(j.ID, stateDeadLetter)
-	q.dlqLen.Add(1)
-	recordFailed(q.cfg.Metrics)
-
-	msg := "dead-lettered"
-	if cause != nil {
-		msg = cause.Error()
+func (q *Memq) deadLetter(qj queuedJob, reason string) {
+	q.setState(qj.job.ID, "dead")
+	e := DeadLetterEntry{Job: qj.job, Reason: reason, Attempts: qj.attempts, At: time.Now().UTC()}
+	if err := q.cfg.DeadLetter.Write(context.Background(), e); err != nil {
+		q.log.Error("dead-letter write failed", "job_id", qj.job.ID, "err", err)
 	}
-	now := time.Now().UTC().Format(time.RFC3339)
-	env := result.ResultEnvelope{
-		JobID:      j.ID,
-		Source:     j.Source,
-		Error:      msg, // Result is nil => could-not-evaluate, never "allow"
-		StartedAt:  now,
-		FinishedAt: now,
-	}
-	if err := q.cfg.DeadLetter.Write(context.Background(), env); err != nil {
-		q.log.Error("dead-letter sink write failed", "job_id", j.ID, "err", err)
-	}
-	q.log.Warn("job dead-lettered", "job_id", j.ID, "cause", msg)
+	q.log.Warn("job dead-lettered", "job_id", qj.job.ID, "attempts", qj.attempts, "reason", reason)
 }
 
-// QueueDepth returns the number of buffered, not-yet-started jobs.
-func (q *memQueue) QueueDepth(_ context.Context) (int, error) {
-	return len(q.ch), nil
+func (q *Memq) QueueDepth(context.Context) (int, error) {
+	return int(q.pending.Load()), nil
 }
 
-// DeadLetterDepth returns the number of dead-lettered jobs (for metrics).
-func (q *memQueue) DeadLetterDepth() int { return int(q.dlqLen.Load()) }
+// ActiveWorkers reports jobs currently inside a handler (metrics).
+func (q *Memq) ActiveWorkers() int { return int(q.active.Load()) }
 
-// ActiveDepth returns jobs currently in process() — in-flight, not yet acked or
-// dead-lettered. memq is at-most-once, so this includes retry-backoff sleeps (the
-// job is still held). Read live at scrape time.
-func (q *memQueue) ActiveDepth() int { return int(q.inflight.Load()) }
-
-// Close stops intake and gracefully drains in-flight work within DrainTimeout.
-// Buffered-but-unstarted jobs are logged at WARN (not silently dropped).
-// In-flight jobs that do not finish in time are left incomplete and logged —
-// never acked-done.
-func (q *memQueue) Close(ctx context.Context) error {
-	q.mu.Lock()
-	if q.closed {
-		q.mu.Unlock()
+// Close gracefully drains: stop enqueues, stop pulling new work, give
+// in-flight jobs the drain budget. Jobs not finished in time are never
+// acked-done; buffered-but-unstarted jobs are logged at WARN (memq is
+// non-durable, so they are lost).
+func (q *Memq) Close(ctx context.Context) error {
+	if !q.closed.CompareAndSwap(false, true) {
 		return nil
 	}
-	q.closed = true
-	q.mu.Unlock()
-
-	// Stop intake. Workers drain whatever is already buffered until ch empties
-	// or startCtx cancels.
-	close(q.ch)
+	close(q.stop)
 
 	done := make(chan struct{})
 	go func() {
-		q.wg.Wait()
+		q.workers.Wait()
+		q.timers.Wait()
 		close(done)
 	}()
 
-	timeout := q.cfg.DrainTimeout
-	if timeout <= 0 {
-		timeout = 30 * time.Second
-	}
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
-
+	drain := time.NewTimer(q.cfg.DrainTimeout)
+	defer drain.Stop()
+	var drainErr error
 	select {
 	case <-done:
-		q.reportUnstarted()
-		return nil
-	case <-timer.C:
-		q.reportUnstarted()
-		q.log.Warn("queue drain timed out; in-flight jobs left incomplete")
-		return context.DeadlineExceeded
+	case <-drain.C:
+		drainErr = fmt.Errorf("memq: drain timeout after %s; in-flight jobs abandoned unacked", q.cfg.DrainTimeout)
+		q.log.Error("drain timeout; in-flight jobs abandoned unacked", "timeout", q.cfg.DrainTimeout)
 	case <-ctx.Done():
-		q.reportUnstarted()
-		return ctx.Err()
+		drainErr = fmt.Errorf("memq: drain cancelled: %w", ctx.Err())
 	}
-}
 
-func (q *memQueue) reportUnstarted() {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	var pending []result.JobID
-	for id, st := range q.states {
-		if st == statePending {
-			pending = append(pending, id)
+	// Surface buffered-but-unstarted jobs.
+	for {
+		select {
+		case qj := <-q.jobs:
+			q.pending.Add(-1)
+			q.log.Warn("buffered job lost on shutdown (memq is non-durable)", "job_id", qj.job.ID)
+		default:
+			return drainErr
 		}
 	}
-	if len(pending) > 0 {
-		q.log.Warn("buffered jobs never started before shutdown", "count", len(pending), "job_ids", pending)
-	}
 }
 
-var _ Queue = (*memQueue)(nil)
+var _ Queue = (*Memq)(nil)

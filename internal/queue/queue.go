@@ -1,137 +1,135 @@
-// Package queue defines the FIFO job queue seam and a prototype in-memory
-// driver (memq). The interface is rich enough that swapping memq for the
-// Redis-backed asynq driver (M5) is behavior-preserving: the handler returns an
-// explicit Disposition (not a bare error), which both drivers honor identically.
+// Package queue defines the FIFO job queue contract and its drivers.
+//
+// FIFO is a property of the queue: dequeue order = enqueue order. The
+// pending set is never ordered by a sortable key (UUID/job-ID string) —
+// lexicographic ordering silently starves jobs past the pivot. Drivers
+// must use an insertion-ordered structure or a monotonic enqueue sequence.
+//
+// Start order != completion order: FIFO governs dequeue/start only. With
+// more than one worker, completion order is not guaranteed. Strict
+// end-to-end ordering needs workers=1 or per-key serialization.
 package queue
 
 import (
 	"context"
+	"errors"
 	"time"
 
-	"github.com/matthupy/vismod/internal/result"
-	"github.com/matthupy/vismod/pkg/moderation"
+	"github.com/vismod/vismod/pkg/moderation"
 )
 
-// Disposition is the explicit outcome a handler reports for a job. It is the
-// key to a behavior-preserving driver swap: a bare error means opposite things
-// on memq vs asynq, an explicit Disposition does not.
+// Disposition is the explicit handler outcome. Both drivers honor the same
+// Disposition identically (behavior-preserving swap):
+// Ack -> success; Retry -> bounded backoff then DLQ; DeadLetter -> DLQ now.
 type Disposition int
 
 const (
-	// Ack: job succeeded, remove it.
 	Ack Disposition = iota
-	// Retry: transient failure, bounded backoff then dead-letter.
 	Retry
-	// DeadLetter: terminal failure, dead-letter immediately (no retry).
 	DeadLetter
 )
 
-func (d Disposition) String() string {
-	switch d {
-	case Ack:
-		return "ack"
-	case Retry:
-		return "retry"
-	case DeadLetter:
-		return "dead_letter"
-	default:
-		return "unknown"
-	}
-}
+// JobID identifies a job. At-least-once delivery (redisq) means consumers
+// (Sink, audit) must be idempotent per JobID.
+type JobID string
 
-// Job is one unit of work flowing through the queue.
+// Job is a queued unit of work. Payloads carry opaque IDs/refs, never
+// media bytes.
 type Job struct {
-	ID          result.JobID
-	Source      moderation.Source
-	SubmittedAt time.Time
-	// ModelFingerprint is the boot-knowable identity of the model that enqueued
-	// the job (config.ModelFingerprint, §L). The worker dead-letters a job whose
-	// fingerprint != its own loaded model instead of silently moderating with the
-	// wrong model under a rolling deploy. It is an opaque hash => payload-hygiene
-	// safe (§D.3/§G.2: no media/PII). Empty only for a pre-feature (older-binary)
-	// job, since all enqueues go through the single stamping helper.
-	ModelFingerprint string
-
-	// Attempt is the 0-based dequeue attempt for THIS job: 0 on the first
-	// dequeue, 1/2/… on each retry re-dispatch. Both drivers set it before
-	// invoking the handler (memq from its in-process retry loop; asynq from
-	// asynq.GetRetryCount), giving a driver-uniform "is this the first attempt?"
-	// signal. It is queue-RUNTIME metadata, not durable job data: it is
-	// deliberately NOT part of jobPayload, so it is never serialized into Redis
-	// (the count is recovered per-dispatch on the worker side instead). A handler
-	// uses it to make per-job-once side effects idempotent across retries (e.g.
-	// the §L "unstamped" accounting fires only on Attempt==0).
-	Attempt int
+	ID     JobID             `json:"id"`
+	Source moderation.Source `json:"source"`
+	// Workflows optionally names the FFmpeg extraction workflows to run
+	// for a video job (in order; frames are the union). Empty means the
+	// configured default workflow. Names must exist in the validated
+	// ffmpeg.workflows set — validated at intake, never trusted at
+	// execution time alone.
+	Workflows []string `json:"workflows,omitempty"`
+	// DedupThreshold optionally overrides the frames.dedup config for
+	// this job: nil inherits the config; 0..64 enables dedup at that
+	// Hamming distance (even when disabled globally); a negative value
+	// disables dedup for this job.
+	DedupThreshold *int      `json:"dedup_threshold,omitempty"`
+	SubmittedAt    time.Time `json:"submitted_at"`
 }
 
-// Handler processes a job and reports a Disposition. A returned error is
-// advisory detail attached to dead-lettered jobs; the Disposition drives
-// control flow.
+// Handler processes one job and reports its Disposition. A non-nil error
+// accompanies Retry/DeadLetter for logging; it never changes the mapping.
 type Handler func(ctx context.Context, j Job) (Disposition, error)
 
-// QueueConfig tunes a queue driver.
-type QueueConfig struct {
-	Workers       int
-	Buffer        int
-	MaxRetries    int           // bounded retry attempts before dead-letter
-	RetryBackoff  time.Duration // base backoff between retries
-	DrainTimeout  time.Duration // graceful-drain budget for in-flight jobs on Close
-	JobTimeout    time.Duration // per-job processing timeout (0 = none)
-	DeadLetterMax int           // DLQ depth cap; at capacity reject enqueues + alert
-	DeadLetter    result.Sink   // where dead-lettered jobs go (exists in the prototype)
-	// Metrics receives terminal-disposition counts (optional; nil => no-op). It
-	// keeps the queue package decoupled from prometheus — observe.Metrics
-	// implements queue.Recorder.
-	Metrics Recorder
-}
-
-// Recorder receives queue-layer terminal-disposition counts so success/failure
-// is observable uniformly across drivers (asynq's info.Processed/Failed are
-// daily-resetting and absent on memq; emitting our own at the driver gives proper
-// monotonic counters with identical semantics on both). Optional: a nil
-// QueueConfig.Metrics is a no-op (see recordCompleted/recordFailed).
-type Recorder interface {
-	RecordJobCompleted() // a job was acked (successfully processed)
-	RecordJobFailed()    // a job was dead-lettered (retry-exhausted / terminal / panic / mismatch)
-}
-
-func recordCompleted(r Recorder) {
-	if r != nil {
-		r.RecordJobCompleted()
-	}
-}
-
-func recordFailed(r Recorder) {
-	if r != nil {
-		r.RecordJobFailed()
-	}
-}
-
-// DepthReporter is a Queue that also exposes DLQ depth for metrics. Both the
-// memq and asynq drivers implement it, so serve can wire the depth gauges
-// uniformly regardless of driver.
-type DepthReporter interface {
-	Queue
-	DeadLetterDepth() int
-	// ActiveDepth reports jobs pulled by a worker and not yet acked/dead-lettered
-	// (in-flight). Backlog (QueueDepth) can be 0 while jobs are wedged in
-	// processing, so this is the stuck/slow-worker signal.
-	ActiveDepth() int
-}
-
-// Pinger is implemented by drivers backed by an external dependency (the redis
-// driver) so serve can validate reachability at boot and on /readyz. The memq
-// driver is in-process and does not implement it.
-type Pinger interface {
-	Ping(ctx context.Context) error
-}
-
-// Queue is the FIFO job queue. Dequeue order == enqueue order. With >1 worker,
-// completion order is NOT guaranteed (jobs finish at different speeds); strict
-// end-to-end ordering needs Workers=1 or per-key serialization.
+// Queue is the driver contract. Swapping drivers via config must be
+// behavior-preserving with zero call-site changes.
 type Queue interface {
-	Enqueue(ctx context.Context, j Job) (result.JobID, error)
+	Enqueue(ctx context.Context, j Job) (JobID, error)
+	// Start launches the fixed worker pool and returns. Cancelling ctx
+	// stops pulling new work (it does not cancel in-flight jobs; per-job
+	// timeouts do that).
 	Start(ctx context.Context, handler Handler) error
+	// QueueDepth is uniform across drivers and drives autoscaling
+	// (exported as the vismod_queue_depth metric).
 	QueueDepth(ctx context.Context) (int, error)
+	// Close gracefully drains: stop enqueues, stop pulling, give in-flight
+	// jobs the drain budget, never ack jobs that did not finish.
 	Close(ctx context.Context) error
 }
+
+// DeadLetterEntry is a dead-lettered job plus why it died.
+type DeadLetterEntry struct {
+	Job      Job       `json:"job"`
+	Reason   string    `json:"reason"`
+	Attempts int       `json:"attempts"`
+	At       time.Time `json:"at"`
+}
+
+// DeadLetterSink receives dead-lettered jobs. It must exist in the
+// prototype: a dead-lettered job is never silently dropped.
+type DeadLetterSink interface {
+	Write(ctx context.Context, e DeadLetterEntry) error
+	Depth(ctx context.Context) (int, error)
+}
+
+// QueueConfig is shared driver tuning.
+type QueueConfig struct {
+	Workers       int           // worker goroutines per replica (fixed pool)
+	Buffer        int           // pending buffer size (memq)
+	MaxRetries    int           // Retry attempts before DLQ
+	RetryBackoff  time.Duration // base backoff between retries
+	DrainTimeout  time.Duration // graceful-drain budget for in-flight jobs
+	JobTimeout    time.Duration // per-job processing timeout
+	DeadLetterMax int           // DLQ depth cap; at capacity reject enqueues + alert
+	DeadLetter    DeadLetterSink
+}
+
+func (c *QueueConfig) applyDefaults() {
+	if c.Workers <= 0 {
+		c.Workers = 4
+	}
+	if c.Buffer <= 0 {
+		c.Buffer = 1024
+	}
+	if c.MaxRetries < 0 {
+		c.MaxRetries = 0
+	}
+	if c.RetryBackoff <= 0 {
+		c.RetryBackoff = 2 * time.Second
+	}
+	if c.DrainTimeout <= 0 {
+		c.DrainTimeout = 30 * time.Second
+	}
+	if c.JobTimeout <= 0 {
+		c.JobTimeout = 5 * time.Minute
+	}
+	if c.DeadLetterMax <= 0 {
+		c.DeadLetterMax = 1000
+	}
+}
+
+// ErrQueueClosed is returned by Enqueue after Close.
+var ErrQueueClosed = errors.New("queue: closed")
+
+// ErrDeadLetterFull is returned by Enqueue while the DLQ is at capacity:
+// new work is rejected (retryable signal to producers) rather than risking
+// unrecorded failures.
+var ErrDeadLetterFull = errors.New("queue: dead-letter queue at capacity; rejecting new work")
+
+// ErrQueueFull is returned by memq when the pending buffer is full.
+var ErrQueueFull = errors.New("queue: pending buffer full")

@@ -1,256 +1,213 @@
-// Package google implements the Google Cloud Vision SafeSearch adapter — the
-// third real Moderator (after azure + hive) and a second normalization shape:
-// ordinal likelihood enums rather than severities or per-head probabilities. It
-// calls the v1 images:annotate REST data plane directly (no SDK), requesting the
-// SAFE_SEARCH_DETECTION feature, and maps the five likelihood fields
-// (adult/spoof/medical/violence/racy) into the canonical schema (normalize.go).
+// Package google implements the Cloud Vision SafeSearch adapter using the
+// official Go SDK (cloud.google.com/go/vision/v2/apiv1 — a blessed
+// dependency). Auth is Application Default Credentials / service account,
+// env-only (GOOGLE_APPLICATION_CREDENTIALS); no secrets in yaml.
 //
-// Scope: image-only (Caps.SupportsVideo=false). Cloud Video Intelligence is a
-// separate API and a documented future enhancement via the optional
-// moderation.VideoModerator interface; v1 lets the pipeline drive framing via
-// videosift, parallel to azure/hive.
+// Response schema verified against "Detect explicit content (SafeSearch)",
+// cloud.google.com/vision/docs/detecting-safe-search, checked 2026-07-29:
+// safeSearchAnnotation carries exactly the five fields read below, each
+// holding one of the six Likelihood values (UNKNOWN, VERY_UNLIKELY,
+// UNLIKELY, POSSIBLE, LIKELY, VERY_LIKELY). No drift found.
 //
-// Fail-safe: on any provider error — transport, a non-2xx status, an HTTP-200
-// per-response error, or a missing annotation — AnalyzeImage returns an error
-// and the pipeline records a frame Status=error. It NEVER yields allow.
+// SafeSearch returns five categories (adult, spoof, medical, violence,
+// racy), each a likelihood ENUM — not a probability. Normalization uses a
+// configurable lookup (default: VERY_UNLIKELY→0.0, UNLIKELY→0.25,
+// POSSIBLE→0.5, LIKELY→0.75, VERY_LIKELY→1.0) with UNKNOWN→nil (never 0),
+// ScoreOrigin="likelihood_enum".
+//
+// Mapping: adult→SEXUAL, racy→SUGGESTIVE_RACY, violence→VIOLENCE,
+// medical→MEDICAL, spoof→SPOOF. MEDICAL and SPOOF are provenance
+// carriers, NOT harm signals. SafeSearch is image-only → video goes
+// through frame extraction.
 package google
 
 import (
 	"context"
-	"encoding/base64"
+	"encoding/json"
 	"fmt"
-	"math/rand/v2"
-	"net/http"
-	"time"
+	"strings"
 
-	"github.com/matthupy/vismod/internal/moderate"
-	"github.com/matthupy/vismod/pkg/moderation"
+	vision "cloud.google.com/go/vision/v2/apiv1"
+	pb "cloud.google.com/go/vision/v2/apiv1/visionpb"
+
+	"github.com/vismod/vismod/internal/moderate"
+	"github.com/vismod/vismod/pkg/moderation"
 )
-
-const adapterName = "google"
-
-// modelVersion is the Vision API version in the endpoint path. SafeSearch has no
-// separately-versioned model id, so the API version is the stable identity
-// stamped into NormalizedResult.ModelVersion (§E single source of truth).
-const modelVersion = "v1"
-
-// defaultEndpoint is the v1 annotate endpoint. Overridable via options.endpoint
-// (e.g. a regional host or a test server).
-const defaultEndpoint = "https://vision.googleapis.com/v1/images:annotate"
-
-// Vision enforces TWO independent size limits on images:annotate, and for the
-// inline base64 path we send (client.go encodes img into requests[].image.content)
-// the SMALLER one binds. Docs (cloud.google.com/vision/docs/supported-files,
-// /vision/quotas): "Image files ... shouldn't exceed 20 MB" AND "The Vision API
-// imposes a 10 MB JSON request size limit", with the explicit warning that
-// "base64-encoded images may exceed the JSON size limit, even if they are within
-// the image file size limit." base64 inflates raw bytes by 4*ceil(n/3) (~+33%),
-// so the 20 MB image limit is NOT the pre-flight gate for inline content — the
-// 10 MB request limit is. A ~19 MB raw frame that clears a 20 MB check becomes a
-// ~25 MB body and earns a terminal 400 from Vision.
-const (
-	// maxRequestBytes is Vision's 10 MB JSON request limit — the limit that binds
-	// inline base64 content (vs the looser 20 MB per-image file limit, which only
-	// governs a future Cloud-Storage URI path). The base64 content plus the
-	// (small) JSON envelope must fit under it.
-	maxRequestBytes = 10 * 1024 * 1024
-
-	// requestEnvelopeBytes reserves headroom for the JSON wrapper around the
-	// base64 content (requests/image/content/features keys, feature type,
-	// brackets). A few hundred bytes is ample; 1 KiB is a safe margin.
-	requestEnvelopeBytes = 1024
-
-	// maxRawImageBytes is the largest RAW image whose base64 encoding still fits
-	// the request limit: floor of the raw size whose EncodedLen <= the budget.
-	// EncodedLen(n) = 4*ceil(n/3), so the inverse budget is (budget/4)*3. This is
-	// what Caps advertises, so the pipeline pre-flights against the limit that
-	// actually binds inline requests rather than the looser 20 MB image limit.
-	maxRawImageBytes = ((maxRequestBytes - requestEnvelopeBytes) / 4) * 3
-)
-
-// defaultRPS is a conservative default for the shared limiter; tune per the
-// project's Vision quota via options.rps.
-const defaultRPS = 5.0
-
-// defaultMaxRetries is the transient-failure retry count when unset. An explicit
-// max_retries: 0 disables retries (decodeOptions -1 sentinel distinguishes them).
-const defaultMaxRetries = 3
-
-// allowedMIME is Vision's image input allow-list. An unsupported type is a
-// terminal per-frame error (a retry won't fix it).
-var allowedMIME = map[string]bool{
-	"image/jpeg":   true,
-	"image/png":    true,
-	"image/gif":    true,
-	"image/bmp":    true,
-	"image/webp":   true,
-	"image/tiff":   true,
-	"image/x-icon": true,
-}
 
 func init() {
-	moderate.Register(adapterName, New)
+	moderate.Register("google", New)
 }
 
-type google struct {
-	client *client
+// DefaultLikelihoodScores is the default likelihood→score lookup.
+// UNKNOWN is intentionally absent: it normalizes to a nil Score.
+var DefaultLikelihoodScores = map[string]float64{
+	"VERY_UNLIKELY": 0.0,
+	"UNLIKELY":      0.25,
+	"POSSIBLE":      0.5,
+	"LIKELY":        0.75,
+	"VERY_LIKELY":   1.0,
 }
 
-// New builds the Google SafeSearch adapter from config. It fails fast (spec
-// §F.2) when the required auth secret is missing.
-//
-// Options (yaml, non-secret) — the key set matches the §L model-fingerprint
-// whitelist exactly, so this adapter adds no new key to guard:
-//
-//	endpoint      string  default https://vision.googleapis.com/v1/images:annotate
-//	auth_mode     string  "apikey" (default) | "bearer"
-//	rps           float64 shared limiter rate, default 5
-//	max_retries   int     transient-failure retries, default 3
-//	retry_backoff string  time.Duration base backoff, default "500ms"
-//
-// Secrets (env-only, VISMOD_ prefix): VISMOD_GOOGLE_API_KEY (apikey),
-// VISMOD_GOOGLE_TOKEN (bearer), optional VISMOD_GOOGLE_PROJECT (bearer billing
-// project, sent as x-goog-user-project). The GCP project is intentionally NOT an
-// adapter.option — keeping it env-only avoids adding an unclassified option key.
+var categoryMap = map[string]moderation.Category{
+	"adult":    moderation.CategorySexual,
+	"racy":     moderation.CategorySuggestiveRacy,
+	"violence": moderation.CategoryViolence,
+	"medical":  moderation.CategoryMedical,
+	"spoof":    moderation.CategorySpoof,
+}
+
+type options struct {
+	RateLimitRPS     float64            `json:"rate_limit_rps"`    // default 15
+	LikelihoodScores map[string]float64 `json:"likelihood_scores"` // overrides DefaultLikelihoodScores
+}
+
+// annotator abstracts the SDK client for tests.
+type annotator interface {
+	DetectSafeSearch(ctx context.Context, img *pb.Image, ictx *pb.ImageContext) (*pb.SafeSearchAnnotation, error)
+	Close() error
+}
+
+type Moderator struct {
+	client  annotator
+	limiter *moderate.Limiter
+	lookup  map[string]float64
+}
+
+// New is the registry factory. Client construction fails fast when ADC
+// credentials are absent (boot-time credential validation).
 func New(cfg moderate.AdapterConfig) (moderation.Moderator, error) {
-	opts := decodeOptions(cfg.Options)
+	var o options
+	b, _ := json.Marshal(cfg.Options)
+	if err := json.Unmarshal(b, &o); err != nil {
+		return nil, fmt.Errorf("google: options: %w", err)
+	}
+	client, err := vision.NewImageAnnotatorClient(context.Background())
+	if err != nil {
+		return nil, fmt.Errorf("google: vision client (check ADC / GOOGLE_APPLICATION_CREDENTIALS): %w", err)
+	}
+	return newWith(sdkAnnotator{client}, o), nil
+}
 
-	auth, err := newAuth(opts.authMode, cfg.Secret)
+// sdkAnnotator adapts the SDK client to the test-friendly annotator
+// interface via BatchAnnotateImages + SAFE_SEARCH_DETECTION (the v2 SDK
+// exposes no per-feature convenience wrapper).
+type sdkAnnotator struct{ c *vision.ImageAnnotatorClient }
+
+func (s sdkAnnotator) DetectSafeSearch(ctx context.Context, img *pb.Image, ictx *pb.ImageContext) (*pb.SafeSearchAnnotation, error) {
+	resp, err := s.c.BatchAnnotateImages(ctx, &pb.BatchAnnotateImagesRequest{
+		Requests: []*pb.AnnotateImageRequest{{
+			Image:        img,
+			ImageContext: ictx,
+			Features:     []*pb.Feature{{Type: pb.Feature_SAFE_SEARCH_DETECTION}},
+		}},
+	})
 	if err != nil {
 		return nil, err
 	}
+	if len(resp.GetResponses()) == 0 {
+		return nil, fmt.Errorf("empty batch response")
+	}
+	r := resp.GetResponses()[0]
+	if e := r.GetError(); e != nil {
+		return nil, fmt.Errorf("annotate error %d: %s", e.GetCode(), e.GetMessage())
+	}
+	return r.GetSafeSearchAnnotation(), nil
+}
+func (s sdkAnnotator) Close() error { return s.c.Close() }
 
-	endpoint := opts.endpoint
-	if endpoint == "" {
-		endpoint = defaultEndpoint
+func newWith(client annotator, o options) *Moderator {
+	if o.RateLimitRPS == 0 {
+		o.RateLimitRPS = 15
 	}
-	rps := opts.rps
-	if rps <= 0 {
-		rps = defaultRPS
+	lookup := make(map[string]float64, len(DefaultLikelihoodScores))
+	for k, v := range DefaultLikelihoodScores {
+		lookup[k] = v
 	}
-	// opts.maxRetries is -1 only when unset (decodeOptions sentinel); an explicit
-	// 0 is honored to disable retries. Any other negative is nonsense -> default.
-	maxRetries := opts.maxRetries
-	if maxRetries < 0 {
-		maxRetries = defaultMaxRetries
+	for k, v := range o.LikelihoodScores {
+		lookup[strings.ToUpper(k)] = v
 	}
-	backoff := opts.retryBackoff
-	if backoff <= 0 {
-		backoff = 500 * time.Millisecond
+	return &Moderator{
+		client:  client,
+		limiter: moderate.NewLimiter(o.RateLimitRPS),
+		lookup:  lookup,
 	}
-
-	// Seeded RNG drives backoff jitter so concurrent workers that all hit a 429
-	// don't retry in lockstep (thundering herd) against the shared limiter.
-	rng := rand.New(rand.NewPCG(uint64(time.Now().UnixNano()), 0x9E3779B97F4A7C15))
-	return &google{client: newClient(endpoint, auth, rps, maxRetries, backoff, rng)}, nil
 }
 
-func (g *google) Name() string { return adapterName }
+func (m *Moderator) Name() string         { return "google" }
+func (m *Moderator) ModelVersion() string { return "vision-v1-safesearch" }
+func (m *Moderator) Close() error         { return m.client.Close() }
 
-func (g *google) Capabilities() moderation.Caps {
+func (m *Moderator) Capabilities() moderation.Caps {
 	return moderation.Caps{
-		SupportsVideo: false, // SafeSearch is single-image; video framing is one layer up
-		// Advertise the derived raw ceiling, not the 20 MB image limit: inline
-		// base64 requests are bound by Vision's 10 MB JSON request limit (see
-		// maxRawImageBytes), so the pre-flight gate must use it.
-		MaxImageBytes: maxRawImageBytes,
+		SupportsVideo: false, // SafeSearch is image-only → frames
+		MaxImageBytes: 20 << 20,
 		Categories: []moderation.Category{
-			moderation.CategorySexual,
-			moderation.CategorySuggestiveRacy,
-			moderation.CategoryViolence,
-			moderation.CategoryMedical,
+			moderation.CategorySexual, moderation.CategorySuggestiveRacy,
+			moderation.CategoryViolence, moderation.CategoryMedical,
 			moderation.CategorySpoof,
 		},
 	}
 }
 
-func (g *google) Close() error { return nil }
-
-// AnalyzeImage validates input, calls images:annotate, and normalizes the
-// SafeSearch annotation into a single-frame NormalizedResult. The pipeline
-// stamps Threshold/Flagged and the asset rollup. ModelVersion is the API
-// version (§E single source).
-func (g *google) AnalyzeImage(ctx context.Context, img moderation.Image) (moderation.NormalizedResult, error) {
-	if err := validateInput(img); err != nil {
-		return moderation.NormalizedResult{}, err // terminal, never allow
+func (m *Moderator) AnalyzeImage(ctx context.Context, img moderation.Image) (moderation.NormalizedResult, error) {
+	if err := m.limiter.Wait(ctx); err != nil {
+		return moderation.NormalizedResult{}, err
 	}
+	ann, err := m.client.DetectSafeSearch(ctx, &pb.Image{Content: img.Bytes}, nil)
+	if err != nil {
+		// gRPC transient classification is handled by the SDK's own retry
+		// policy; a surviving error is surfaced as retryable so the
+		// fail-safe path applies (never allow).
+		return moderation.NormalizedResult{}, moderation.Retryable(fmt.Errorf("google: safesearch: %w", err))
+	}
+	return m.Normalize(ann)
+}
 
-	resp, err := g.client.analyze(ctx, img.Bytes)
+// Normalize maps a SafeSearchAnnotation into the common schema. Exported
+// for golden tests (pure function, no network).
+func (m *Moderator) Normalize(ann *pb.SafeSearchAnnotation) (moderation.NormalizedResult, error) {
+	if ann == nil {
+		return moderation.NormalizedResult{}, fmt.Errorf("google: nil SafeSearch annotation (could not evaluate)")
+	}
+	fields := []struct {
+		label string
+		lk    pb.Likelihood
+	}{
+		{"adult", ann.Adult},
+		{"spoof", ann.Spoof},
+		{"medical", ann.Medical},
+		{"violence", ann.Violence},
+		{"racy", ann.Racy},
+	}
+	cats := make([]moderation.CategoryResult, 0, len(fields))
+	rawMap := make(map[string]string, len(fields))
+	for _, f := range fields {
+		name := f.lk.String() // e.g. "VERY_UNLIKELY"; "UNKNOWN" for unset
+		rawMap[f.label] = name
+		var score *float64
+		if v, ok := m.lookup[name]; ok && name != "UNKNOWN" {
+			s := v
+			score = &s
+		} // UNKNOWN (or an unlisted enum value) stays nil — never 0
+		canonical, ok := categoryMap[f.label]
+		if !ok {
+			canonical = moderation.CategoryOther
+		}
+		cats = append(cats, moderation.CategoryResult{
+			Category:      canonical,
+			ProviderLabel: f.label + ":" + name,
+			Score:         score,
+			ScoreOrigin:   moderation.OriginLikelihoodEnum,
+		})
+	}
+	raw, err := json.Marshal(rawMap) // sanitized: enum names only
 	if err != nil {
 		return moderation.NormalizedResult{}, err
 	}
-
-	// An HTTP 200 can still carry a PER-RESPONSE failure (responses[].error).
-	// Surface it as a coded error so observability can label
-	// vismod_adapter_errors_total{code} — fail-safe (error, never allow).
-	if err := responseError(resp); err != nil {
-		return moderation.NormalizedResult{}, err
-	}
-
-	// A missing safeSearchAnnotation is an unexpected provider state (the feature
-	// was requested): treat as could-not-evaluate, never a clean frame.
-	ann, ok := firstAnnotation(resp)
-	if !ok {
-		return moderation.NormalizedResult{}, &apiError{Status: 200, Code: "empty_output", Message: "no safeSearchAnnotation in response"}
-	}
-
 	return moderation.NormalizedResult{
-		Provider:     adapterName,
-		ModelVersion: modelVersion,
-		MediaType:    "image",
-		Frames: []moderation.FrameResult{{
-			TimestampSec: nil,
-			Status:       moderation.FrameStatusOK,
-			Categories:   normalize(ann),
-		}},
+		Provider:     "google",
+		ModelVersion: m.ModelVersion(),
+		Frames:       []moderation.FrameResult{{Status: moderation.FrameOK, Categories: cats}},
+		Raw:          raw,
 	}, nil
-}
-
-// responseError returns a coded error when the first response entry carries a
-// per-response error object, else nil. The code is response_<n> so it stays
-// distinct from transport codes (network/decode/http_<n>) in metrics.
-func responseError(resp annotateResponse) error {
-	if len(resp.Responses) == 0 || resp.Responses[0].Error == nil {
-		return nil
-	}
-	e := resp.Responses[0].Error
-	msg := e.Message
-	if msg == "" {
-		msg = "provider response failed"
-	}
-	return &apiError{Status: 200, Code: fmt.Sprintf("response_%d", e.Code), Message: msg}
-}
-
-// validateInput enforces the inline size budget and the format allow-list. All
-// failures are terminal (a retry won't fix empty/oversize/unsupported input), so
-// each returns a coded *apiError and thus lands in vismod_adapter_errors_total{code}
-// with a label, consistent with transport/HTTP/decode errors.
-//
-// Each failure carries a semantically-correct 4xx Status so apiError.Error()
-// renders a meaningful "HTTP 4xx" (a bad-request condition) rather than the
-// misleading "HTTP 0", which reads as a transport event in logs. Status is
-// purely a rendering/observability detail here: these errors stay TERMINAL
-// because the retry loop (client.go) keys off apiError.Retryable (left false),
-// never the numeric Status, and locally-constructed validation errors never
-// reach classifyHTTPError (the only path that maps a Status to retryable). The
-// {code} labels (input_empty/input_oversize/input_mime) are unchanged.
-//
-// The size check is against the base64-ENCODED length vs Vision's 10 MB JSON
-// request limit, not the raw byte count: client.go sends the image as inline
-// base64, which inflates ~33%, so a raw image under 20 MB can still overflow the
-// request limit (see maxRawImageBytes).
-func validateInput(img moderation.Image) error {
-	if len(img.Bytes) == 0 {
-		return &apiError{Status: http.StatusBadRequest, Code: "input_empty", Message: "empty image"}
-	}
-	if base64.StdEncoding.EncodedLen(len(img.Bytes)) > maxRequestBytes-requestEnvelopeBytes {
-		return &apiError{Status: http.StatusRequestEntityTooLarge, Code: "input_oversize", Message: fmt.Sprintf(
-			"image %d bytes exceeds inline budget (base64 must fit Vision's 10 MB request limit; raw cap ~%d bytes)",
-			len(img.Bytes), maxRawImageBytes)}
-	}
-	if img.MIME != "" && !allowedMIME[img.MIME] {
-		return &apiError{Status: http.StatusUnsupportedMediaType, Code: "input_mime", Message: fmt.Sprintf(
-			"unsupported MIME %q (allowed: jpeg/png/gif/bmp/webp/tiff/ico)", img.MIME)}
-	}
-	return nil
 }

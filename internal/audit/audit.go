@@ -1,304 +1,307 @@
-// Package audit implements an append-only, hash-chained decision log and its
-// verifier. It binds each decision to its inputs BY HASH (it stores
-// SHA-256(Raw) + ModelIdentity + verdict, never Raw itself).
+// Package audit implements the tamper-EVIDENT decision log: append-only,
+// hash-chained records binding each verdict to its inputs by hash. It
+// never stores media bytes or provider Raw payloads — only SHA-256(Raw),
+// the ModelIdentity, and the verdict.
 //
-// Scope honesty: a bare chain detects truncation and in-place edits, NOT a
-// full-chain rewrite by a write-capable insider. The tamper-RESISTANT upgrade
-// (HMAC/Ed25519 signing or head-hash anchoring) is a documented future seam.
-//
-// M0 ships a working chain + `verify`. M4 hardens canonicalization to RFC 8785
-// JCS and wires the pipeline to append on every decision.
+// Honest scope: a bare hash chain detects truncation and in-place edits,
+// not a full-chain rewrite by a write-capable insider. The tamper-
+// RESISTANT upgrade seam (HMAC/Ed25519 signing or head-hash anchoring) is
+// the Signer interface below. See SECURITY.md.
 package audit
 
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"sort"
 	"sync"
+	"time"
+
+	"github.com/vismod/vismod/internal/result"
+	"github.com/vismod/vismod/pkg/moderation"
 )
 
-// Payload is the verdict-affecting content bound into the chain. It never
-// contains media bytes or Raw free-text.
-//
-// INVARIANT: every field MUST stay string-typed. canonical() emits numbers
-// verbatim via json.Number.String() and skips JCS's ECMAScript number
-// normalization (an all-string payload never hits that path). Add a float/int
-// field and two writers that format it differently (1e3 vs 1000, -0 vs 0) would
-// hash to different chains while "meaning" the same — a silent integrity split.
-// TestPayloadFieldsAllString enforces this; widen canonical() before relaxing it.
-type Payload struct {
-	JobID        string `json:"job_id"`
-	Verdict      string `json:"verdict"`
-	RawSHA256    string `json:"raw_sha256"`
-	Adapter      string `json:"adapter"`
-	ModelVersion string `json:"model_version"`
-	ConfigHash   string `json:"config_hash"`
+// Signer is the tamper-resistant upgrade seam: implementations sign each
+// entry hash (HMAC, Ed25519) or anchor the head hash externally. v1 ships
+// no default Signer; the chain alone is tamper-evident only.
+type Signer interface {
+	Sign(entryHash []byte) ([]byte, error)
 }
 
-// Record is one chain entry as persisted (one JSON object per line).
+// Record is one audit log line.
 type Record struct {
-	Seq       uint64  `json:"seq"`
-	Timestamp string  `json:"timestamp"` // RFC3339 UTC, second precision (pipeline uses time.RFC3339); ordering is by seq, not this field
-	PrevHash  string  `json:"prev_hash"` // hex
-	Payload   Payload `json:"payload"`
-	EntryHash string  `json:"entry_hash"` // hex
+	Seq       uint64            `json:"seq"`
+	Timestamp string            `json:"timestamp"` // RFC 3339 UTC, nanoseconds
+	PrevHash  string            `json:"prev_hash"` // hex; genesis = 64 zeros
+	Payload   map[string]string `json:"payload"`
+	EntryHash string            `json:"entry_hash"`
+	Signature string            `json:"signature,omitempty"`
 }
 
-var zeroHash [32]byte
+const hashHexLen = 64
 
-// Log is a file-backed append-only hash chain. Appends are idempotent per
-// JobID (a JobID already in the chain is skipped — no new seq, no gap).
-//
-// SINGLE-WRITER ONLY: idempotency is enforced by the in-memory `seen` map, so it
-// holds only within one process. It does NOT survive a process restart
-// mid-retry, and two Logs over one file (M5 asynq multi-worker) would both
-// O_APPEND and interleave — double-append + a corrupt chain. M5 must serialize
-// writers (single audit-writer goroutine/process) before sharing a chain file.
+var genesisPrev = make([]byte, 32)
+
+// Log is the append-only, hash-chained audit log. Appends are idempotent
+// per JobID: the JobID is looked up under the append lock first; if
+// present the append is skipped and no new seq is consumed.
 type Log struct {
-	mu    sync.Mutex
-	path  string
-	seq   uint64
-	prev  [32]byte
-	seen  map[string]struct{}
-	ready bool
+	mu     sync.Mutex
+	f      *os.File
+	seq    uint64
+	prev   []byte
+	seen   map[string]bool
+	signer Signer
 }
 
-// Open loads (or initializes) the chain at path, replaying it to recover the
-// head hash, next seq and the JobID index.
-func Open(path string) (*Log, error) {
-	l := &Log{path: path, prev: zeroHash, seen: map[string]struct{}{}}
-	recs, err := readAll(path)
+// Open opens (or creates) the audit log at path with O_APPEND, replaying
+// the existing chain to restore seq, prev-hash, and the JobID dedupe set.
+// A corrupt existing chain is a fatal boot error: appending to a broken
+// chain would mask tampering.
+func Open(path string, signer Signer) (*Log, error) {
+	existing, err := readRecords(path)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("audit: replay %s: %w", path, err)
 	}
-	for _, r := range recs {
-		h, herr := hex.DecodeString(r.EntryHash)
-		if herr != nil || len(h) != 32 {
-			return nil, fmt.Errorf("audit: bad entry_hash at seq %d", r.Seq)
+	l := &Log{seen: map[string]bool{}, prev: genesisPrev, signer: signer}
+	for i, r := range existing {
+		if err := verifyRecord(r, uint64(i+1), l.prev); err != nil {
+			return nil, fmt.Errorf("audit: existing chain is broken at seq %d: %w (refusing to append to a tampered log)", r.Seq, err)
 		}
-		copy(l.prev[:], h)
 		l.seq = r.Seq
-		l.seen[r.Payload.JobID] = struct{}{}
+		l.prev, _ = hex.DecodeString(r.EntryHash)
+		if id := r.Payload["job_id"]; id != "" {
+			l.seen[id] = true
+		}
 	}
-	l.ready = true
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("audit: open %s: %w", path, err)
+	}
+	l.f = f
 	return l, nil
 }
 
-// Append adds a payload to the chain unless its JobID is already present.
-// Returns the written record (or the existing-skip with ok=false).
-func (l *Log) Append(p Payload, timestamp string) (Record, bool, error) {
+// Record appends one entry for a completed job (idempotent per JobID).
+func (l *Log) Record(_ context.Context, env result.ResultEnvelope) error {
+	payload := payloadFor(env)
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if !l.ready {
-		return Record{}, false, errors.New("audit: log not opened")
+	if l.seen[payload["job_id"]] {
+		return nil // idempotent: no new seq, no duplicate append
 	}
-	if _, dup := l.seen[p.JobID]; dup {
-		return Record{}, false, nil // idempotent skip; no new seq
-	}
+	return l.appendLocked(payload)
+}
 
+// AppendEvent records an operational event (e.g. the gated fail-safe
+// override) into the same chain.
+func (l *Log) AppendEvent(kind string, fields map[string]string) error {
+	payload := map[string]string{"event": kind}
+	for k, v := range fields {
+		payload[k] = v
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.appendLocked(payload)
+}
+
+func (l *Log) appendLocked(payload map[string]string) error {
 	seq := l.seq + 1
-	entry := computeHash(seq, timestamp, l.prev, p)
+	ts := time.Now().UTC().Format(time.RFC3339Nano)
+	entry, err := entryHash(seq, ts, l.prev, payload)
+	if err != nil {
+		return err
+	}
 	rec := Record{
 		Seq:       seq,
-		Timestamp: timestamp,
-		PrevHash:  hex.EncodeToString(l.prev[:]),
-		Payload:   p,
-		EntryHash: hex.EncodeToString(entry[:]),
+		Timestamp: ts,
+		PrevHash:  hex.EncodeToString(l.prev),
+		Payload:   payload,
+		EntryHash: hex.EncodeToString(entry),
 	}
-
-	f, err := os.OpenFile(l.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if l.signer != nil {
+		sig, err := l.signer.Sign(entry)
+		if err != nil {
+			return fmt.Errorf("audit: sign: %w", err)
+		}
+		rec.Signature = hex.EncodeToString(sig)
+	}
+	line, err := json.Marshal(rec)
 	if err != nil {
-		return Record{}, false, err
+		return fmt.Errorf("audit: marshal: %w", err)
 	}
-	defer f.Close()
-	line, _ := json.Marshal(rec)
-	if _, err := f.Write(append(line, '\n')); err != nil {
-		return Record{}, false, err
+	if _, err := l.f.Write(append(line, '\n')); err != nil {
+		return fmt.Errorf("audit: append: %w", err)
 	}
-
 	l.seq = seq
 	l.prev = entry
-	l.seen[p.JobID] = struct{}{}
-	return rec, true, nil
-}
-
-// Verify recomputes the whole chain and returns the seq of the first broken
-// link (0 + nil error means intact).
-func Verify(path string) (brokenSeq uint64, err error) {
-	recs, err := readAll(path)
-	if err != nil {
-		return 0, err
-	}
-	prev := zeroHash
-	var lastSeq uint64
-	for i, r := range recs {
-		if r.Seq != lastSeq+1 {
-			return r.Seq, fmt.Errorf("audit: non-monotonic seq at index %d (got %d, want %d)", i, r.Seq, lastSeq+1)
-		}
-		if r.PrevHash != hex.EncodeToString(prev[:]) {
-			return r.Seq, fmt.Errorf("audit: prev_hash mismatch at seq %d", r.Seq)
-		}
-		want := computeHash(r.Seq, r.Timestamp, prev, r.Payload)
-		if r.EntryHash != hex.EncodeToString(want[:]) {
-			return r.Seq, fmt.Errorf("audit: entry_hash mismatch at seq %d (tampered)", r.Seq)
-		}
-		prev = want
-		lastSeq = r.Seq
-	}
-	return 0, nil
-}
-
-// computeHash = SHA-256(seq[8]BE || timestamp || prev[32] || canonical(payload)),
-// length-prefixed to avoid ambiguous concatenation.
-func computeHash(seq uint64, timestamp string, prev [32]byte, p Payload) [32]byte {
-	h := sha256.New()
-	var seqb [8]byte
-	binary.BigEndian.PutUint64(seqb[:], seq)
-	writeField(h, seqb[:])
-	writeField(h, []byte(timestamp))
-	writeField(h, prev[:])
-	writeField(h, canonical(p))
-	var out [32]byte
-	copy(out[:], h.Sum(nil))
-	return out
-}
-
-func writeField(h interface{ Write([]byte) (int, error) }, b []byte) {
-	var n [8]byte
-	binary.BigEndian.PutUint64(n[:], uint64(len(b)))
-	_, _ = h.Write(n[:])
-	_, _ = h.Write(b)
-}
-
-// canonical serializes the payload in a self-consistent canonical form: object
-// members sorted lexicographically by key, compact (no insignificant
-// whitespace), UTF-8. This makes `audit verify` recompute byte-identical hashes
-// across processes and runs, independent of Go struct declaration order — which
-// is all the chain needs, since the SAME canonicalizer hashes and verifies.
-//
-// SCOPE HONESTY: this is JCS-SHAPED, not byte-for-byte RFC 8785. Go's
-// json.Marshal \u-escapes '<' '>' '&' and U+2028/2029 in string values; strict
-// JCS does not. JobID is caller-supplied and may contain those, so a different
-// JCS implementation could emit a different byte string for the same payload.
-// That does not affect chain integrity (one verifier, both sides); it only means
-// the hashes are NOT a cross-implementation interop contract. The payload is
-// all-string (see Payload), so JCS number-formatting rules never apply here.
-func canonical(p Payload) []byte {
-	b, _ := json.Marshal(p)
-	out, err := jcs(b)
-	if err != nil {
-		// UNREACHABLE: b is freshly marshalled from a struct, so it is always
-		// valid JSON. If jcs ever fails here it is a broken invariant, not a
-		// recoverable error — falling back to raw (unsorted) b would silently
-		// produce a different hash and split the chain. Fail loud instead.
-		panic(fmt.Sprintf("audit: canonicalize freshly-marshalled payload: %v", err))
-	}
-	return out
-}
-
-// jcs re-emits arbitrary JSON in RFC 8785 canonical form: object keys sorted,
-// compact, numbers preserved verbatim via json.Number.
-func jcs(b []byte) ([]byte, error) {
-	dec := json.NewDecoder(bytes.NewReader(b))
-	dec.UseNumber()
-	var v any
-	if err := dec.Decode(&v); err != nil {
-		return nil, err
-	}
-	var buf bytes.Buffer
-	if err := writeCanonical(&buf, v); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
-}
-
-func writeCanonical(buf *bytes.Buffer, v any) error {
-	switch t := v.(type) {
-	case map[string]any:
-		keys := make([]string, 0, len(t))
-		for k := range t {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		buf.WriteByte('{')
-		for i, k := range keys {
-			if i > 0 {
-				buf.WriteByte(',')
-			}
-			ks, _ := json.Marshal(k)
-			buf.Write(ks)
-			buf.WriteByte(':')
-			if err := writeCanonical(buf, t[k]); err != nil {
-				return err
-			}
-		}
-		buf.WriteByte('}')
-	case []any:
-		buf.WriteByte('[')
-		for i, e := range t {
-			if i > 0 {
-				buf.WriteByte(',')
-			}
-			if err := writeCanonical(buf, e); err != nil {
-				return err
-			}
-		}
-		buf.WriteByte(']')
-	case json.Number:
-		buf.WriteString(t.String())
-	default: // string, bool, nil
-		enc, err := json.Marshal(t)
-		if err != nil {
-			return err
-		}
-		buf.Write(enc)
+	if id := payload["job_id"]; id != "" {
+		l.seen[id] = true
 	}
 	return nil
 }
 
-func readAll(path string) ([]Record, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, nil
+func (l *Log) Close() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.f.Close()
+}
+
+// payloadFor binds the decision to its inputs BY HASH: SHA-256(Raw) plus
+// ModelIdentity plus verdict. Raw itself, media bytes, and free-text never
+// enter the audit log.
+func payloadFor(env result.ResultEnvelope) map[string]string {
+	p := map[string]string{
+		"job_id":        string(env.JobID),
+		"asset_id":      "",
+		"adapter":       env.ModelID.Adapter,
+		"model_version": env.ModelID.ModelVersion,
+		"config_hash":   env.ModelID.ConfigHash,
+		"verdict":       "",
+		"raw_sha256":    "",
+	}
+	if env.Result != nil {
+		p["asset_id"] = env.Result.AssetID
+		p["verdict"] = string(env.Result.Overall.Verdict)
+		if len(env.Result.Raw) > 0 {
+			sum := sha256.Sum256(env.Result.Raw)
+			p["raw_sha256"] = hex.EncodeToString(sum[:])
 		}
+	} else if env.Error != "" {
+		p["verdict"] = string(moderation.VerdictError)
+	}
+	return p
+}
+
+// entryHash = SHA-256(seq ‖ timestamp ‖ prev_hash ‖ canonical(payload))
+// with fixed encodings: seq as 8-byte big-endian; timestamp and payload
+// length-prefixed (8-byte BE length); prev_hash as raw 32 bytes.
+func entryHash(seq uint64, ts string, prev []byte, payload map[string]string) ([]byte, error) {
+	canon, err := canonicalJSON(payload)
+	if err != nil {
+		return nil, err
+	}
+	h := sha256.New()
+	var seqB [8]byte
+	binary.BigEndian.PutUint64(seqB[:], seq)
+	h.Write(seqB[:])
+	writeLenPrefixed(h.Write, []byte(ts))
+	h.Write(prev)
+	writeLenPrefixed(h.Write, canon)
+	return h.Sum(nil), nil
+}
+
+func writeLenPrefixed(w func([]byte) (int, error), b []byte) {
+	var lenB [8]byte
+	binary.BigEndian.PutUint64(lenB[:], uint64(len(b)))
+	w(lenB[:])
+	w(b)
+}
+
+// canonicalJSON emits the payload per RFC 8785 JCS. The payload is a flat
+// map of strings, for which JCS reduces to: sorted keys, compact
+// separators, UTF-8, minimal escaping (no HTML escaping).
+func canonicalJSON(payload map[string]string) ([]byte, error) {
+	keys := make([]string, 0, len(payload))
+	for k := range payload {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var buf bytes.Buffer
+	buf.WriteByte('{')
+	for i, k := range keys {
+		if i > 0 {
+			buf.WriteByte(',')
+		}
+		if err := writeJCSString(&buf, k); err != nil {
+			return nil, err
+		}
+		buf.WriteByte(':')
+		if err := writeJCSString(&buf, payload[k]); err != nil {
+			return nil, err
+		}
+	}
+	buf.WriteByte('}')
+	return buf.Bytes(), nil
+}
+
+func writeJCSString(buf *bytes.Buffer, s string) error {
+	enc := json.NewEncoder(buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(s); err != nil {
+		return err
+	}
+	// json.Encoder appends a newline; strip it.
+	buf.Truncate(buf.Len() - 1)
+	return nil
+}
+
+// Verify recomputes the whole chain at path and returns the number of
+// valid records, reporting the FIRST broken link it finds.
+func Verify(path string) (int, error) {
+	records, err := readRecords(path)
+	if err != nil {
+		return 0, err
+	}
+	prev := genesisPrev
+	for i, r := range records {
+		if err := verifyRecord(r, uint64(i+1), prev); err != nil {
+			return i, fmt.Errorf("audit: chain broken at seq %d (record %d): %w", r.Seq, i+1, err)
+		}
+		prev, _ = hex.DecodeString(r.EntryHash)
+	}
+	return len(records), nil
+}
+
+func verifyRecord(r Record, wantSeq uint64, prev []byte) error {
+	if r.Seq != wantSeq {
+		return fmt.Errorf("out-of-order seq: want %d, got %d", wantSeq, r.Seq)
+	}
+	if r.PrevHash != hex.EncodeToString(prev) {
+		return fmt.Errorf("prev_hash mismatch")
+	}
+	if len(r.EntryHash) != hashHexLen {
+		return fmt.Errorf("malformed entry_hash")
+	}
+	want, err := entryHash(r.Seq, r.Timestamp, prev, r.Payload)
+	if err != nil {
+		return err
+	}
+	if hex.EncodeToString(want) != r.EntryHash {
+		return fmt.Errorf("entry_hash mismatch (payload or header tampered)")
+	}
+	return nil
+}
+
+func readRecords(path string) ([]Record, error) {
+	f, err := os.Open(path)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
 	var out []Record
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	line := 0
 	for sc.Scan() {
-		line := sc.Bytes()
-		if len(line) == 0 {
+		line++
+		if len(bytes.TrimSpace(sc.Bytes())) == 0 {
 			continue
 		}
 		var r Record
-		if err := json.Unmarshal(line, &r); err != nil {
-			return nil, fmt.Errorf("audit: malformed record: %w", err)
+		if err := json.Unmarshal(sc.Bytes(), &r); err != nil {
+			return nil, fmt.Errorf("line %d: %w", line, err)
 		}
 		out = append(out, r)
 	}
 	return out, sc.Err()
-}
-
-// ReadRecords returns every persisted chain record in order (empty if the log
-// does not exist yet). Intended for inspection/testing — Verify is the
-// integrity check.
-func ReadRecords(path string) ([]Record, error) { return readAll(path) }
-
-// RawSHA256 hashes raw provider output for binding into the chain.
-func RawSHA256(raw []byte) string {
-	if len(raw) == 0 {
-		return ""
-	}
-	sum := sha256.Sum256(raw)
-	return hex.EncodeToString(sum[:])
 }
