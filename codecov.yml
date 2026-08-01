@@ -1,0 +1,38 @@
+# Codecov config. Coverage is a signal, not a gate — CI correctness is
+# enforced by the test/lint/govulncheck jobs, so a coverage dip informs the
+# review rather than blocking the merge.
+coverage:
+  status:
+    project:
+      default:
+        target: auto
+        threshold: 1%       # tolerate small movement
+        informational: true # never fail the check run
+    patch:
+      default:
+        target: 80%
+        informational: true
+
+comment:
+  layout: "reach, diff, files"
+  behavior: default
+  require_changes: true   # only comment when coverage actually moved
+
+ignore:
+  - "docs/**"
+  - "deploy/**"
+  - "cmd/vismod/main.go"          # thin main, no logic
+  - "**/*_test.go"
+  - "internal/moderate/adapters/golden/**"   # test helper
+
+# Deliberate: no per-package flags, and nothing here blocks a merge.
+#
+# Every package averages into one number, so a drop in the verdict path
+# (internal/pipeline, internal/config, internal/audit) and a drop in the
+# operator dashboard move the badge identically. That flattening is
+# accepted for now — coverage is a review signal, and the fail-safe
+# guarantees are enforced by the rollup tests themselves, which no
+# coverage percentage can substitute for.
+#
+# Revisit by adding a `flags:` block scoped to the verdict path if the
+# single number stops being informative.

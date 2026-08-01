@@ -1,0 +1,31 @@
+# GitHub Pages (Jekyll) config for the vismod docs site.
+#
+# Source is this docs/ directory; the site is built and deployed by
+# .github/workflows/pages.yml. Everything here is plain Markdown — no
+# Jekyll-specific syntax in the pages themselves, so the same files stay
+# readable on github.com and in a local editor.
+title: vismod
+description: >-
+  Open-source visual content moderation pipeline. Fail-safe by design:
+  a provider outage or an unscorable frame yields an error verdict and
+  human review, never a silent allow.
+theme: jekyll-theme-primer
+
+# Absolute links to root-level docs (SECURITY.md, CONTRIBUTING.md, ...)
+# are written out to github.com in the pages, so no baseurl juggling is
+# needed for those. This only affects intra-docs/ relative links.
+relative_links:
+  enabled: true
+  collections: true
+
+# Agent-facing working notes and historical build logs are kept in the
+# repo but not published as documentation pages. UNVERIFIED/STATUS/TASKS
+# under agent/ ARE published — they are linked from the docs and are part
+# of the project's honesty posture.
+exclude:
+  - history/
+  - superpowers/
+  - README.md
+
+plugins:
+  - jekyll-relative-links

@@ -1,16 +1,62 @@
 vismod — open-source visual content moderation pipeline
-Copyright 2026 The vismod Authors
+Copyright (C) 2026 The vismod Authors
 
-This product includes software developed by The vismod Authors and
-contributors, licensed under the Apache License, Version 2.0.
+This program is free software: you can redistribute it and/or modify it
+under the terms of the GNU General Public License as published by the
+Free Software Foundation, either version 3 of the License, or (at your
+option) any later version.
 
-vismod invokes the external FFmpeg and FFprobe binaries at runtime for
-video frame extraction. FFmpeg is a trademark of Fabrice Bellard and is
-licensed separately (LGPL/GPL depending on build); vismod does not bundle
-or link FFmpeg — the Docker image installs it from the distribution's
-package repository.
+This program is distributed in the hope that it will be useful, but
+WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General
+Public License for more details.
 
-Third-party Go modules are used under their respective licenses (see
-go.mod); notable direct dependencies: spf13/cobra, spf13/viper,
-prometheus/client_golang, cloud.google.com/go/vision, redis/go-redis,
-golang.org/x/sync (all Apache-2.0, BSD-3-Clause, or MIT).
+You should have received a copy of the GNU General Public License along
+with this program. If not, see <https://www.gnu.org/licenses/>.
+
+SPDX-License-Identifier: GPL-3.0-or-later
+
+
+FFmpeg
+------
+
+vismod invokes the external `ffmpeg` and `ffprobe` binaries at runtime
+for video frame extraction. It does not bundle, link against, or
+statically include FFmpeg — the Docker image installs it from the
+distribution's package repository, and other deployments supply it on
+`PATH`. Because the interaction is arms-length process execution over
+files and pipes, FFmpeg's own license (LGPL or GPL depending on how the
+build was configured) applies to FFmpeg alone and does not combine with
+vismod's. FFmpeg is a trademark of Fabrice Bellard.
+
+
+Third-party Go modules
+----------------------
+
+vismod links against Go modules distributed under permissive licenses
+(Apache-2.0, BSD-3-Clause, MIT), all of which are one-way compatible with
+GPL-3.0: their code may be combined into this GPL-3.0-or-later work, and
+each module remains available under its own terms upstream. Notable
+direct dependencies:
+
+  github.com/spf13/cobra                Apache-2.0
+  github.com/spf13/viper                Apache-2.0
+  github.com/prometheus/client_golang   Apache-2.0
+  cloud.google.com/go/vision            Apache-2.0
+  github.com/redis/go-redis/v9          BSD-3-Clause
+  golang.org/x/sync                     BSD-3-Clause
+  github.com/alicebob/miniredis/v2      MIT (test-only)
+
+Apache-2.0 is compatible with GPL version 3 but NOT with GPL version 2;
+this is one reason vismod is licensed GPL-3.0-or-later rather than
+GPL-2.0. See the complete module set and versions in go.mod / go.sum.
+
+
+Model providers
+---------------
+
+vismod ships no model weights and performs no classification itself. All
+content detection is performed by the configured provider — Azure AI
+Content Safety, Google Cloud Vision SafeSearch, Hive, or a self-hosted
+ShieldGemma endpoint — under that provider's own terms and license. See
+RESPONSIBLE_USE.md and MODEL_LIMITATIONS.md.

@@ -1,3 +1,8 @@
+---
+title: Tasks
+nav_order: 21
+---
+
 # TASKS
 
 Ordered queue. Take the top unblocked entry. One entry = one commit.

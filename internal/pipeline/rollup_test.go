@@ -30,7 +30,7 @@ func cat(c moderation.Category, score *float64) moderation.CategoryResult {
 
 func TestApplyThresholds(t *testing.T) {
 	cats := ApplyThresholds([]moderation.CategoryResult{
-		cat(moderation.CategorySexual, f(0.45)),  // >= SEXUAL flag_at 0.4 -> flagged
+		cat(moderation.CategorySexual, f(0.45)),   // >= SEXUAL flag_at 0.4 -> flagged
 		cat(moderation.CategoryViolence, f(0.45)), // < default 0.5 -> not flagged
 		cat(moderation.CategoryHate, nil),         // nil score never flags
 	}, th())

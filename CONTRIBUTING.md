@@ -68,6 +68,28 @@ description.
 - Update the docs that ship with behavior you change (README, CLAUDE,
   AGENTS, SECURITY, RESPONSIBLE_USE, MODEL_LIMITATIONS, this file).
 
+## Licensing of contributions
+
+vismod is **GPL-3.0-or-later** ([LICENSE](LICENSE)). There is no CLA and
+no copyright assignment: contributions are inbound=outbound, meaning by
+opening a pull request you license your contribution to the project under
+GPL-3.0-or-later on the same terms, and you keep your copyright.
+
+Two consequences worth knowing before you write code:
+
+- **Anything that links into vismod must be GPL-3.0-compatible.** New
+  dependencies under Apache-2.0, BSD, MIT, ISC, or MPL-2.0 are fine.
+  GPL-2.0-**only** and proprietary/source-available licenses (BUSL, SSPL,
+  Elastic, "free for non-commercial") are not — they cannot be combined
+  with this work. Check before you add an import.
+- **Forks and modified deployments you distribute must ship source.**
+  That is the point of the license: derivative moderation tooling stays
+  auditable. Note that GPL-3.0 obligations are triggered by
+  *distribution*, not by running a modified vismod as a hosted service.
+
+Per-file license headers are not required; the repository-level
+[LICENSE](LICENSE) and [NOTICE](NOTICE) govern every file.
+
 ## Code of conduct
 
 See CODE_OF_CONDUCT.md. Moderation tooling attracts hard discussions;

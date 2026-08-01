@@ -98,11 +98,11 @@ func TestFrameStats(t *testing.T) {
 		return r
 	}
 
-	tr.Record(img("allow"))            // 1 frame
-	tr.Record(vid("allow", 10, 0))     // clean video
-	tr.Record(vid("block", 20, 5))     // solid detection margin
-	tr.Record(vid("flag", 30, 1))      // single-frame flag: recall floor
-	tr.Record(vid("error", 4, 0))      // errored video: counted in volume only
+	tr.Record(img("allow"))        // 1 frame
+	tr.Record(vid("allow", 10, 0)) // clean video
+	tr.Record(vid("block", 20, 5)) // solid detection margin
+	tr.Record(vid("flag", 30, 1))  // single-frame flag: recall floor
+	tr.Record(vid("error", 4, 0))  // errored video: counted in volume only
 
 	f := tr.FrameSnapshot()
 	if f.TotalFrames != 65 {

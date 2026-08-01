@@ -1,9 +1,14 @@
 # vismod
 
+[![ci](https://github.com/matthupy/vismod/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/matthupy/vismod/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/matthupy/vismod/branch/main/graph/badge.svg)](https://codecov.io/gh/matthupy/vismod)
+[![Go Reference](https://pkg.go.dev/badge/github.com/vismod/vismod.svg)](https://pkg.go.dev/github.com/vismod/vismod)
+[![Go 1.26](https://img.shields.io/badge/go-1.26-00ADD8?logo=go&logoColor=white)](go.mod)
+[![License: GPL v3](https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg)](LICENSE)
+
 **Open-source visual content moderation pipeline.** Scans images and
-video for harmful content using a pluggable visual-moderation model
-(Azure AI Content Safety, Google Cloud Vision SafeSearch, or thehive.ai),
-normalizes their wildly different outputs into **one common scoring
+video for harmful content using a pluggable visual-moderation model,
+normalizes wildly different vendor outputs into **one common scoring
 schema**, and runs as a one-shot CLI or a long-running containerized
 worker that scales horizontally by queue depth.
 
@@ -15,8 +20,10 @@ review — never a silent `allow`.
 
 > Read [RESPONSIBLE_USE.md](RESPONSIBLE_USE.md) before deploying. All
 > content detection — including any special-category detection and
-> protections — is performed by the configured scanning vendor under
-> that vendor's terms. This project's docs are not legal advice.
+> protections — is performed by the configured scanning model under that
+> provider's terms. This project's docs are not legal advice.
+
+📖 **[Full documentation](https://matthupy.github.io/vismod/)**
 
 ---
 
@@ -25,7 +32,7 @@ review — never a silent `allow`.
 ```sh
 go build -o vismod ./cmd/vismod
 
-# configure a provider (secrets are env-only, never yaml)
+# configure a model (secrets are env-only, never yaml)
 export VISMOD_MICROSOFT_API_KEY=<key>
 cp config.example.yaml config.yaml   # set adapter.options.endpoint
 
@@ -36,188 +43,169 @@ cp config.example.yaml config.yaml   # set adapter.options.endpoint
 ./vismod -c config.yaml serve
 ```
 
-Docker (one image, both modes — bundles ffmpeg/ffprobe, non-root):
+Other commands: `adapters` (registry + capabilities), `workflows
+list|validate`, `audit verify`, `version`, `healthcheck`.
+
+## Supported scanning models
+
+Exactly **one** model is active per process, selected by `adapter.name`
+at startup; restart to change it. An unknown name fails fast and lists
+the registered adapters — it never falls back.
+
+| `adapter.name` | Model | Hosting | Categories | Score origin | Credential |
+|---|---|---|---|---|---|
+| `microsoft` | Azure AI Content Safety | Vendor cloud | `HATE` `SEXUAL` `VIOLENCE` `SELF_HARM` | `severity` (`severity/6`) | `VISMOD_MICROSOFT_API_KEY` or `VISMOD_MICROSOFT_ACCESS_TOKEN` |
+| `google` | Cloud Vision SafeSearch | Vendor cloud | `SEXUAL` `SUGGESTIVE_RACY` `VIOLENCE` `MEDICAL` `SPOOF` | `likelihood_enum` | ADC / `GOOGLE_APPLICATION_CREDENTIALS` |
+| `hive` | Hive (thehive.ai) visual moderation | Vendor cloud | 14 categories incl. `GORE_GRAPHIC` `WEAPONS` `DRUGS` `GAMBLING` | `probability` | `VISMOD_HIVE_API_TOKEN` |
+| `shieldgemma` | `google/shieldgemma-2-4b-it` | **Self-hosted by you** | `SEXUAL` `GORE_GRAPHIC` `OTHER` | `probability` | none (endpoint only) |
+
+**`shieldgemma` is the no-vendor option**: you run an inference server
+(vLLM, TGI, or anything with an OpenAI-compatible chat-completions
+endpoint), and vismod speaks HTTP to it. No per-call billing, no media
+leaving your network. It requires `provider_thresholds.mode: override`
+and an explicit `model_version`, and it has never been run against a real
+server.
+
+All four are image-scoring, so video is frame-extracted by vismod and
+each frame scored as an image.
+
+> ⚠️ **Scores are not portable between these models.** `severity/6`, a
+> likelihood bucket, and a head probability are different quantities that
+> happen to share the `[0,1]` range. Thresholds are per-adapter and must
+> be retuned when you switch.
+
+Per-model detail — limits, class maps, auth modes, and an honest
+verification status for each — is in
+**[docs/models.md](docs/models.md)**. Adding a model is one adapter
+package plus golden tests, with zero pipeline changes
+([CONTRIBUTING.md](CONTRIBUTING.md)).
+
+## Docker
+
+One image, both modes. Bundles `ffmpeg`/`ffprobe`, runs non-root.
 
 ```sh
 docker build -t vismod .
+```
 
-# A config file is REQUIRED — mount it. There is no usable env-only
-# configuration: the VISMOD_* overlay only overrides keys the yaml
-# already sets, so with no file the adapter name is empty and boot
-# fails with `unknown adapter ""`.
+A config file is **required** — mount it. There is no usable env-only
+configuration: the `VISMOD_*` overlay only overrides keys the yaml
+already sets, so with no file the adapter name is empty and boot fails
+with `unknown adapter ""`.
+
+```sh
+# one-shot scan
 docker run -e VISMOD_MICROSOFT_API_KEY -v "$PWD:/data" \
   vismod scan -c /data/config.yaml /data/clip.mp4
 
+# worker — :9090 serves /metrics /healthz /readyz
 docker run -e VISMOD_MICROSOFT_API_KEY -p 9090:9090 -v "$PWD:/data" \
-  vismod serve -c /data/config.yaml   # :9090 = /metrics /healthz /readyz
+  vismod serve -c /data/config.yaml
 ```
 
 `intake_addr` defaults to `127.0.0.1:8080`, which inside a container is
 reachable only from within it; publishing that port does nothing until
-you set the address to `0.0.0.0:8080`. The dev intake has no auth — read
-[SECURITY.md](SECURITY.md) before exposing it.
+you set the address to `0.0.0.0:8080`. The dev intake has **no auth** —
+read [SECURITY.md](SECURITY.md) before exposing it.
 
-Compose (two replicas, durable Redis queue, Prometheus + Grafana):
+## Docker Compose
+
+The compose stack is the fastest way to see vismod behave like a real
+deployment: two worker replicas against a durable Redis queue, with
+Prometheus and Grafana already wired to the metrics.
 
 ```sh
-cp deploy/compose/env.example .env                                        # set your API key
-cp deploy/compose/config.compose.example.yaml deploy/compose/config.compose.yaml   # set your endpoint
-docker compose up --build     # intake :8080, UI :8081, Prometheus :9090, Grafana :3000
+# 1. credentials (env-only, never yaml)
+cp deploy/compose/env.example .env
+$EDITOR .env                      # set VISMOD_MICROSOFT_API_KEY
+
+# 2. config (mounted into both replicas)
+cp deploy/compose/config.compose.example.yaml deploy/compose/config.compose.yaml
+$EDITOR deploy/compose/config.compose.yaml    # set adapter.options.endpoint
+
+# 3. up
+docker compose up --build
 ```
 
-See [deploy/compose/README.md](deploy/compose/README.md), and
-[deploy/README.md](deploy/README.md) for Kubernetes.
+| Service | Published port | What it is |
+|---|---|---|
+| `vismod-a` | `:8080` intake, `:8081` operator UI | Worker + the only replica publishing ports |
+| `vismod-b` | none | Second worker on the same queue; Prometheus reaches it over the compose network |
+| `prometheus` | `:9090` | Scrapes both replicas. Host `:9090` is Prometheus — the replicas' own metrics port stays internal |
+| `grafana` | `:3000` | Preprovisioned vismod dashboard, anonymous view-only |
+| `redis` | none | Durable at-least-once queue; data survives `down`/`up` |
 
-Other commands: `adapters` (registry + capabilities), `workflows
-list|validate`, `audit verify`, `version`, `healthcheck`.
+Drop a file in `./media/` (mounted read-only at `/data`) and submit it:
 
-## How it works
-
-```
-            video   ┌───────────────┐
- job ──────────────▶│ FFmpegSource  │─ frames ─┐
-      │             │ (workflows)   │          │
-      │             └───────────────┘          ▼
-      │ image                        ┌───────────────────┐
-      └─────────────────────────────▶│ Moderator adapter │
-                                     │ (exactly 1 active)│
-                                     └─────────┬─────────┘
-                                               ▼
-                          normalize → thresholds → rollup
-                                               ▼
-                                  Sink → audit → ack/DLQ
+```sh
+curl -X POST localhost:8080/jobs \
+  -H 'content-type: application/json' \
+  -d '{"kind":"file","ref":"/data/clip.mp4"}'
 ```
 
-- **One model active per process**, selected by `adapter.name` at
-  startup; restart to change. Unknown names fail fast listing the
-  registered adapters. Adding a vendor = one adapter package + golden
-  tests, zero pipeline changes ([CONTRIBUTING.md](CONTRIBUTING.md)).
-- **Registered adapters:** `microsoft` (Azure AI Content Safety),
-  `google` (Cloud Vision SafeSearch), `hive` (thehive.ai), and
-  `shieldgemma` — **self-hosted**: you run an inference server serving
-  `google/shieldgemma-2-4b-it` and vismod speaks HTTP to it, with no
-  per-call billing and no media leaving your network. It requires
-  `provider_thresholds.mode: override` and an explicit `model_version`,
-  and it has never been run against a real server
-  ([docs/agent/UNVERIFIED.md](docs/agent/UNVERIFIED.md)).
-- **Video** is frame-extracted via direct `ffmpeg`/`ffprobe`
-  (config-driven, guardrailed workflows —
-  [docs/custom-ffmpeg-workflows.md](docs/custom-ffmpeg-workflows.md)),
-  then each frame is moderated as an image. Jobs may select one or more
-  workflows (`scan --workflow …` / `"workflows":[…]` on the intake);
-  frames are the union, capped by `max_frames`. An optional
-  `frames.dedup` stage drops near-duplicate frames (dHash Hamming
-  distance) before they spend moderation calls. Video-native adapters
-  can implement `VideoModerator` and skip extraction.
-- **Normalization**: every provider signal becomes a `CategoryResult`
-  with a canonical category, the raw `provider_label`, a normalized
-  score in [0,1] (or **null** for could-not-evaluate — never 0), and its
-  `score_origin`. Unmapped labels land in `OTHER`; nothing is dropped.
-- **Verdicts** roll up per asset with strict precedence
-  `block > error > flag > allow`; any errored frame, zero frames, or an
-  all-null score set is `error` — never `allow`.
+`media_type` is inferred from the extension; `workflows` is optional.
+Then watch `vismod_queue_depth` in Grafana drain as the two replicas
+claim work — the queue is the coordination point, so replicas need no
+knowledge of each other.
 
-### Example envelope (one JSON line per job)
+⚠️ **Do not `docker compose up --scale vismod-b=N`.** It succeeds
+silently, but every scaled replica shares the one `audit-b` volume and
+corrupts the audit hash chain. Each replica needs its own audit volume —
+add a `vismod-c` service with an `audit-c` volume instead.
 
-```json
-{"job_id":"scan-...","source":{"kind":"file","ref":"/data/clip.mp4","media_type":"video"},
- "model_id":{"adapter":"microsoft","model_version":"2024-09-01","config_hash":"9b6f…"},
- "result":{"schema_version":"1.1.0","provider":"microsoft","media_type":"video",
-   "asset_id":"/data/clip.mp4",
-   "frames":[{"timestamp_sec":2.0,"status":"ok","categories":[
-     {"category":"SEXUAL","provider_label":"Sexual","score":0.333,
-      "score_origin":"severity","threshold":0.4,"flagged":false}]}],
-   "overall":{"verdict":"allow","flagged":false,"top_category":"SEXUAL",
-     "max_score":0.333,"confidence":0.333}},
- "started_at":"…","finished_at":"…"}
-```
+What this stack exercises, and what it deliberately does not, is written
+up in **[deploy/compose/README.md](deploy/compose/README.md)** — including
+`compose.prod.example.yaml` for a production-shaped variant. For
+Kubernetes, KEDA, and HPA: **[deploy/README.md](deploy/README.md)**.
 
-## Things you must know before production
+Without a real vendor credential every job correctly ends
+`verdict:"error"` — that is the fail-safe design working, not a broken
+stack.
 
-- **Scores are not portable across providers.** `severity/6`, a
-  likelihood bucket, and a head probability are different quantities;
-  thresholds are per-adapter and must be retuned on switch. Details:
-  [MODEL_LIMITATIONS.md](MODEL_LIMITATIONS.md).
-- **FIFO ≠ completion order.** Dequeue order equals enqueue order, but
-  with `queue.workers > 1` completion order is not guaranteed. Strict
-  end-to-end ordering needs `workers: 1` (or per-key serialization
-  upstream).
-- **The memory queue driver is not for production intake.** It is
-  single-process, non-durable, at-most-once: a crash loses queued and
-  in-flight jobs. `serve` warns at boot and in `/readyz`. Production and
-  any multi-replica deployment require `queue.driver: redis` (durable,
-  at-least-once, crash-recovering).
-- **At-least-once means redelivery happens, and sink idempotency is
-  per-process.** Every result sink is idempotent per `job_id` within a
-  process lifetime, so a redelivery to a running worker never
-  double-writes. That guarantee does NOT survive a restart: the dedupe
-  set is in memory, so a job redelivered after a crash or a rolling
-  restart gets a second line in the `file` sink (and a second POST to a
-  `webhook` receiver). The audit log is the exception — `audit.Open`
-  replays its file and rebuilds the seen-set before appending, so its
-  per-`job_id` guarantee holds across restarts. Downstream consumers of
-  the `file` and `webhook` sinks must dedupe on `job_id` themselves.
-- **Result envelope destinations are configurable.** `output.sinks`
-  (`config.example.yaml`) fans each envelope out to any combination of
-  stdout, an append-only JSONL file, and an HTTP webhook. Every sink is
-  attempted and the first failure is what triggers redelivery — a
-  webhook outage never suppresses the local record. Omit the `output`
-  block for the stdout-only default every earlier release used. A `file`
-  sink needs one path per replica ([deploy/README.md](deploy/README.md)).
-- **Custom FFmpeg workflows are an operator-trust boundary.** They are
-  validated hard (no shell, single bound input, protocol deny-list,
-  output confinement — [SECURITY.md](SECURITY.md)), but review workflow
-  changes like code.
-- **Rate limits**: the token bucket is shared across all workers and
-  frame fan-out in one process, but replicas multiply it — budget
-  `global_quota / max_replicas` per replica or add a shared limiter
-  ([deploy/README.md](deploy/README.md)).
+## Documentation
 
-## Scaling out
+Technical detail lives in [docs/](docs/), published at
+**[matthupy.github.io/vismod](https://matthupy.github.io/vismod/)**.
 
-Each replica runs a fixed pool of `queue.workers` goroutines; horizontal
-scale is replica-count driven by the **`vismod_queue_depth`** gauge.
-KEDA `ScaledObject` and HPA examples, the drain-on-deploy contract, and
-the rate-limit budgeting note live in [deploy/](deploy/README.md).
+| Page | What's in it |
+|---|---|
+| [Architecture](docs/architecture.md) | Pipeline shape, package map, normalization, verdict rollup |
+| [Supported models](docs/models.md) | Per-adapter detail and verification status |
+| [Result envelope](docs/result-envelope.md) | Output schema, sinks, idempotency boundaries |
+| [Scaling and observability](docs/scaling.md) | Queue drivers, replica scaling, metrics, backpressure |
+| [Audit log](docs/audit-log.md) | Hash chain, verification, tamper-evident scope |
+| [Production checklist](docs/production-checklist.md) | The list to walk before going live |
+| [Custom ffmpeg workflows](docs/custom-ffmpeg-workflows.md) | Writing and validating extraction workflows |
+| [Self-hosted classifiers](docs/self-hosted-classifiers.md) | Which open-weight model to run, and why |
 
-Observability: Prometheus `/metrics` (`vismod_jobs_total{verdict}`,
-`vismod_adapter_request_seconds`, `vismod_adapter_errors_total`,
-`vismod_queue_depth`, `vismod_deadletter_depth`,
-`vismod_workers_active`), `/healthz` liveness, `/readyz` readiness —
-which also flips not-ready under sustained provider failure
-(backpressure with hysteresis) so ingress backs off instead of
-black-holing jobs.
+Policy and posture: [SECURITY.md](SECURITY.md) ·
+[RESPONSIBLE_USE.md](RESPONSIBLE_USE.md) ·
+[MODEL_LIMITATIONS.md](MODEL_LIMITATIONS.md) ·
+[CONTRIBUTING.md](CONTRIBUTING.md) ·
+[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) ·
+[config.example.yaml](config.example.yaml)
 
-## Audit log
-
-Every decision appends to a hash-chained, append-only audit log binding
-the verdict to its inputs **by hash** (`SHA-256(Raw)` + model identity +
-config hash — never media or provider payloads). `vismod audit verify`
-recomputes the chain and reports the first broken link. Scope honesty:
-tamper-evident, not tamper-proof — see [SECURITY.md](SECURITY.md).
+Working with a coding agent? [AGENTS.md](AGENTS.md).
 
 ## Development
 
 ```sh
-go test ./...     # no network, no credentials: fakes, httptest, miniredis
+go build ./...
 go vet ./...
+go test ./...     # no network, no credentials: fakes, httptest, miniredis
 ```
 
 Golden files regenerate with `go test -update ./internal/moderate/...`.
 FFmpeg integration tests skip automatically when ffmpeg is absent.
 
-## Docs
-
-[SECURITY.md](SECURITY.md) ·
-[RESPONSIBLE_USE.md](RESPONSIBLE_USE.md) ·
-[AGENTS.md](AGENTS.md) ·
-[MODEL_LIMITATIONS.md](MODEL_LIMITATIONS.md) ·
-[CONTRIBUTING.md](CONTRIBUTING.md) ·
-[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) ·
-[config.example.yaml](config.example.yaml) ·
-[docs/custom-ffmpeg-workflows.md](docs/custom-ffmpeg-workflows.md) ·
-[deploy/README.md](deploy/README.md)
-
 ## License
 
-Apache-2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+**GPL-3.0-or-later** — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+
+vismod is copyleft on purpose. Fork it, modify it, deploy it; if you
+distribute your changes, they stay open source too. Moderation tooling
+that decides what people can post should be auditable by the people it
+decides about.
+
+Contributions are inbound=outbound with no CLA
+([CONTRIBUTING.md](CONTRIBUTING.md#licensing-of-contributions)).
