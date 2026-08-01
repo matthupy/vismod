@@ -18,7 +18,7 @@ var versionCmd = &cobra.Command{
 	Short: "Print version information",
 	Args:  cobra.NoArgs,
 	Run: func(cmd *cobra.Command, _ []string) {
-		fmt.Fprintf(cmd.OutOrStdout(), "vismod %s (%s) %s/%s\n", Version, Commit, runtime.GOOS, runtime.GOARCH)
+		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "vismod %s (%s) %s/%s\n", Version, Commit, runtime.GOOS, runtime.GOARCH)
 	},
 }
 

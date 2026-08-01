@@ -20,7 +20,7 @@ var healthcheckCmd = &cobra.Command{
 		if err != nil {
 			return fmt.Errorf("healthcheck: %w", err)
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 		if resp.StatusCode != http.StatusOK {
 			return fmt.Errorf("healthcheck: %s returned %d", healthURL, resp.StatusCode)
 		}

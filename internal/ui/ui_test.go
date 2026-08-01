@@ -41,12 +41,12 @@ func do(t *testing.T, s *Server, method, path, user, pass string) *httptest.Resp
 	}
 	rec := httptest.NewRecorder()
 	var h http.HandlerFunc
-	switch {
-	case path == "/api/status":
+	switch path {
+	case "/api/status":
 		h = s.auth(s.status)
-	case path == "/api/intake/pause":
+	case "/api/intake/pause":
 		h = s.auth(s.pause)
-	case path == "/api/intake/resume":
+	case "/api/intake/resume":
 		h = s.auth(s.resume)
 	default:
 		h = s.auth(s.index)
