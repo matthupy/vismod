@@ -68,7 +68,7 @@ func dhashFile(path string) (uint64, error) {
 	if err != nil {
 		return 0, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }() // read-only decode; close cannot lose data
 	img, _, err := image.Decode(f)
 	if err != nil {
 		return 0, fmt.Errorf("decode %s: %w", path, err)

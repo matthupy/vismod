@@ -26,7 +26,7 @@ var auditVerifyCmd = &cobra.Command{
 		if err != nil {
 			return fmt.Errorf("%w (%d records verified before the break)", err, valid)
 		}
-		fmt.Fprintf(cmd.OutOrStdout(), "audit chain OK: %d records verified (%s)\n", valid, path)
+		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "audit chain OK: %d records verified (%s)\n", valid, path)
 		return nil
 	},
 }
