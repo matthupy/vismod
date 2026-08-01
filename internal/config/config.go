@@ -310,17 +310,17 @@ type Config struct {
 	Adapter            AdapterSection     `mapstructure:"adapter"`
 	Thresholds         Thresholds         `mapstructure:"thresholds"`
 	ProviderThresholds ProviderThresholds `mapstructure:"provider_thresholds"`
-	FFmpeg       FFmpegConfig       `mapstructure:"ffmpeg"`
-	Frames       FramesConfig       `mapstructure:"frames"`
-	Queue        QueueConfig        `mapstructure:"queue"`
-	Audit        AuditConfig        `mapstructure:"audit"`
-	UI           UIConfig           `mapstructure:"ui"`
-	Output       OutputConfig       `mapstructure:"output"`
-	Backpressure BackpressureConfig `mapstructure:"backpressure"`
-	Failsafe     FailsafeConfig     `mapstructure:"failsafe"`
-	LogLevel     string             `mapstructure:"log_level"`
-	MetricsAddr  string             `mapstructure:"metrics_addr"`
-	IntakeAddr   string             `mapstructure:"intake_addr"`
+	FFmpeg             FFmpegConfig       `mapstructure:"ffmpeg"`
+	Frames             FramesConfig       `mapstructure:"frames"`
+	Queue              QueueConfig        `mapstructure:"queue"`
+	Audit              AuditConfig        `mapstructure:"audit"`
+	UI                 UIConfig           `mapstructure:"ui"`
+	Output             OutputConfig       `mapstructure:"output"`
+	Backpressure       BackpressureConfig `mapstructure:"backpressure"`
+	Failsafe           FailsafeConfig     `mapstructure:"failsafe"`
+	LogLevel           string             `mapstructure:"log_level"`
+	MetricsAddr        string             `mapstructure:"metrics_addr"`
+	IntakeAddr         string             `mapstructure:"intake_addr"`
 }
 
 func f64(v float64) *float64 { return &v }

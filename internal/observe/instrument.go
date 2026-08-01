@@ -60,9 +60,9 @@ type instrumented struct {
 	metrics *Metrics
 }
 
-func (i instrumented) Name() string                     { return i.inner.Name() }
-func (i instrumented) Capabilities() moderation.Caps    { return i.inner.Capabilities() }
-func (i instrumented) Close() error                     { return i.inner.Close() }
+func (i instrumented) Name() string                  { return i.inner.Name() }
+func (i instrumented) Capabilities() moderation.Caps { return i.inner.Capabilities() }
+func (i instrumented) Close() error                  { return i.inner.Close() }
 
 func (i instrumented) AnalyzeImage(ctx context.Context, img moderation.Image) (moderation.NormalizedResult, error) {
 	start := time.Now()

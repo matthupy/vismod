@@ -222,4 +222,3 @@ func RenderWorkflow(wf config.WorkflowConfig, v TemplateValues) ([]string, error
 	}
 	return append([]string{"-nostdin"}, out...), nil
 }
-

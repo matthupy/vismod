@@ -45,11 +45,11 @@ func init() {
 }
 
 type options struct {
-	Endpoint    string  `json:"endpoint"`     // https://<resource>.cognitiveservices.azure.com
-	APIVersion  string  `json:"api_version"`  // default DefaultAPIVersion
-	AuthMode    string  `json:"auth_mode"`    // "key" (default) | "entra"
+	Endpoint     string  `json:"endpoint"`       // https://<resource>.cognitiveservices.azure.com
+	APIVersion   string  `json:"api_version"`    // default DefaultAPIVersion
+	AuthMode     string  `json:"auth_mode"`      // "key" (default) | "entra"
 	RateLimitRPS float64 `json:"rate_limit_rps"` // default 5 (F0 tier)
-	MaxAttempts int     `json:"max_attempts"` // HTTP retry budget, default 3
+	MaxAttempts  int     `json:"max_attempts"`   // HTTP retry budget, default 3
 }
 
 // Moderator is the Azure Content Safety adapter.
@@ -130,8 +130,10 @@ func (m *Moderator) Capabilities() moderation.Caps {
 
 // analyzeRequest is the v1 request: inline content only (see SSRF note).
 type analyzeRequest struct {
-	Image      struct{ Content string `json:"content"` } `json:"image"`
-	OutputType string                                    `json:"outputType"`
+	Image struct {
+		Content string `json:"content"`
+	} `json:"image"`
+	OutputType string `json:"outputType"`
 }
 
 type analyzeResponse struct {

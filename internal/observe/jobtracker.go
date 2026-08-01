@@ -110,7 +110,7 @@ type VerdictStats struct {
 //     single-frame flags means the current density is already near the
 //     recall floor; do not thin further.
 type FrameStats struct {
-	TotalFrames       int     `json:"total_frames"`         // all jobs, images count 1
+	TotalFrames       int     `json:"total_frames"` // all jobs, images count 1
 	VideoJobs         int     `json:"video_jobs"`
 	VideoFrames       int     `json:"video_frames"`
 	AvgFramesPerVideo float64 `json:"avg_frames_per_video"` // 0 until a video finishes

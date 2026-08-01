@@ -1,3 +1,8 @@
+---
+title: Custom FFmpeg workflows
+nav_order: 8
+---
+
 # Writing custom FFmpeg workflows
 
 Frame extraction is configuration-driven: a **workflow** is a named,

@@ -1,3 +1,8 @@
+---
+title: Self-hosted classifiers
+nav_order: 9
+---
+
 # Self-hosted image classifiers as adapter candidates
 
 Research write-up, 2026-07-29. **Status: the ShieldGemma 2 recommendation

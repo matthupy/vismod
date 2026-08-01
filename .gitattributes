@@ -1,0 +1,49 @@
+# Line endings.
+#
+# The blobs in this repo are LF, as they should be. The problem this file
+# solves is local-only: with core.autocrlf=true (the Git-for-Windows
+# default) a Windows checkout smudges those LF blobs to CRLF in the
+# WORKING TREE, and `gofmt -l .` then flags every Go file. Linux CI is
+# unaffected, so the result is a formatting gate that is green in CI and
+# unusably noisy on a Windows dev box.
+#
+# `eol=lf` pins the working tree to LF on every platform, so local gofmt
+# agrees with CI and the autocrlf setting stops mattering.
+* text=auto eol=lf
+
+# Explicit for the file types that care.
+*.go       text eol=lf
+*.mod      text eol=lf
+*.sum      text eol=lf
+*.md       text eol=lf
+*.yml      text eol=lf
+*.yaml     text eol=lf
+*.json     text eol=lf
+*.sh       text eol=lf
+Dockerfile text eol=lf
+LICENSE    text eol=lf
+NOTICE     text eol=lf
+
+# Windows-only scripts must keep CRLF or cmd.exe mis-parses them.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Never touch binaries.
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.webp binary
+*.mp4  binary
+*.mov  binary
+*.webm binary
+*.ico  binary
+
+# Golden files pin normalized output byte for byte; an eol rewrite would
+# silently invalidate them, so keep them LF like everything else and let
+# `go test -update` be the only thing that changes them.
+internal/moderate/adapters/**/testdata/*.golden text eol=lf
+
+# Keep generated/vendored noise out of language stats and diffs.
+docs/history/**    linguist-documentation
+docs/superpowers/** linguist-documentation

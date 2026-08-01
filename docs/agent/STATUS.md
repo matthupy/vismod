@@ -1,3 +1,8 @@
+---
+title: Status
+nav_order: 20
+---
+
 # STATUS
 
 Current state of the work. Rewrite this at the end of every iteration.
