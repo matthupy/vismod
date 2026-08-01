@@ -76,7 +76,7 @@ error verdict or processing failure (fail safe: an error is never allow).`,
 		if err != nil {
 			return err
 		}
-		defer mod.Close()
+		defer func() { _ = mod.Close() }()
 		// After buildModerator: the label declaration lives on the adapter,
 		// so this check cannot run in config.Load.
 		if err := validateProviderLabelBoot(cfg, mod); err != nil {
@@ -88,7 +88,15 @@ error verdict or processing failure (fail safe: an error is never allow).`,
 			return err
 		}
 		if auditLog != nil {
-			defer auditLog.Close()
+			// A failed close on the audit log means the last decision may
+			// not have reached disk. Nothing can be done about it here, but
+			// it must not vanish: an audit trail that silently loses its
+			// tail is worse than one that admits the gap.
+			defer func() {
+				if err := auditLog.Close(); err != nil {
+					log.Error("closing audit log failed", "err", err)
+				}
+			}()
 		}
 
 		sink, closeSinks, err := buildSinks(cfg, cmd.OutOrStdout(), nil)

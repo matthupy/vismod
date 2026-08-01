@@ -617,7 +617,14 @@ func ConfigHash(adapterName, modelVersion string, th Thresholds) string {
 	}
 	resolved := map[string]entry{}
 	for name, t := range th {
-		resolved[name] = entry{FlagAt: t.FlagAt, BlockAt: t.BlockAt}
+		// Whole-struct conversion, not a field-by-field literal, on
+		// purpose: it only compiles while entry and CategoryThreshold have
+		// identical shape. Adding a verdict-affecting field to
+		// CategoryThreshold then breaks the build here and forces a
+		// decision about whether it belongs in the hash — where a field
+		// literal would keep compiling and silently leave config_hash
+		// unchanged across a real change in decision behavior.
+		resolved[name] = entry(t)
 	}
 	payload := struct {
 		Adapter      string           `json:"adapter"`

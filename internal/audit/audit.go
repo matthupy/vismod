@@ -197,11 +197,15 @@ func entryHash(seq uint64, ts string, prev []byte, payload map[string]string) ([
 	return h.Sum(nil), nil
 }
 
+// writeLenPrefixed feeds w the 8-byte big-endian length of b followed by b
+// itself. w is always a hash.Hash's Write, which is documented never to
+// return an error, so the returns are discarded explicitly rather than
+// propagated — there is no failure mode here to fail safe against.
 func writeLenPrefixed(w func([]byte) (int, error), b []byte) {
 	var lenB [8]byte
 	binary.BigEndian.PutUint64(lenB[:], uint64(len(b)))
-	w(lenB[:])
-	w(b)
+	_, _ = w(lenB[:])
+	_, _ = w(b)
 }
 
 // canonicalJSON emits the payload per RFC 8785 JCS. The payload is a flat
@@ -287,7 +291,7 @@ func readRecords(path string) ([]Record, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }() // read-only replay; close cannot lose data
 	var out []Record
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)

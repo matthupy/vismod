@@ -58,7 +58,7 @@ func DoJSON(ctx context.Context, client *http.Client, build func() (*http.Reques
 			lastErr = err // network/timeout: retryable
 		} else {
 			body, rerr := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			if rerr != nil {
 				lastErr = rerr
 			} else if resp.StatusCode >= 200 && resp.StatusCode < 300 {

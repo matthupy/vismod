@@ -16,11 +16,13 @@ var adaptersCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, _ []string) error {
 		names := moderate.Registered()
 		if len(names) == 0 {
-			fmt.Fprintln(cmd.OutOrStdout(), "no adapters registered (M0 skeleton)")
+			_, _ = fmt.Fprintln(cmd.OutOrStdout(), "no adapters registered (M0 skeleton)")
 			return nil
 		}
 		for _, name := range names {
-			fmt.Fprintf(cmd.OutOrStdout(), "%s", name)
+			// Writes to the command's own stdout: a failure here has no
+			// recovery path and must not mask the listing.
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%s", name)
 			// Capabilities need an instance; construction may fail without
 			// credentials — report why instead of hiding the adapter.
 			m, err := moderate.New(name, moderate.AdapterConfig{
@@ -28,12 +30,12 @@ var adaptersCmd = &cobra.Command{
 				Secret:  config.Secret(),
 			})
 			if err != nil {
-				fmt.Fprintf(cmd.OutOrStdout(), "\t(capabilities unavailable: %v)\n", err)
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "\t(capabilities unavailable: %v)\n", err)
 				continue
 			}
 			caps := m.Capabilities()
 			_ = m.Close()
-			fmt.Fprintf(cmd.OutOrStdout(), "\tvideo=%v max_image_bytes=%d categories=%v\n",
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "\tvideo=%v max_image_bytes=%d categories=%v\n",
 				caps.SupportsVideo, caps.MaxImageBytes, caps.Categories)
 		}
 		return nil

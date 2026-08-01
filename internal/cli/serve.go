@@ -59,7 +59,7 @@ func runServe(parent context.Context) error {
 	if err != nil {
 		return err
 	}
-	defer mod.Close()
+	defer func() { _ = mod.Close() }()
 	// After buildModerator: the declaration lives on the adapter, so this
 	// cannot run in config.Load. Before instrumentation: the wrapper forwards
 	// ModelVersion() but NOT ProviderLabels(), so asserting it here keeps the
@@ -74,7 +74,15 @@ func runServe(parent context.Context) error {
 		return err
 	}
 	if auditLog != nil {
-		defer auditLog.Close()
+		// Matches the closeSinks handling below: a failed close on the audit
+		// log means the last decision may not have reached disk, and an
+		// audit trail that silently loses its tail is worse than one that
+		// admits the gap.
+		defer func() {
+			if err := auditLog.Close(); err != nil {
+				log.Error("closing audit log failed", "err", err)
+			}
+		}()
 	}
 
 	sink, closeSinks, err := buildSinks(cfg, os.Stdout, metrics)
@@ -352,14 +360,17 @@ func serveIntake(cfg config.Config, q queue.Queue, bp *observe.Backpressure, sw 
 			SubmittedAt:    time.Now().UTC(),
 		}
 		id, err := q.Enqueue(r.Context(), j)
-		switch {
-		case err == nil:
+		// Identity comparison, not errors.Is: these are the queue's own
+		// sentinels returned unwrapped, and matching a wrapped variant
+		// would change which rejections get a Retry-After.
+		switch err {
+		case nil:
 			w.WriteHeader(http.StatusAccepted)
 			_ = json.NewEncoder(w).Encode(map[string]string{"job_id": string(id)})
-		case err == queue.ErrDeadLetterFull, err == queue.ErrQueueFull:
+		case queue.ErrDeadLetterFull, queue.ErrQueueFull:
 			w.Header().Set("Retry-After", "30")
 			http.Error(w, err.Error(), http.StatusServiceUnavailable)
-		case err == queue.ErrQueueClosed:
+		case queue.ErrQueueClosed:
 			http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		default:
 			http.Error(w, err.Error(), http.StatusInternalServerError)

@@ -1,0 +1,29 @@
+# golangci-lint configuration.
+#
+# The linter had never been run against this tree before CI restored the
+# job, so its first run surfaced 28 pre-existing findings. The production
+# ones are fixed in code. This file records the one category deliberately
+# not enforced.
+version: "2"
+
+linters:
+  # The standard set: errcheck, govet, ineffassign, staticcheck, unused.
+  # Deliberately not expanded — a linter that fires constantly gets
+  # suppressed wholesale, which is worse than a small enforced set.
+  default: standard
+
+  exclusions:
+    generated: lax
+    rules:
+      # errcheck on test cleanup is noise. `defer f.Close()` in a test has
+      # no recovery path: the test has already asserted what it cares
+      # about, and a failed close would surface as a failed assertion or a
+      # leaked handle the next test trips over. Enforcing it here buys
+      # nothing and trains people to write `_ =` reflexively — including
+      # in production code, where it would hide something real.
+      #
+      # Scoped to errcheck only: staticcheck, govet, ineffassign and
+      # unused still apply to tests in full.
+      - path: (.+)_test\.go
+        linters:
+          - errcheck

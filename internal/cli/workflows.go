@@ -19,7 +19,7 @@ var workflowsListCmd = &cobra.Command{
 	Args:  cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, _ []string) error {
 		if len(cfg.FFmpeg.Workflows) == 0 {
-			fmt.Fprintln(cmd.OutOrStdout(), "no workflows configured (defaults ship in M2)")
+			_, _ = fmt.Fprintln(cmd.OutOrStdout(), "no workflows configured (defaults ship in M2)")
 			return nil
 		}
 		for name, wf := range cfg.FFmpeg.Workflows {
@@ -27,7 +27,7 @@ var workflowsListCmd = &cobra.Command{
 			if name == cfg.FFmpeg.DefaultWorkflow {
 				marker = "*"
 			}
-			fmt.Fprintf(cmd.OutOrStdout(), "%s %s\t%s\n", marker, name, wf.Description)
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%s %s\t%s\n", marker, name, wf.Description)
 		}
 		return nil
 	},
@@ -48,7 +48,7 @@ output stays inside the pipeline-owned WorkDir.`,
 		if err := frames.ValidateAll(cfg.FFmpeg); err != nil {
 			return err
 		}
-		fmt.Fprintf(cmd.OutOrStdout(), "all %d workflows OK (binaries present, guardrails satisfied)\n", len(cfg.FFmpeg.Workflows))
+		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "all %d workflows OK (binaries present, guardrails satisfied)\n", len(cfg.FFmpeg.Workflows))
 		return nil
 	},
 }
