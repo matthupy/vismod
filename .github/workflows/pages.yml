@@ -35,7 +35,7 @@ jobs:
     name: Build site
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       # enablement: true turns Pages on for the repo if it is not already,
       # rather than erroring out and demanding a trip through Settings.
