@@ -1,8 +1,10 @@
 # Publishes docs/ to GitHub Pages at https://matthupy.github.io/vismod/
 #
-# One-time repo setup: Settings → Pages → Build and deployment → Source =
-# "GitHub Actions". Without that, this workflow builds fine and the deploy
-# step fails.
+# No manual repo setup needed: configure-pages runs with `enablement: true`,
+# so it provisions the Pages site over the API on first run and sets the
+# build type to "workflow". Without that flag the action fails at
+# `Get Pages site failed ... Not Found` on a repo where Pages was never
+# turned on in Settings.
 #
 # The docs are plain Markdown with a small YAML front-matter block, so the
 # same files stay readable on github.com and in an editor. Jekyll config
@@ -35,7 +37,11 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # enablement: true turns Pages on for the repo if it is not already,
+      # rather than erroring out and demanding a trip through Settings.
       - uses: actions/configure-pages@v5
+        with:
+          enablement: true
 
       - name: Build with Jekyll
         uses: actions/jekyll-build-pages@v1
