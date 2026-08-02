@@ -245,6 +245,38 @@ func (f *Fetcher) checkMediaType(header string) error {
 	return nil
 }
 
+// Reason maps a fetch error to one of a FIXED set of metric labels.
+// Never derive a label from an error string: it would be unbounded
+// cardinality and could carry a URL into Prometheus.
+func Reason(err error) string {
+	switch {
+	case err == nil:
+		return ""
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
+		return "timeout"
+	}
+	s := err.Error()
+	switch {
+	case strings.Contains(s, "allow_hosts"), strings.Contains(s, "scheme"),
+		strings.Contains(s, "userinfo"), strings.Contains(s, "no host"),
+		strings.Contains(s, "not parseable"):
+		return "rejected_url"
+	case strings.Contains(s, "loopback"), strings.Contains(s, "private"),
+		strings.Contains(s, "link-local"), strings.Contains(s, "multicast"),
+		strings.Contains(s, "CGNAT"), strings.Contains(s, "unspecified"):
+		return "denied_address"
+	case strings.Contains(s, "redirect"):
+		return "redirect"
+	case strings.Contains(s, "max_bytes"):
+		return "oversize"
+	case strings.Contains(s, "Content-Type"):
+		return "media_type"
+	case strings.Contains(s, "returned "):
+		return "http_status"
+	}
+	return "other"
+}
+
 // redactForError keeps a query string out of an error string, which ends
 // up in the envelope's Error field and in logs.
 func redactForError(raw string) string {

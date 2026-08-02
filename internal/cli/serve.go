@@ -127,6 +127,7 @@ func newServer(cfg config.Config) (*server, error) {
 	}
 	p := buildPipeline(cfg, mod, sink, auditLog, fetcher, log)
 	p.FrameSource = newFrameSource(cfg, log)
+	p.OnFetch = fetchRecorder(metrics)
 
 	q, err := newQueue(cfg, log)
 	if err != nil {

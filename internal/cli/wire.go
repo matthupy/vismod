@@ -6,12 +6,14 @@ import (
 	"log/slog"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/vismod/vismod/internal/audit"
 	"github.com/vismod/vismod/internal/config"
 	"github.com/vismod/vismod/internal/fetch"
 	"github.com/vismod/vismod/internal/frames"
 	"github.com/vismod/vismod/internal/moderate"
+	"github.com/vismod/vismod/internal/observe"
 	"github.com/vismod/vismod/internal/pipeline"
 	"github.com/vismod/vismod/internal/result"
 	"github.com/vismod/vismod/pkg/moderation"
@@ -62,6 +64,24 @@ func newFetcher(cfg config.Config) (pipeline.SourceFetcher, error) {
 		return nil, nil
 	}
 	return f, nil
+}
+
+// fetchRecorder adapts the fetch metrics to pipeline.OnFetch, keeping
+// Prometheus out of the pipeline package. reason is always a value from
+// fetch.Reason's fixed label set, never an error string.
+func fetchRecorder(m *observe.Metrics) func(time.Duration, int64, string) {
+	if m == nil {
+		return nil
+	}
+	return func(d time.Duration, n int64, reason string) {
+		m.FetchSeconds.Observe(d.Seconds())
+		if n > 0 {
+			m.FetchBytesTotal.Add(float64(n))
+		}
+		if reason != "" {
+			m.FetchFailuresTotal.WithLabelValues(reason).Inc()
+		}
+	}
 }
 
 // buildPipeline assembles the per-job pipeline around the active model.

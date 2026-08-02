@@ -2,6 +2,7 @@ package fetch
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -332,4 +333,31 @@ func TestFetchNilErrorNeverLeavesNilCleanup(t *testing.T) {
 		t.Fatal("cleanup must be non-nil even on the earliest failure path")
 	}
 	cleanup()
+}
+
+func TestReasonLabelsAreBounded(t *testing.T) {
+	allowed := map[string]bool{
+		"": true, "timeout": true, "rejected_url": true, "denied_address": true,
+		"redirect": true, "oversize": true, "media_type": true,
+		"http_status": true, "other": true,
+	}
+	for _, err := range []error{
+		nil,
+		context.DeadlineExceeded,
+		errors.New("fetch: host \"x\" is not in source.url.allow_hosts"),
+		errors.New("fetch: 10.0.0.1 is a private address"),
+		errors.New("fetch: redirects are not followed"),
+		errors.New("fetch: body exceeds source.url.max_bytes (1024)"),
+		errors.New("fetch: Content-Type \"text/html\" is not in source.url.allowed_media_types"),
+		errors.New("fetch: https://h/x returned 500"),
+		errors.New("something entirely unexpected"),
+	} {
+		got := Reason(err)
+		if !allowed[got] {
+			t.Errorf("Reason(%v) = %q, outside the fixed label set", err, got)
+		}
+		if strings.ContainsAny(got, "/:?") {
+			t.Errorf("label %q looks like it carries a url", got)
+		}
+	}
 }

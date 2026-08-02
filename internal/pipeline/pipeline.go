@@ -77,6 +77,10 @@ type Pipeline struct {
 	DedupThreshold int
 	// Fetcher resolves kind:"url" sources. nil disables them.
 	Fetcher SourceFetcher
+	// OnFetch records fetch outcomes for metrics. nil disables. It exists
+	// so the pipeline never imports Prometheus; reason comes from
+	// fetch.Reason and is always from that bounded label set.
+	OnFetch func(d time.Duration, bytes int64, reason string)
 	// MaxScanFrames caps frames per video reaching the moderation
 	// fan-out, applied AFTER post-processing (dedup) so duplicates are
 	// removed before anything is cut for budget. 0 = no cap.
@@ -246,7 +250,9 @@ func (p *Pipeline) resolveSource(ctx context.Context, j queue.Job) (resolved, fu
 		}
 	}
 
+	fetchStart := time.Now()
 	path, cleanFile, err := p.Fetcher.Fetch(ctx, j.Source.Ref, dir)
+	p.recordFetch(fetchStart, path, err)
 	cleanup := func() {
 		if cleanFile != nil {
 			cleanFile()
@@ -260,6 +266,21 @@ func (p *Pipeline) resolveSource(ctx context.Context, j queue.Job) (resolved, fu
 		local: moderation.Source{Kind: "file", Ref: path, MediaType: j.Source.MediaType},
 		env:   envSrc,
 	}, cleanup, nil
+}
+
+// recordFetch reports one fetch outcome. The byte count comes from the
+// file on disk, not from Content-Length, which is never trusted.
+func (p *Pipeline) recordFetch(start time.Time, path string, err error) {
+	if p.OnFetch == nil {
+		return
+	}
+	var n int64
+	if err == nil && path != "" {
+		if fi, statErr := os.Stat(path); statErr == nil {
+			n = fi.Size()
+		}
+	}
+	p.OnFetch(time.Since(start), n, fetch.Reason(err))
 }
 
 // processImage handles a still image: one FrameResult, TimestampSec nil.
