@@ -18,7 +18,12 @@ import (
 // 1.1.0: added the GAMBLING, ALCOHOL_TOBACCO, OFFENSIVE_GESTURE and
 // ANIMATED_SYNTHETIC categories (additive values only; no field or
 // meaning changed).
-const SchemaVersion = "1.1.0"
+// 1.2.0: added Source.RefDigest for url-kind sources (additive field
+// only; no field or meaning changed). Source is serialized into
+// result.ResultEnvelope rather than NormalizedResult, and the envelope
+// carries no version of its own, so this constant is the only version
+// signal consumers have for that change.
+const SchemaVersion = "1.2.0"
 
 // Verdict is the final decision for an asset.
 // Precedence at rollup is strict: block > error > flag > allow.
@@ -173,11 +178,20 @@ type Caps struct {
 	Categories []Category
 }
 
-// Source identifies an input asset. Kind is "file" in v1; "url"/"s3" are
-// future kinds and require an SSRF allow-list before being enabled.
+// Source identifies an input asset.
+//
+// Kind is "file" or "url" ("s3" remains a future kind). For a "url"
+// source, Ref carries only scheme+host+path: a presigned URL's query
+// string is a CREDENTIAL, and Ref reaches the result envelope, the audit
+// record, and structured logs. RefDigest is SHA-256 of the FULL original
+// URL, so a verdict stays traceable to the exact request without storing
+// that credential.
+//
+// RefDigest is empty (and omitted) for file sources.
 type Source struct {
 	Kind      string `json:"kind"`
 	Ref       string `json:"ref"`
+	RefDigest string `json:"ref_digest,omitempty"`
 	MediaType string `json:"media_type"` // "image" | "video"
 }
 
