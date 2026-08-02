@@ -25,6 +25,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/vismod/vismod/internal/config"
+	"github.com/vismod/vismod/internal/fetch"
 	"github.com/vismod/vismod/internal/frames"
 	"github.com/vismod/vismod/internal/queue"
 	"github.com/vismod/vismod/internal/result"
@@ -48,6 +49,12 @@ type EventSink interface {
 // value) and a prominent audit event.
 var errEmptyVideoSkipped = errors.New("empty video skipped by operator override")
 
+// SourceFetcher resolves a remote source URL to a local file. nil means
+// url sources are disabled (source.url.enabled=false).
+type SourceFetcher interface {
+	Fetch(ctx context.Context, rawURL, dir string) (path string, cleanup func(), err error)
+}
+
 // Pipeline processes jobs. All collaborators sit behind interfaces and
 // swap via config with zero call-site changes.
 type Pipeline struct {
@@ -68,6 +75,8 @@ type Pipeline struct {
 	// dropped before the moderation fan-out.
 	Dedup          bool
 	DedupThreshold int
+	// Fetcher resolves kind:"url" sources. nil disables them.
+	Fetcher SourceFetcher
 	// MaxScanFrames caps frames per video reaching the moderation
 	// fan-out, applied AFTER post-processing (dedup) so duplicates are
 	// removed before anything is cut for budget. 0 = no cap.
@@ -98,15 +107,27 @@ func (p *Pipeline) Process(ctx context.Context, j queue.Job) (queue.Disposition,
 // CLI for exit codes).
 func (p *Pipeline) ProcessJob(ctx context.Context, j queue.Job) (result.ResultEnvelope, queue.Disposition, error) {
 	started := time.Now().UTC()
+
+	rs, cleanupSource, resolveErr := p.resolveSource(ctx, j)
+	// Lifecycle contract: deferred immediately, so the download is removed
+	// on every exit path — error, ctx-cancel, panic — before ack.
+	defer cleanupSource()
+
+	// From here on, j carries the LOCAL source (what analysis reads) and
+	// rs.env carries what gets recorded.
+	j.Source = rs.local
+
 	p.log().Info("job started",
 		"job_id", j.ID, "adapter", p.ModelID.Adapter,
-		"media_type", j.Source.MediaType, "ref", j.Source.Ref,
+		"media_type", rs.env.MediaType, "ref", rs.env.Ref,
 		"workflows", workflowsLabel(j.Workflows))
 
 	var res moderation.NormalizedResult
 	var procErr error
-	switch j.Source.MediaType {
-	case "video":
+	switch {
+	case resolveErr != nil:
+		procErr = resolveErr
+	case rs.env.MediaType == "video":
 		res, procErr = p.processVideo(ctx, j)
 	default:
 		res, procErr = p.processImage(ctx, j)
@@ -114,18 +135,18 @@ func (p *Pipeline) ProcessJob(ctx context.Context, j queue.Job) (result.ResultEn
 	if errors.Is(procErr, errEmptyVideoSkipped) {
 		// Gated §F.5 override: ack with no verdict, prominent audit event.
 		p.log().Warn("OPERATOR OVERRIDE: empty video skipped without verdict (failsafe.allow_empty_video_skip)",
-			"job_id", j.ID, "asset", j.Source.Ref)
+			"job_id", j.ID, "asset", rs.env.Ref)
 		if p.Events != nil {
 			if err := p.Events.AppendEvent("empty_video_skip_override", map[string]string{
 				"job_id":      string(j.ID),
-				"asset_id":    j.Source.Ref,
+				"asset_id":    rs.env.Ref,
 				"adapter":     p.ModelID.Adapter,
 				"config_hash": p.ModelID.ConfigHash,
 			}); err != nil {
 				return result.ResultEnvelope{}, queue.DeadLetter, fmt.Errorf("override audit event failed: %w", err)
 			}
 		}
-		return result.ResultEnvelope{JobID: j.ID, Source: j.Source, ModelID: p.ModelID, StartedAt: started, FinishedAt: time.Now().UTC()}, queue.Ack, nil
+		return result.ResultEnvelope{JobID: j.ID, Source: rs.env, ModelID: p.ModelID, StartedAt: started, FinishedAt: time.Now().UTC()}, queue.Ack, nil
 	}
 	if procErr != nil {
 		// Could-not-evaluate before any per-frame evidence existed
@@ -136,17 +157,17 @@ func (p *Pipeline) ProcessJob(ctx context.Context, j queue.Job) (result.ResultEn
 
 	// Stamp normalizer-owned fields (the adapter leaves them empty).
 	res.SchemaVersion = moderation.SchemaVersion
-	if res.AssetID = j.Source.Ref; res.AssetID == "" {
+	if res.AssetID = rs.env.Ref; res.AssetID == "" {
 		res.AssetID = string(j.ID)
 	}
 	if res.MediaType == "" {
-		res.MediaType = j.Source.MediaType
+		res.MediaType = rs.env.MediaType
 	}
 	res.Overall = Rollup(res.Frames, p.Thresholds)
 
 	env := result.ResultEnvelope{
 		JobID:      j.ID,
-		Source:     j.Source,
+		Source:     rs.env,
 		ModelID:    p.ModelID,
 		Result:     &res,
 		StartedAt:  started,
@@ -178,6 +199,67 @@ func (p *Pipeline) ProcessJob(ctx context.Context, j queue.Job) (result.ResultEn
 		return env, queue.DeadLetter, fmt.Errorf("verdict=error: %s", env.Error)
 	}
 	return env, queue.Ack, nil
+}
+
+// resolved holds the two views of a job's source that must not be
+// conflated: what ANALYSIS reads, and what gets RECORDED.
+//
+// For a url source those differ. Analysis needs the local download;
+// the envelope, audit record, and logs must carry the redacted URL,
+// because a presigned URL's query string is a credential and a temp path
+// is meaningless to whoever reads the verdict later.
+type resolved struct {
+	local moderation.Source // kind:"file", ref = local path
+	env   moderation.Source // what is recorded
+}
+
+// resolveSource materializes a job's source. cleanup is always non-nil
+// and must be deferred by the caller on every exit path.
+func (p *Pipeline) resolveSource(ctx context.Context, j queue.Job) (resolved, func(), error) {
+	if j.Source.Kind != "url" {
+		return resolved{local: j.Source, env: j.Source}, func() {}, nil
+	}
+
+	// Redact FIRST, so every return path below — including the failures —
+	// reports the safe form.
+	ref, digest := fetch.Redact(j.Source.Ref)
+	envSrc := moderation.Source{
+		Kind:      "url",
+		Ref:       ref,
+		RefDigest: digest,
+		MediaType: j.Source.MediaType,
+	}
+
+	if p.Fetcher == nil {
+		return resolved{local: envSrc, env: envSrc}, func() {},
+			fmt.Errorf("url sources are not enabled (source.url.enabled=false)")
+	}
+
+	dir, err := os.MkdirTemp("", "vismod-fetch-")
+	if err != nil {
+		return resolved{local: envSrc, env: envSrc}, func() {},
+			fmt.Errorf("fetch workdir: %w", err)
+	}
+	rmDir := func() {
+		if err := os.RemoveAll(dir); err != nil {
+			p.log().Error("fetch workdir cleanup failed", "job_id", j.ID, "err", err)
+		}
+	}
+
+	path, cleanFile, err := p.Fetcher.Fetch(ctx, j.Source.Ref, dir)
+	cleanup := func() {
+		if cleanFile != nil {
+			cleanFile()
+		}
+		rmDir()
+	}
+	if err != nil {
+		return resolved{local: envSrc, env: envSrc}, cleanup, err
+	}
+	return resolved{
+		local: moderation.Source{Kind: "file", Ref: path, MediaType: j.Source.MediaType},
+		env:   envSrc,
+	}, cleanup, nil
 }
 
 // processImage handles a still image: one FrameResult, TimestampSec nil.
