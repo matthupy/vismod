@@ -231,6 +231,43 @@ frames:
     enabled: true
     hamming_threshold: 14
 
+# ── Remote media sources (kind:"url") ────────────────────────────────────
+# OFF by default. Enabling lets a JOB choose an outbound destination, which
+# is the one place in vismod where an untrusted payload picks who gets
+# contacted — so every control here fails closed and none of them can be
+# switched off:
+#   - https only, and the host must match allow_hosts EXACTLY (no
+#     wildcards, no suffix matching: "example.com" does NOT permit
+#     "evil.example.com").
+#   - enabled: true with an empty allow_hosts REFUSES TO BOOT.
+#   - Loopback, RFC 1918, 169.254.0.0/16 (cloud metadata), IPv6 link-local
+#     and ULA, CGNAT 100.64.0.0/10, unspecified and multicast addresses are
+#     denied at DIAL time, against the address actually connected to. That
+#     per-connection check is the DNS-rebinding defense and has no config
+#     switch. Do not point a media source at your own infrastructure — use
+#     kind:"file" for local media.
+#   - Redirects are refused, userinfo in the URL is refused, and the size
+#     cap is enforced on bytes read (Content-Length is never trusted).
+#   - The download is transient: it lands in a job-scoped temp file and is
+#     deleted on every exit path before the job is acked.
+#   - A presigned URL's query string is a CREDENTIAL. Only scheme+host+path
+#     is recorded; envelopes/audit/logs/metrics carry a SHA-256 of the full
+#     URL as source.ref_digest instead. See SECURITY.md.
+source:
+  url:
+    enabled: false
+    allow_hosts: []             # exact hostnames, e.g. ["media.example.com"]
+    max_bytes: 268435456        # 256 MiB; enforced on bytes read
+    timeout: 60s                # whole-download budget per attempt
+    max_attempts: 3             # transient failures only; rejections never retry
+    allowed_media_types:        # response Content-Type gate ([] disables the gate)
+      - video/mp4
+      - video/webm
+      - video/quicktime
+      - image/jpeg
+      - image/png
+      - image/webp
+
 # ── Job queue ────────────────────────────────────────────────────────────
 queue:
   driver: memory                # memory (dev/CLI, NON-DURABLE) | redis (production)
@@ -268,13 +305,15 @@ audit:
 # ── Observability ───────────────────────────────────────────────────────
 log_level: info                 # debug | info | warn | error (JSON to stderr)
 metrics_addr: ":9090"           # /metrics /healthz /readyz
-# Dev HTTP intake (serve mode). POST /jobs body:
+# Dev HTTP intake (serve mode), no auth — see docs/rest-api.md. POST /jobs:
 #   {"kind":"file","ref":"<abs path>","media_type":"image|video",
 #    "workflows":["interval","keyframe"],   # optional, any number; frames are
 #                                           # the union; omitted = default_workflow
 #    "dedup_threshold": 8}                  # optional; 0..64 enables dedup at
 #                                           # that Hamming distance, -1 disables;
 #                                           # omitted = frames.dedup config
+# kind:"url" takes an allow-listed https URL as ref and requires the
+# source.url block above; it is rejected with 400 while that is disabled.
 intake_addr: "127.0.0.1:8080"
 
 # ── Web UI (stretch; read-mostly; never renders media) ──────────────────

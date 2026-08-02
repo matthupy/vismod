@@ -24,6 +24,7 @@ quick start. These pages are the technical detail.
 |---|---|
 | [Architecture](architecture.md) | Pipeline shape, package map, normalization rules, verdict rollup |
 | [Supported models](models.md) | All four adapters: categories, score origins, credentials, limits, verification status |
+| [REST intake](rest-api.md) | `POST /jobs`, scanning from a URL, worked curl/PowerShell examples |
 | [Result envelope](result-envelope.md) | Output schema, sinks, idempotency boundaries, exit codes |
 | [Scaling and observability](scaling.md) | Queue drivers, replica scaling, metrics, readiness/backpressure |
 | [Audit log](audit-log.md) | Hash chain, verification, tamper-evident scope |
