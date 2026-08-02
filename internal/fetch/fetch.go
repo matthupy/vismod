@@ -193,7 +193,7 @@ func (f *Fetcher) attempt(ctx context.Context, rawURL, path string) error {
 		}
 		return err // transport error: retryable
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		if !moderate.RetryableStatus(resp.StatusCode) {
@@ -217,7 +217,10 @@ func (f *Fetcher) attempt(ctx context.Context, rawURL, path string) error {
 	if err != nil {
 		return terminalErr{fmt.Errorf("fetch: create %s: %w", path, err)}
 	}
-	defer out.Close()
+	// Belt and braces: the explicit Close below is the one whose error is
+	// reported, but every early return still has to release the handle.
+	// Closing twice is harmless; the second error is not a new fact.
+	defer func() { _ = out.Close() }()
 
 	// Read ONE byte past the cap so an exactly-at-cap body still succeeds
 	// while an oversize one is detectable. Content-Length is never trusted.
@@ -227,6 +230,12 @@ func (f *Fetcher) attempt(ctx context.Context, rawURL, path string) error {
 	}
 	if n > f.cfg.MaxBytes {
 		return terminal("fetch: body exceeds source.url.max_bytes (%d)", f.cfg.MaxBytes)
+	}
+	// A failed close can mean the tail of the download never reached disk,
+	// which would hand ffmpeg a truncated file. Report it as retryable
+	// rather than scanning a partial asset.
+	if err := out.Close(); err != nil {
+		return fmt.Errorf("fetch: close %s: %w", path, err)
 	}
 	return nil
 }
