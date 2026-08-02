@@ -35,16 +35,79 @@ execution or exfiltration:
 
 ### SSRF / egress posture
 
-Two kinds of URL exist in this system and they take **opposite** rules.
-Do not apply one rule to the other.
+**Three** kinds of URL exist in this system, in two different trust
+classes, and they take **opposite** rules. Do not apply one class's rule
+to the other.
+
+| Class | URLs | Chosen by | Private ranges |
+|---|---|---|---|
+| 1 | media source (`kind:"url"`) | the **job** — untrusted | **denied at dial** |
+| 2 | `shieldgemma` inference endpoint | operator yaml | expected, allowed |
+| 3 | `webhook` result sink receiver | operator yaml | expected, allowed |
 
 **1. Media source URLs — untrusted, deny private ranges.**
 
-- v1 sends media to providers as **inline content only**. Azure
-  `blobUrl` (and any future `url:`/`s3:` source kind) is a remote-fetch
-  vector and is disabled. If a URL source is ever added it MUST sit
-  behind a scheme+host allow-list that forbids RFC 1918 ranges,
-  169.254.0.0/16 (cloud metadata), and loopback.
+A job may name a remote asset (`{"kind":"url","ref":"https://…"}`), which
+is the only place in vismod where an untrusted payload chooses an
+outbound destination. The feature is **off by default**
+(`source.url.enabled: false`); with it off, `kind:"url"` is rejected at
+intake with `400` and by the pipeline with `verdict:"error"`. Media is
+still sent to providers as **inline content only** — Azure `blobUrl` and
+any provider-side remote-fetch parameter remain unused, because that
+would move the fetch outside these controls.
+
+When it is enabled, every control below is fail-closed and none of them
+has an off switch (`internal/fetch`, one test per rule):
+
+- **`https` only, exact hostname allow-list** (`source.url.allow_hosts`).
+  No wildcards, no suffix matching: `example.com` does not permit
+  `evil.example.com`. `enabled: true` with an empty allow-list refuses to
+  boot rather than accepting a setting that cannot fetch anything.
+- **No userinfo** in the URL; credentials stay env-only.
+- **Address deny-list at dial time** (`fetch.DenyPrivate`, run from
+  `net.Dialer.Control`): loopback, RFC 1918, `169.254.0.0/16` (cloud
+  metadata), IPv6 link-local and ULA (`fc00::/7`), the unspecified
+  address, multicast, and CGNAT `100.64.0.0/10`. Addresses are unmapped
+  first, so a v4-mapped form (`::ffff:127.0.0.1`) cannot smuggle a
+  private v4 past the v4 predicates.
+- **The host allow-list and the address deny-list are two separate
+  checks, deliberately.** The allow-list runs at parse time, on text; the
+  address policy runs per-connection, against the address actually
+  dialed. Only the second one catches **DNS rebinding** — an allow-listed
+  name that re-resolves to `169.254.169.254` between validation and
+  connect. Collapsing them into one parse-time check would silently
+  remove that defense.
+- **Redirects are refused** — a redirect is a destination vismod did not
+  choose. **The size cap is enforced on bytes read**
+  (`source.url.max_bytes`), never on `Content-Length`. The response
+  `Content-Type` must be in `source.url.allowed_media_types`.
+- **The download is transient.** It lands in a job-scoped temp file,
+  under a per-job temp directory, deleted on every exit path before the
+  job is acked — the same contract as frame extraction's `WorkDir`.
+- **No URL ever reaches ffmpeg.** The pipeline hands analysis the local
+  temp path as a `kind:"file"` source; the protocol deny-list below is
+  unchanged and still rejects any input path carrying a scheme.
+- **A presigned URL's query string is a credential.** Only
+  scheme+host+path is recorded in `source.ref`; `source.ref_digest`
+  carries SHA-256 of the full URL so a verdict stays traceable to the
+  exact request. The full URL never reaches a result envelope, audit
+  record, log line, error string, HTTP error response, operator-UI job
+  feed, or metric label. Metric failure reasons come from a fixed label
+  set, never from an error string.
+- **Fail-safe is preserved.** Any fetch failure — rejected URL, denied
+  address, oversize body, timeout, exhausted attempts — yields
+  `verdict:"error"` and a dead-letter. Never `allow`.
+
+Rejections are terminal and are not retried: retrying cannot change a
+destination that was refused. Only transient transport failures and
+retryable HTTP statuses consume `source.url.max_attempts`.
+
+Validation runs **twice by design** — at intake (so a caller gets a `400`
+with a reason) and again in the fetcher (because with
+`queue.driver: redis` a job can arrive straight onto the queue without
+passing through intake). The same rule as the per-job workflow and dedup
+overrides.
+
 - Frame extraction rejects any input path containing a protocol scheme.
 
 **2. Operator-supplied endpoint URLs — operator config, private ranges
@@ -146,6 +209,12 @@ their own API layer. Revisit if a coarse-output mode is added.
 - Job payloads (queue, Redis, any ops surface) carry **opaque file
   refs/IDs, never media bytes**. Secure the Redis instance (auth +
   network policy) — it is part of the trust boundary.
+- **A `kind:"url"` job payload carries the URL as submitted**, query
+  string included: the fetcher needs the whole thing, and redaction
+  happens where results are recorded, not on the queue. If you submit
+  presigned URLs, the queue holds live credentials for as long as the job
+  is pending — one more reason the Redis instance is inside the trust
+  boundary, and a reason to keep presigned lifetimes short.
 - Per-job frame extraction happens in a transient `WorkDir` deleted on
   every exit path before the job is acked. Nothing in the ordinary
   result/audit path persists media.

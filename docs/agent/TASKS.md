@@ -16,7 +16,7 @@ Delete an entry when it lands; record the outcome in `STATUS.md`.
 
 ---
 
-## 1. Audit the decision before fanning out to sinks
+## 0. Audit the decision before fanning out to sinks
 
 The sink write happens BEFORE `p.Audit.Record` in
 `internal/pipeline/pipeline.go`, and a sink error returns `queue.Retry`.

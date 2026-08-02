@@ -46,6 +46,9 @@ type Metrics struct {
 	FramesScannedTotal     prometheus.Counter
 	JobFrames              *prometheus.HistogramVec
 	SinkWriteFailuresTotal *prometheus.CounterVec
+	FetchSeconds           prometheus.Histogram
+	FetchBytesTotal        prometheus.Counter
+	FetchFailuresTotal     *prometheus.CounterVec
 }
 
 func NewMetrics() *Metrics {
@@ -83,10 +86,25 @@ func NewMetrics() *Metrics {
 			Name: "vismod_sink_write_failures_total",
 			Help: "Result-sink write failures, by sink type.",
 		}, []string{"type"}),
+		FetchSeconds: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "vismod_fetch_duration_seconds",
+			Help:    "Remote media fetch latency.",
+			Buckets: []float64{0.1, 0.5, 1, 2, 5, 10, 30, 60},
+		}),
+		FetchBytesTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "vismod_fetch_bytes_total", Help: "Bytes downloaded for url sources.",
+		}),
+		FetchFailuresTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			// reason is a BOUNDED set — never an error string, which would
+			// be both a cardinality bomb and a way for a url to reach a
+			// metric label.
+			Name: "vismod_fetch_failures_total", Help: "Remote fetch failures, by reason.",
+		}, []string{"reason"}),
 	}
 	reg.MustRegister(m.JobsTotal, m.AdapterRequestSeconds, m.AdapterErrorsTotal,
 		m.QueueDepth, m.DeadletterDepth, m.WorkersActive,
-		m.FramesScannedTotal, m.JobFrames, m.SinkWriteFailuresTotal)
+		m.FramesScannedTotal, m.JobFrames, m.SinkWriteFailuresTotal,
+		m.FetchSeconds, m.FetchBytesTotal, m.FetchFailuresTotal)
 	return m
 }
 

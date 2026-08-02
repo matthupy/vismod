@@ -21,6 +21,7 @@ internal/cli/     cobra composition root; the only place adapters are wired
 internal/config/  viper loader, thresholds, workflows, ConfigHash
 internal/moderate/  adapter registry, rate limiter, retrying HTTP; adapters/*
 internal/frames/  ffmpeg frame extraction, workflow guardrails, dHash dedup
+internal/fetch/   allow-listed https media download for kind:"url" sources
 internal/queue/   memq (dev) and redisq (durable, at-least-once)
 internal/pipeline/  frames -> dedup -> fan-out -> thresholds -> rollup -> sink
 internal/result/  result envelope + Sink implementations (JSONL, file, webhook, multi)
@@ -51,6 +52,7 @@ extension point, and the gotchas that have already bitten someone.
 | Which open-weight model to self-host, and why | [docs/self-hosted-classifiers.md](docs/self-hosted-classifiers.md) |
 | Human contributor rules | [CONTRIBUTING.md](CONTRIBUTING.md) |
 | Custom ffmpeg workflows | [docs/custom-ffmpeg-workflows.md](docs/custom-ffmpeg-workflows.md) |
+| Submitting jobs over HTTP, scanning from a URL | [docs/rest-api.md](docs/rest-api.md) |
 | Scaling, KEDA/HPA, rate-limit budgeting | [deploy/README.md](deploy/README.md) |
 | Try it locally with Docker Compose | [deploy/compose/README.md](deploy/compose/README.md) |
 | Config surface | [config.example.yaml](config.example.yaml) |

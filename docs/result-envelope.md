@@ -10,7 +10,7 @@ One JSON object per job, emitted to every configured sink.
 ```json
 {"job_id":"scan-...","source":{"kind":"file","ref":"/data/clip.mp4","media_type":"video"},
  "model_id":{"adapter":"microsoft","model_version":"2024-09-01","config_hash":"9b6f…"},
- "result":{"schema_version":"1.1.0","provider":"microsoft","media_type":"video",
+ "result":{"schema_version":"1.2.0","provider":"microsoft","media_type":"video",
    "asset_id":"/data/clip.mp4",
    "frames":[{"timestamp_sec":2.0,"status":"ok","categories":[
      {"category":"SEXUAL","provider_label":"Sexual","score":0.333,
@@ -18,6 +18,14 @@ One JSON object per job, emitted to every configured sink.
    "overall":{"verdict":"allow","flagged":false,"top_category":"SEXUAL",
      "max_score":0.333,"confidence":0.333}},
  "started_at":"…","finished_at":"…"}
+```
+
+A job submitted as `kind:"url"` ([REST intake](rest-api.md)) carries a
+`source` of this shape instead — note the truncated `ref`:
+
+```json
+"source":{"kind":"url","ref":"https://media.example.com/clip.mp4",
+          "ref_digest":"7b1f…","media_type":"video"}
 ```
 
 ## Fields that matter downstream
@@ -38,6 +46,21 @@ One JSON object per job, emitted to every configured sink.
   the canonical `category` is `OTHER`.
 - **`overall.verdict`** is one of `allow`, `flag`, `block`, `error`,
   rolled up with precedence `block > error > flag > allow`.
+- **`source.ref_digest`** appears on `kind:"url"` sources only (omitted
+  for files) and is SHA-256 of the **full** submitted URL. `source.ref`
+  for a url is deliberately truncated to scheme+host+path, because a
+  presigned URL's query string is a credential and `ref` reaches
+  envelopes, audit records, and logs. Correlate on `ref_digest` when two
+  jobs differ only in their query string — `ref` alone cannot tell them
+  apart. Verifying a digest requires the original URL; vismod does not
+  store it.
+
+`result.schema_version` is **`1.2.0`** as of the `ref_digest` addition
+(`1.1.0` added four categories). Both bumps are additive: no field was
+removed, renamed, or given a new meaning, so a `1.1.0` consumer keeps
+working. Note that `source` is serialized by the envelope rather than by
+`NormalizedResult`, and the envelope carries no version of its own —
+`result.schema_version` is the only version signal for a `source` change.
 
 ## Sinks
 

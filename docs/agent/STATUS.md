@@ -8,7 +8,7 @@ nav_order: 20
 Current state of the work. Rewrite this at the end of every iteration.
 Keep it short — it is read cold at the start of the next one.
 
-**Updated:** 2026-08-01
+**Updated:** 2026-08-02
 
 ## Where things stand
 
@@ -239,14 +239,33 @@ and `genproto/googleapis/rpc` from indirect to direct in `go.mod`; no new
 modules, same versions. `prometheus/client_golang/prometheus/testutil` was
 deliberately NOT used — it pulls in `kylelemons/godebug`.
 
+Latest: the `kind:"url"` media source (`feat/url-source-kind`, PR #40).
+New `internal/fetch` downloads an allow-listed `https` asset to a
+job-scoped temp file, the pipeline scans it exactly as a local file, and
+the download is deleted before ack. OFF by default; `enabled: true` with
+an empty `allow_hosts` refuses to boot. Two independent checks by
+design — a parse-time host allow-list and a per-dial address deny-list
+(the only DNS-rebinding defense). A presigned URL's query string is
+treated as a credential: `Source.Ref` records scheme+host+path and the
+new `Source.RefDigest` carries SHA-256 of the full URL, bumping
+SchemaVersion to 1.2.0. Documentation landed with it: `SECURITY.md` now
+describes three URL trust classes (its old text, claiming media-source
+URLs are disabled, was wrong on this branch), plus a new
+`docs/rest-api.md`, the `source:` block in `config.example.yaml`, and
+three AGENTS.md gotchas (two `Source` values per url job, the typed-nil
+`*Fetcher`, allow-list vs deny-list).
+
 ## Gate status
 
 `go build ./...`, `go vet ./...`, `go test ./...` all pass locally as of
-2026-08-02.
+2026-08-02. CI on PR #40 is green on all four jobs (build & test, lint,
+vulnerability scan, docker build & smoke) — the only `-race` evidence
+that exists, since that job cannot run on this box.
 
 ## In flight
 
-Nothing.
+PR #40 (`feat/url-source-kind`) is open and has had no human review. No
+fetch has ever run against a real remote host (`UNVERIFIED.md`).
 
 ## Blocked
 

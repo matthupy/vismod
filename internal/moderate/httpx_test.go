@@ -247,8 +247,8 @@ func TestRetryableStatus(t *testing.T) {
 		http.StatusGatewayTimeout:        true,
 	}
 	for code, want := range cases {
-		if got := retryableStatus(code); got != want {
-			t.Errorf("retryableStatus(%d) = %v, want %v", code, got, want)
+		if got := RetryableStatus(code); got != want {
+			t.Errorf("RetryableStatus(%d) = %v, want %v", code, got, want)
 		}
 	}
 }
@@ -274,8 +274,8 @@ func TestRetryAfter(t *testing.T) {
 		if tc.header != "" {
 			resp.Header.Set("Retry-After", tc.header)
 		}
-		if got := retryAfter(resp); got != tc.want {
-			t.Errorf("retryAfter(%q) = %v, want %v", tc.header, got, tc.want)
+		if got := RetryAfter(resp); got != tc.want {
+			t.Errorf("RetryAfter(%q) = %v, want %v", tc.header, got, tc.want)
 		}
 	}
 }

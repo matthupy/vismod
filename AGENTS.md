@@ -110,6 +110,8 @@ internal/moderate/adapters/{microsoft,google,hive,shieldgemma}/
                        self-register in init(); shieldgemma is self-hosted
 internal/frames/       FrameSource, FFmpegSource (multi-workflow union),
                        workflow guardrails, dHash Dedup
+internal/fetch/        kind:"url" media download: parse-time host allow-list,
+                       per-dial address deny-list, size cap, transient file
 internal/queue/        Queue iface; memq (dev, non-durable) + redisq
                        (durable, at-least-once, strict FIFO via Redis LIST)
 internal/pipeline/     per-job flow: frames -> dedup -> fan-out -> thresholds
@@ -204,6 +206,33 @@ import needs justification.
   `media_b64` body; it now uploads multipart/form-data via
   `moderate.NewMultipartRequest`. Neither adapter has ever been run
   against a live vendor — see `docs/agent/UNVERIFIED.md`.
+- **A url job has TWO `Source` values, and mixing them leaks a
+  credential.** `pipeline.resolveSource` returns `resolved{local, env}`:
+  `local` is a `kind:"file"` source pointing at the downloaded temp path
+  (analysis reads this — no URL ever reaches ffmpeg), `env` is the
+  redacted `kind:"url"` source (scheme+host+path plus `RefDigest`) and is
+  what every envelope, audit record, log line, and UI row must use.
+  `queue.Job.Source.Ref` still holds the FULL url — the fetcher needs it
+  — so anything that records `j.Source.Ref` for a url job publishes a
+  presigned URL's query string. That was a real bug in `serve.go`'s
+  worker handler (the operator-UI job feed); `serve_run_test.go` guards
+  it.
+- **`fetch.New` returns a typed nil when disabled, and
+  `cli.newFetcher` must convert it to an untyped nil.** Returning the
+  `*fetch.Fetcher` nil directly gives `pipeline.Fetcher` a non-nil
+  interface holding a nil pointer, so the `p.Fetcher == nil` guard is
+  false and a url job panics instead of producing `verdict:"error"`.
+  `wire.go` has an explicit `if f == nil { return nil, nil }` for this;
+  do not "simplify" it away.
+- **The host allow-list and the address deny-list are two checks on
+  purpose.** `fetch.validateURL` runs at parse time on text; `DenyPrivate`
+  runs per-connection from `net.Dialer.Control` against the address
+  actually dialed. Only the second closes DNS rebinding, where an
+  allow-listed name re-resolves to `169.254.169.254` after validation.
+  Merging them into one parse-time check passes every test and silently
+  deletes the defense. The deny-list has no config switch, and
+  `Fetcher.allowScheme` ("http" only in tests, unexported) is the one
+  weakening any test may do.
 - UI (`internal/ui`) is read-mostly by design: pause/resume intake is
   the entire control surface; config stays restart-to-apply; never add
   anything that renders media or `Raw`.
@@ -239,7 +268,8 @@ import needs justification.
 README.md, CLAUDE.md, SECURITY.md (workflow trust boundary, SSRF
 posture, audit scope), RESPONSIBLE_USE.md (vendor-scope detection,
 human-in-the-loop), MODEL_LIMITATIONS.md, CONTRIBUTING.md,
-config.example.yaml, docs/custom-ffmpeg-workflows.md, deploy/README.md
+config.example.yaml, docs/custom-ffmpeg-workflows.md,
+docs/rest-api.md (intake contract, url rules), deploy/README.md
 (autoscaling contract), deploy/compose/README.md (per-replica volume
 constraints). If you change behavior they describe, update them in the
 same commit.

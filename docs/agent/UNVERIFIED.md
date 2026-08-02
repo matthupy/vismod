@@ -132,3 +132,28 @@ multi-replica run has been exercised against a real vendor quota.
 **Proves it:** a load test with N replicas against a vendor sandbox
 showing aggregate request rate stays under quota, or a shared limiter
 implementation with its own tests.
+
+## No url fetch has ever run against a real remote host
+
+`internal/fetch` is exercised entirely by `httptest` on loopback, with
+the address policy (`DenyPrivate`) replaced by a permissive stub for
+every test that actually transfers bytes — loopback is precisely what
+the real policy denies. So the happy path has never been proven against
+a public `https` host, a real TLS handshake, a real presigned URL, or a
+body larger than a few KiB.
+
+The DNS-rebinding defense is likewise verified only against a SIMULATED
+policy: `TestFetchDNSRebinding` swaps in an `ipPolicy` that denies on
+its second call and asserts the policy ran twice. That proves the hook
+runs per-connection, not that a real rebinding resolver is defeated.
+
+`go test -race ./internal/fetch/` has NOT been run locally (this dev box
+has no C compiler, so the race detector cannot build). The retry loop
+mutates the cleanup closure's `sync.Once` under a mutex; CI's `-race` is
+the only gate on that.
+
+**Proves it:** an integration run against a live allow-listed host
+(fetching a real image and a real video, including one presigned URL
+whose query string must not appear in the envelope, audit record, logs,
+or metric labels), plus a rebinding test using a resolver that returns a
+public address then the metadata address, plus a green `-race` run in CI.

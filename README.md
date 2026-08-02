@@ -108,6 +108,35 @@ reachable only from within it; publishing that port does nothing until
 you set the address to `0.0.0.0:8080`. The dev intake has **no auth** —
 read [SECURITY.md](SECURITY.md) before exposing it.
 
+### `POST /jobs`
+
+The intake takes one job per request, returns `202` + `{"job_id":…}`, and
+puts the verdict in your configured sinks — never in the HTTP response.
+
+```sh
+# a local file
+curl -X POST localhost:8080/jobs -H 'content-type: application/json' \
+  -d '{"kind":"file","ref":"/data/clip.mp4"}'
+
+# a remote asset (off by default — see below)
+curl -X POST localhost:8080/jobs -H 'content-type: application/json' \
+  -d '{"kind":"url","ref":"https://media.example.com/clip.mp4"}'
+```
+
+`media_type` is inferred from the extension; `workflows` and
+`dedup_threshold` are optional per-job overrides.
+
+`kind:"url"` is **off by default** and `ref` must be an `https` URL whose
+host is listed exactly in `source.url.allow_hosts` — no wildcards, no
+suffix matching. Enabling it with an empty allow-list refuses to boot,
+and loopback/private/link-local/CGNAT addresses are denied at connect
+time with no switch to turn that off. vismod downloads the asset to a
+job-scoped temp file, scans it, and deletes it before ack; a presigned
+URL's query string is treated as a credential and never recorded.
+
+Worked `curl` and PowerShell examples — image, video with workflows, and
+reading the envelope back — are in **[docs/rest-api.md](docs/rest-api.md)**.
+
 ## Docker Compose
 
 The compose stack is the fastest way to see vismod behave like a real
@@ -171,6 +200,7 @@ Technical detail lives in [docs/](docs/), published at
 |---|---|
 | [Architecture](docs/architecture.md) | Pipeline shape, package map, normalization, verdict rollup |
 | [Supported models](docs/models.md) | Per-adapter detail and verification status |
+| [REST intake](docs/rest-api.md) | `POST /jobs`, scanning from a URL, curl/PowerShell examples |
 | [Result envelope](docs/result-envelope.md) | Output schema, sinks, idempotency boundaries |
 | [Scaling and observability](docs/scaling.md) | Queue drivers, replica scaling, metrics, backpressure |
 | [Audit log](docs/audit-log.md) | Hash chain, verification, tamper-evident scope |

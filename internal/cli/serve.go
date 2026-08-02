@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/vismod/vismod/internal/audit"
 	"github.com/vismod/vismod/internal/config"
+	"github.com/vismod/vismod/internal/fetch"
 	"github.com/vismod/vismod/internal/observe"
 	"github.com/vismod/vismod/internal/pipeline"
 	"github.com/vismod/vismod/internal/queue"
@@ -114,8 +116,18 @@ func newServer(cfg config.Config) (*server, error) {
 		}
 		return nil, err
 	}
-	p := buildPipeline(cfg, mod, sink, auditLog, log)
+	fetcher, err := newFetcher(cfg)
+	if err != nil {
+		_ = mod.Close()
+		if auditLog != nil {
+			_ = auditLog.Close()
+		}
+		_ = closeSinks()
+		return nil, err
+	}
+	p := buildPipeline(cfg, mod, sink, auditLog, fetcher, log)
 	p.FrameSource = newFrameSource(cfg, log)
+	p.OnFetch = fetchRecorder(metrics)
 
 	q, err := newQueue(cfg, log)
 	if err != nil {
@@ -204,10 +216,18 @@ func (s *server) run(ctx context.Context) error {
 		}
 		if disp != queue.Retry { // retries aren't final outcomes
 			metrics.JobsTotal.WithLabelValues(verdict).Inc()
+			// The envelope's Source is the RECORDED one: for a url job that
+			// is the redacted ref, never the presigned original sitting in
+			// j.Source.Ref. Falling back to the job's own ref is safe only
+			// for non-url kinds.
+			ref, mediaType := env.Source.Ref, env.Source.MediaType
+			if ref == "" && j.Source.Kind != "url" {
+				ref, mediaType = j.Source.Ref, j.Source.MediaType
+			}
 			rec := observe.JobRecord{
 				ID:         string(j.ID),
-				Ref:        j.Source.Ref,
-				MediaType:  j.Source.MediaType,
+				Ref:        ref,
+				MediaType:  mediaType,
 				Verdict:    verdict,
 				FinishedAt: env.FinishedAt,
 				DurationMS: env.FinishedAt.Sub(env.StartedAt).Milliseconds(),
@@ -267,6 +287,11 @@ func (s *server) run(ctx context.Context) error {
 	var uiSrv *http.Server
 	if cfg.UI.Enabled {
 		uiSrv = ui.New(cfg, q, dlqOf(q), statesOf(q), activeOf(q), sw, tracker, log).Start()
+	}
+
+	if cfg.Source.URL.Enabled {
+		log.Warn("url media sources are ENABLED; jobs may cause outbound fetches",
+			"allow_hosts", strings.Join(cfg.Source.URL.AllowHosts, ","))
 	}
 
 	log.Info("vismod serve started",
@@ -377,6 +402,23 @@ type intakeRequest struct {
 	DedupThreshold *int `json:"dedup_threshold,omitempty"`
 }
 
+// validateURLIntake is the intake-side half of url validation. The
+// execution-side half runs in the fetcher, because a job can also arrive
+// straight onto the redis queue without passing through here.
+func validateURLIntake(cfg config.Config, rawRef string) error {
+	if !cfg.Source.URL.Enabled {
+		return fmt.Errorf(`kind "url" requires source.url.enabled=true`)
+	}
+	allow := make(map[string]bool, len(cfg.Source.URL.AllowHosts))
+	for _, h := range cfg.Source.URL.AllowHosts {
+		allow[strings.ToLower(strings.TrimSpace(h))] = true
+	}
+	if _, err := fetch.ValidateURL(rawRef, allow); err != nil {
+		return err
+	}
+	return nil
+}
+
 // serveIntake exposes the dev/demo HTTP intake: POST /jobs with a JSON
 // body. Rejections are retryable signals (503 + Retry-After), never
 // silent drops. Payloads carry file refs only, never media bytes.
@@ -402,12 +444,31 @@ func serveIntake(cfg config.Config, q queue.Queue, bp *observe.Backpressure, sw 
 			http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
 			return
 		}
-		if req.Kind != "file" || req.Ref == "" {
-			http.Error(w, `bad request: v1 accepts {"kind":"file","ref":"<abs path>","media_type":"image|video","workflows":["name",...]} (workflows optional)`, http.StatusBadRequest)
+		if req.Ref == "" {
+			http.Error(w, `bad request: ref is required — {"kind":"file|url","ref":"<abs path|https url>","media_type":"image|video","workflows":["name",...]} (workflows optional)`, http.StatusBadRequest)
+			return
+		}
+		switch req.Kind {
+		case "file":
+		case "url":
+			if err := validateURLIntake(cfg, req.Ref); err != nil {
+				// err is built from the REDACTED url — never echo a query
+				// string back to the caller or into the access log.
+				http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+		default:
+			http.Error(w, `bad request: kind must be "file" or "url"`, http.StatusBadRequest)
 			return
 		}
 		if req.MediaType == "" {
-			req.MediaType = mediaTypeFor(req.Ref)
+			// For a url, infer from the redacted path: a query string can
+			// carry an extension that is not the asset's.
+			ref := req.Ref
+			if req.Kind == "url" {
+				ref, _ = fetch.Redact(ref)
+			}
+			req.MediaType = mediaTypeFor(ref)
 		}
 		if err := validateWorkflowSelection(cfg, req.Workflows); err != nil {
 			http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
@@ -417,14 +478,18 @@ func serveIntake(cfg config.Config, q queue.Queue, bp *observe.Backpressure, sw 
 			http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
 			return
 		}
-		abs, err := filepath.Abs(req.Ref)
-		if err != nil {
-			http.Error(w, "bad path", http.StatusBadRequest)
-			return
+		ref := req.Ref
+		if req.Kind == "file" {
+			abs, err := filepath.Abs(req.Ref)
+			if err != nil {
+				http.Error(w, "bad path", http.StatusBadRequest)
+				return
+			}
+			ref = abs
 		}
 		j := queue.Job{
 			ID:             queue.JobID(fmt.Sprintf("job-%d", time.Now().UnixNano())),
-			Source:         moderation.Source{Kind: req.Kind, Ref: abs, MediaType: req.MediaType},
+			Source:         moderation.Source{Kind: req.Kind, Ref: ref, MediaType: req.MediaType},
 			Workflows:      req.Workflows,
 			DedupThreshold: req.DedupThreshold,
 			SubmittedAt:    time.Now().UTC(),

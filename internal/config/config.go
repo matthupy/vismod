@@ -235,6 +235,27 @@ type FramesConfig struct {
 	Dedup       DedupConfig `mapstructure:"dedup"`
 }
 
+// URLSourceConfig enables jobs whose Source.Kind is "url".
+//
+// OFF by default. The destination is chosen by an untrusted job payload,
+// so this is the one config block where every omission fails closed:
+// enabling it without an allow-list refuses to boot, and there is no
+// switch that disables the address deny-list.
+type URLSourceConfig struct {
+	Enabled bool `mapstructure:"enabled"`
+	// AllowHosts are exact hostnames (no wildcards, no suffix matching:
+	// "example.com" does NOT permit "evil.example.com").
+	AllowHosts        []string      `mapstructure:"allow_hosts"`
+	MaxBytes          int64         `mapstructure:"max_bytes"`
+	Timeout           time.Duration `mapstructure:"timeout"`
+	MaxAttempts       int           `mapstructure:"max_attempts"`
+	AllowedMediaTypes []string      `mapstructure:"allowed_media_types"`
+}
+
+type SourceConfig struct {
+	URL URLSourceConfig `mapstructure:"url"`
+}
+
 type RedisConfig struct {
 	Addr     string `mapstructure:"addr"`
 	Password string `mapstructure:"-"` // env-only: VISMOD_QUEUE_REDIS_PASSWORD
@@ -312,6 +333,7 @@ type Config struct {
 	ProviderThresholds ProviderThresholds `mapstructure:"provider_thresholds"`
 	FFmpeg             FFmpegConfig       `mapstructure:"ffmpeg"`
 	Frames             FramesConfig       `mapstructure:"frames"`
+	Source             SourceConfig       `mapstructure:"source"`
 	Queue              QueueConfig        `mapstructure:"queue"`
 	Audit              AuditConfig        `mapstructure:"audit"`
 	UI                 UIConfig           `mapstructure:"ui"`
@@ -383,6 +405,16 @@ func Defaults() Config {
 			Workflows:       DefaultWorkflows(),
 		},
 		Frames: FramesConfig{Concurrency: 4, Dedup: DedupConfig{Enabled: false, HammingThreshold: 8}},
+		Source: SourceConfig{URL: URLSourceConfig{
+			Enabled:     false,
+			MaxBytes:    256 << 20,
+			Timeout:     60 * time.Second,
+			MaxAttempts: 3,
+			AllowedMediaTypes: []string{
+				"video/mp4", "video/webm", "video/quicktime",
+				"image/jpeg", "image/png", "image/webp",
+			},
+		}},
 		Queue: QueueConfig{
 			Driver:        "memory",
 			Workers:       4,
@@ -468,6 +500,36 @@ func Validate(cfg Config) error {
 	}
 	if err := validateOutput(cfg.Output); err != nil {
 		return err
+	}
+	if err := validateURLSource(cfg.Source.URL); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateURLSource(u URLSourceConfig) error {
+	if !u.Enabled {
+		return nil
+	}
+	if len(u.AllowHosts) == 0 {
+		return fmt.Errorf("config: source.url.enabled=true requires at least one entry in source.url.allow_hosts — an empty allow-list can fetch nothing, and accepting it would make \"enabled\" misleading")
+	}
+	for i, h := range u.AllowHosts {
+		if strings.TrimSpace(h) == "" {
+			return fmt.Errorf("config: source.url.allow_hosts[%d] is empty", i)
+		}
+		if strings.ContainsAny(h, "*/") {
+			return fmt.Errorf("config: source.url.allow_hosts[%d] = %q — hostnames are matched exactly; wildcards and paths are not supported", i, h)
+		}
+	}
+	if u.MaxBytes < 0 {
+		return fmt.Errorf("config: source.url.max_bytes must be >= 0, got %d", u.MaxBytes)
+	}
+	if u.Timeout < 0 {
+		return fmt.Errorf("config: source.url.timeout must be >= 0, got %s", u.Timeout)
+	}
+	if u.MaxAttempts < 0 {
+		return fmt.Errorf("config: source.url.max_attempts must be >= 0, got %d", u.MaxAttempts)
 	}
 	return nil
 }

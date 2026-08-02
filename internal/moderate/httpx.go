@@ -68,11 +68,11 @@ func DoJSON(ctx context.Context, client *http.Client, build func() (*http.Reques
 				if errCodeHeader != "" {
 					herr.Code = resp.Header.Get(errCodeHeader)
 				}
-				if !retryableStatus(resp.StatusCode) {
+				if !RetryableStatus(resp.StatusCode) {
 					return nil, herr // terminal 4xx: fail now, no retry
 				}
 				lastErr = herr
-				if ra := retryAfter(resp); ra > 0 && attempt < maxAttempts {
+				if ra := RetryAfter(resp); ra > 0 && attempt < maxAttempts {
 					if err := sleepCtx(ctx, ra); err != nil {
 						return nil, moderation.Retryable(lastErr)
 					}
@@ -103,11 +103,15 @@ func DoJSON(ctx context.Context, client *http.Client, build func() (*http.Reques
 // Retry-After header (grows exponentially per attempt).
 const rate429Floor = 2 * time.Second
 
-func retryableStatus(code int) bool {
+// RetryableStatus reports whether an HTTP status is transient (F.4):
+// 429 and 5xx retry, every other 4xx is terminal.
+func RetryableStatus(code int) bool {
 	return code == http.StatusTooManyRequests || code >= 500
 }
 
-func retryAfter(resp *http.Response) time.Duration {
+// RetryAfter returns a usable Retry-After delay, or 0. Values above 120s
+// are ignored so a hostile or broken header cannot stall a worker.
+func RetryAfter(resp *http.Response) time.Duration {
 	if v := resp.Header.Get("Retry-After"); v != "" {
 		if secs, err := strconv.Atoi(v); err == nil && secs > 0 && secs <= 120 {
 			return time.Duration(secs) * time.Second

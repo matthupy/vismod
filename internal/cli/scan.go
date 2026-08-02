@@ -137,7 +137,11 @@ func runScan(ctx context.Context, out io.Writer, args []string, opts scanOptions
 		return 0, err
 	}
 	defer func() { _ = closeSinks() }()
-	p := buildPipeline(cfg, mod, sink, auditLog, log)
+	fetcher, err := newFetcher(cfg)
+	if err != nil {
+		return 0, err
+	}
+	p := buildPipeline(cfg, mod, sink, auditLog, fetcher, log)
 	p.FrameSource = newFrameSource(cfg, log)
 
 	exit := 0
