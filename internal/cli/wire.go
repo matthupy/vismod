@@ -9,6 +9,7 @@ import (
 
 	"github.com/vismod/vismod/internal/audit"
 	"github.com/vismod/vismod/internal/config"
+	"github.com/vismod/vismod/internal/fetch"
 	"github.com/vismod/vismod/internal/frames"
 	"github.com/vismod/vismod/internal/moderate"
 	"github.com/vismod/vismod/internal/pipeline"
@@ -39,11 +40,36 @@ func buildModerator(cfg config.Config, log *slog.Logger) (moderation.Moderator, 
 	})
 }
 
+// newFetcher builds the url-source fetcher, or nil when the feature is
+// off. Construction IS boot validation: a bad allow-list fails here.
+func newFetcher(cfg config.Config) (pipeline.SourceFetcher, error) {
+	f, err := fetch.New(fetch.Config{
+		Enabled:           cfg.Source.URL.Enabled,
+		AllowHosts:        cfg.Source.URL.AllowHosts,
+		MaxBytes:          cfg.Source.URL.MaxBytes,
+		Timeout:           cfg.Source.URL.Timeout,
+		MaxAttempts:       cfg.Source.URL.MaxAttempts,
+		AllowedMediaTypes: cfg.Source.URL.AllowedMediaTypes,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if f == nil {
+		// Disabled. Returning the typed nil *Fetcher would produce a
+		// non-nil interface holding a nil pointer, so pipeline's
+		// `p.Fetcher == nil` would be false and url jobs would panic
+		// instead of erroring. Do not simplify this away.
+		return nil, nil
+	}
+	return f, nil
+}
+
 // buildPipeline assembles the per-job pipeline around the active model.
-func buildPipeline(cfg config.Config, mod moderation.Moderator, sink result.Sink, auditLog *audit.Log, log *slog.Logger) *pipeline.Pipeline {
+func buildPipeline(cfg config.Config, mod moderation.Moderator, sink result.Sink, auditLog *audit.Log, f pipeline.SourceFetcher, log *slog.Logger) *pipeline.Pipeline {
 	p := &pipeline.Pipeline{
 		Moderator:   mod,
 		Sink:        sink,
+		Fetcher:     f,
 		Thresholds:  cfg.Thresholds,
 		Concurrency: cfg.Frames.Concurrency,
 		ModelID: result.ModelIdentity{

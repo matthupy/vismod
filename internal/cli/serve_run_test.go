@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/vismod/vismod/internal/config"
+	"github.com/vismod/vismod/internal/observe"
 	"github.com/vismod/vismod/internal/queue"
 	"github.com/vismod/vismod/pkg/moderation"
 )
@@ -304,5 +305,57 @@ func TestRunServeDrainsOnCancel(t *testing.T) {
 		}
 	case <-time.After(20 * time.Second):
 		t.Fatal("runServe ignored parent cancellation")
+	}
+}
+
+// TestServerRunNeverPutsAPresignedURLInTheJobFeed: the queue job carries
+// the FULL url (the fetcher needs the signature), but everything the
+// operator UI renders comes from the envelope's redacted source. Reading
+// j.Source.Ref here would publish the credential on the dashboard.
+func TestServerRunNeverPutsAPresignedURLInTheJobFeed(t *testing.T) {
+	c := serveConfig(t)
+	c.Source.URL.Enabled = true
+	c.Source.URL.AllowHosts = []string{"media.example.com"}
+
+	s, err := newServer(c)
+	if err != nil {
+		t.Fatalf("newServer: %v", err)
+	}
+	defer s.close()
+
+	// No fetch happens against a real host: the address policy denies it
+	// long before a socket opens. The job still ends as a tracked record,
+	// which is exactly the surface under test.
+	if _, err := s.queue.Enqueue(context.Background(), queue.Job{
+		ID: "serve-url-1",
+		Source: moderation.Source{
+			Kind:      "url",
+			Ref:       "https://media.example.com/clip.mp4?X-Amz-Signature=deadbeef",
+			MediaType: "image",
+		},
+		SubmittedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	stop := runServer(t, s)
+	deadline := time.Now().Add(15 * time.Second)
+	var recent []observe.JobRecord
+	for time.Now().Before(deadline) {
+		if recent, _ = s.tracker.Snapshot(); len(recent) > 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	stop()
+
+	if len(recent) == 0 {
+		t.Fatal("the url job never reached the job tracker")
+	}
+	if strings.Contains(recent[0].Ref, "deadbeef") || strings.Contains(recent[0].Ref, "X-Amz") {
+		t.Errorf("presigned credential reached the operator UI job feed: %q", recent[0].Ref)
+	}
+	if recent[0].Ref != "https://media.example.com/clip.mp4" {
+		t.Errorf("job feed ref = %q, want the redacted url", recent[0].Ref)
 	}
 }

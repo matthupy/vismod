@@ -21,8 +21,8 @@ func TestBuildPipelineStampsModelVersionUnderServeWiring(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	cfg := config.Config{Thresholds: config.Thresholds{}}
 
-	direct := buildPipeline(cfg, devFakeModerator{}, nil, nil, log)
-	instrumented := buildPipeline(cfg, observe.InstrumentModerator(devFakeModerator{}, observe.NewMetrics()), nil, nil, log)
+	direct := buildPipeline(cfg, devFakeModerator{}, nil, nil, nil, log)
+	instrumented := buildPipeline(cfg, observe.InstrumentModerator(devFakeModerator{}, observe.NewMetrics()), nil, nil, nil, log)
 
 	if instrumented.ModelID.ModelVersion != direct.ModelID.ModelVersion {
 		t.Errorf("instrumenting changed model_version: %q under serve vs %q under scan",

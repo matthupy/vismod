@@ -368,3 +368,121 @@ func (stubQueue) Enqueue(context.Context, queue.Job) (queue.JobID, error) { retu
 func (stubQueue) Start(context.Context, queue.Handler) error              { return nil }
 func (stubQueue) QueueDepth(context.Context) (int, error)                 { return 0, nil }
 func (stubQueue) Close(context.Context) error                             { return nil }
+
+// urlIntakeConfig is intakeConfig with url sources enabled for one host.
+func urlIntakeConfig() config.Config {
+	cfg := intakeConfig()
+	cfg.Source.URL.Enabled = true
+	cfg.Source.URL.AllowHosts = []string{"media.example.com"}
+	return cfg
+}
+
+func TestIntakeRejectsURLKindWhenDisabled(t *testing.T) {
+	h := newIntake(t, intakeConfig(), testMemq(t), openBackpressure(), &intakeSwitch{})
+	rec := post(h, `{"kind":"url","ref":"https://media.example.com/clip.mp4","media_type":"video"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "source.url.enabled") {
+		t.Errorf("body should explain the feature is off: %s", rec.Body.String())
+	}
+}
+
+func TestIntakeAcceptsAllowListedURL(t *testing.T) {
+	q := testMemq(t)
+	h := newIntake(t, urlIntakeConfig(), q, openBackpressure(), &intakeSwitch{})
+	rec := post(h, `{"kind":"url","ref":"https://media.example.com/clip.mp4","media_type":"video"}`)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202: %s", rec.Code, rec.Body.String())
+	}
+	if got := depth(t, q); got != 1 {
+		t.Errorf("queue depth = %d, want 1", got)
+	}
+}
+
+// The queued url must be the FULL original: the fetcher needs the
+// presigned query string to authenticate. Redaction happens at the
+// recording boundary (pipeline), not at intake.
+func TestIntakeQueuesTheFullURLUnmodified(t *testing.T) {
+	q := testMemq(t)
+	h := newIntake(t, urlIntakeConfig(), q, openBackpressure(), &intakeSwitch{})
+	const ref = "https://media.example.com/clip.mp4?sig=secret"
+	if rec := post(h, `{"kind":"url","ref":"`+ref+`"}`); rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+
+	got := make(chan queue.Job, 1)
+	if err := q.Start(t.Context(), func(_ context.Context, j queue.Job) (queue.Disposition, error) {
+		got <- j
+		return queue.Ack, nil
+	}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	select {
+	case j := <-got:
+		if j.Source.Ref != ref {
+			t.Errorf("queued ref = %q, want the untouched url", j.Source.Ref)
+		}
+		if j.Source.Kind != "url" {
+			t.Errorf("kind = %q, want url", j.Source.Kind)
+		}
+		if j.Source.MediaType != "video" {
+			t.Errorf("media_type = %q, want video (inferred from the redacted path)", j.Source.MediaType)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("job never reached a worker")
+	}
+}
+
+func TestIntakeRejectsBadURLs(t *testing.T) {
+	for name, ref := range map[string]string{
+		"not allow-listed": "https://evil.example.com/clip.mp4",
+		"http scheme":      "http://media.example.com/clip.mp4",
+		"userinfo":         "https://u:p@media.example.com/clip.mp4",
+		"metadata ip":      "https://169.254.169.254/clip.mp4",
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := newIntake(t, urlIntakeConfig(), testMemq(t), openBackpressure(), &intakeSwitch{})
+			rec := post(h, `{"kind":"url","ref":"`+ref+`","media_type":"video"}`)
+			if rec.Code != http.StatusBadRequest {
+				t.Errorf("status = %d, want 400 for %s", rec.Code, ref)
+			}
+		})
+	}
+}
+
+func TestIntakeDoesNotEchoTheQueryString(t *testing.T) {
+	h := newIntake(t, urlIntakeConfig(), testMemq(t), openBackpressure(), &intakeSwitch{})
+	rec := post(h, `{"kind":"url","ref":"https://evil.example.com/c.mp4?sig=secret","media_type":"video"}`)
+	if strings.Contains(rec.Body.String(), "secret") {
+		t.Errorf("error response echoed the credential: %s", rec.Body.String())
+	}
+}
+
+func TestIntakeStillRejectsUnknownKinds(t *testing.T) {
+	h := newIntake(t, urlIntakeConfig(), testMemq(t), openBackpressure(), &intakeSwitch{})
+	if rec := post(h, `{"kind":"s3","ref":"s3://b/k","media_type":"video"}`); rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rec.Code)
+	}
+}
+
+func TestDisabledFetcherIsAnUntypedNil(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.Source.URL.Enabled = false
+	f, err := newFetcher(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f != nil {
+		t.Fatal("a disabled fetcher must be an untyped nil, or pipeline's nil check silently fails and url jobs panic")
+	}
+}
+
+func TestEnabledFetcherWithEmptyAllowListFailsBoot(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.Source.URL.Enabled = true
+	cfg.Source.URL.AllowHosts = nil
+	if _, err := newFetcher(cfg); err == nil {
+		t.Fatal("construction IS boot validation: an empty allow-list must fail here")
+	}
+}
