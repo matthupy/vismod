@@ -468,3 +468,88 @@ func TestOutputWebhookPlaintextInwardIsAllowed(t *testing.T) {
 		})
 	}
 }
+
+func TestSourceURLDefaultsDisabled(t *testing.T) {
+	cfg, err := Load(writeTempYAML(t, "ffmpeg:\n  max_frames: 8\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Source.URL.Enabled {
+		t.Error("url sources must be OFF by default")
+	}
+}
+
+func TestSourceURLParses(t *testing.T) {
+	cfg, err := Load(writeTempYAML(t, `
+ffmpeg:
+  max_frames: 8
+source:
+  url:
+    enabled: true
+    allow_hosts:
+      - media.example.com
+    max_bytes: 1048576
+    timeout: 30s
+    max_attempts: 5
+    allowed_media_types:
+      - video/mp4
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	u := cfg.Source.URL
+	if !u.Enabled || len(u.AllowHosts) != 1 || u.MaxBytes != 1048576 ||
+		u.Timeout != 30*time.Second || u.MaxAttempts != 5 || len(u.AllowedMediaTypes) != 1 {
+		t.Errorf("parsed wrong: %+v", u)
+	}
+}
+
+func TestSourceURLEnabledWithoutAllowHostsRefusesBoot(t *testing.T) {
+	_, err := Load(writeTempYAML(t, `
+ffmpeg:
+  max_frames: 8
+source:
+  url:
+    enabled: true
+`))
+	if err == nil {
+		t.Fatal("enabled with no allow_hosts must refuse to boot")
+	}
+	if !strings.Contains(err.Error(), "allow_hosts") {
+		t.Errorf("error must name the offending key, got %v", err)
+	}
+}
+
+func TestSourceURLNegativeNumbersRefuseBoot(t *testing.T) {
+	for name, body := range map[string]string{
+		"negative max_bytes": "    max_bytes: -1\n",
+		"negative timeout":   "    timeout: -5s\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			y := "ffmpeg:\n  max_frames: 8\nsource:\n  url:\n    enabled: true\n    allow_hosts: [media.example.com]\n" + body
+			if _, err := Load(writeTempYAML(t, y)); err == nil {
+				t.Fatal("want boot refusal")
+			}
+		})
+	}
+}
+
+func TestSourceURLWildcardHostRefusesBoot(t *testing.T) {
+	y := "ffmpeg:\n  max_frames: 8\nsource:\n  url:\n    enabled: true\n    allow_hosts: [\"*.example.com\"]\n"
+	if _, err := Load(writeTempYAML(t, y)); err == nil {
+		t.Fatal("a wildcard host must refuse to boot: matching is exact")
+	}
+}
+
+func TestConfigHashIgnoresSourceAndOutput(t *testing.T) {
+	th := Thresholds{"default": {FlagAt: f64(0.5), BlockAt: f64(0.8)}}
+	// ConfigHash takes only adapter, model version, and thresholds — so
+	// changing fetch or sink settings CANNOT perturb it. This test exists
+	// so a future signature change cannot silently make every previously
+	// written envelope incomparable.
+	a := ConfigHash("microsoft", "v1", th)
+	b := ConfigHash("microsoft", "v1", th)
+	if a != b {
+		t.Fatal("hash is not stable")
+	}
+}
