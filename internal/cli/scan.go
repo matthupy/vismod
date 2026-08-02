@@ -1,7 +1,9 @@
 package cli
 
 import (
+	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -49,97 +51,124 @@ Exit codes: 0 = all allow; 1 = at least one flag/block; 2 = at least one
 error verdict or processing failure (fail safe: an error is never allow).`,
 	Args: cobra.MinimumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		log := observe.NewLogger(cfg.LogLevel)
-
-		// The extraction path is only validated when a video is actually
-		// being scanned; image-only scans don't require ffmpeg.
-		for _, path := range args {
-			if mediaTypeFor(path) == "video" {
-				if err := validateFrameBoot(cfg); err != nil {
-					return fmt.Errorf("boot validation: %w", err)
-				}
-				break
-			}
-		}
-		if err := validateWorkflowSelection(cfg, scanWorkflows); err != nil {
-			return err
-		}
-		var dedupOverride *int
+		opts := scanOptions{Workflows: scanWorkflows}
+		// Flag presence, not value: 0 is a meaningful threshold, so an
+		// unset flag has to stay nil ("inherit the config") rather than
+		// read as "dedup at Hamming distance 0".
 		if cmd.Flags().Changed("dedup-threshold") {
-			if err := validateDedupThreshold(&scanDedupThreshold); err != nil {
-				return err
-			}
-			dedupOverride = &scanDedupThreshold
+			opts.DedupThreshold = &scanDedupThreshold
 		}
-
-		mod, err := buildModerator(cfg, log)
+		code, err := runScan(cmd.Context(), cmd.OutOrStdout(), args, opts)
 		if err != nil {
 			return err
 		}
-		defer func() { _ = mod.Close() }()
-		// After buildModerator: the label declaration lives on the adapter,
-		// so this check cannot run in config.Load.
-		if err := validateProviderLabelBoot(cfg, mod); err != nil {
-			return fmt.Errorf("boot validation: %w", err)
-		}
-
-		auditLog, err := openAudit(cfg)
-		if err != nil {
-			return err
-		}
-		if auditLog != nil {
-			// A failed close on the audit log means the last decision may
-			// not have reached disk. Nothing can be done about it here, but
-			// it must not vanish: an audit trail that silently loses its
-			// tail is worse than one that admits the gap.
-			defer func() {
-				if err := auditLog.Close(); err != nil {
-					log.Error("closing audit log failed", "err", err)
-				}
-			}()
-		}
-
-		sink, closeSinks, err := buildSinks(cfg, cmd.OutOrStdout(), nil)
-		if err != nil {
-			return err
-		}
-		defer func() { _ = closeSinks() }()
-		p := buildPipeline(cfg, mod, sink, auditLog, log)
-		p.FrameSource = newFrameSource(cfg, log)
-
-		exit := 0
-		for i, path := range args {
-			abs, err := filepath.Abs(path)
-			if err != nil {
-				return fmt.Errorf("resolve %s: %w", path, err)
-			}
-			if _, err := os.Stat(abs); err != nil {
-				return fmt.Errorf("input %s: %w", path, err)
-			}
-			j := queue.Job{
-				ID: queue.JobID(fmt.Sprintf("scan-%d-%d", time.Now().UnixNano(), i)),
-				Source: moderation.Source{
-					Kind: "file", Ref: abs, MediaType: mediaTypeFor(abs),
-				},
-				Workflows:      scanWorkflows,
-				DedupThreshold: dedupOverride,
-				SubmittedAt:    time.Now().UTC(),
-			}
-			env, disp, perr := p.ProcessJob(cmd.Context(), j)
-			if disp != queue.Ack {
-				exit = 2
-				log.Error("scan job failed", "input", path, "err", perr)
-				continue
-			}
-			if env.Result != nil && env.Result.Overall.Verdict != moderation.VerdictAllow && exit == 0 {
-				exit = 1
-			}
-		}
-		if exit != 0 {
-			os.Exit(exit)
+		// os.Exit lives HERE, not in runScan: exiting inside the scan
+		// would skip its own deferred closes and make every non-zero exit
+		// path untestable in-process.
+		if code != 0 {
+			os.Exit(code)
 		}
 		return nil
 	},
+}
+
+// scanOptions carries the per-invocation overrides that ride the scan
+// flags. A nil DedupThreshold inherits frames.dedup from config.
+type scanOptions struct {
+	Workflows      []string
+	DedupThreshold *int
+}
+
+// runScan moderates each input and returns the process exit code:
+// 0 = every input allowed, 1 = at least one flag/block, 2 = at least one
+// error verdict or processing failure. A non-nil error is a setup failure
+// (bad config, unusable input) that never reached scanning.
+//
+// Fail safe: 2 outranks 1, and an error verdict never reports as allow.
+func runScan(ctx context.Context, out io.Writer, args []string, opts scanOptions) (int, error) {
+	log := observe.NewLogger(cfg.LogLevel)
+
+	// The extraction path is only validated when a video is actually
+	// being scanned; image-only scans don't require ffmpeg.
+	for _, path := range args {
+		if mediaTypeFor(path) == "video" {
+			if err := validateFrameBoot(cfg); err != nil {
+				return 0, fmt.Errorf("boot validation: %w", err)
+			}
+			break
+		}
+	}
+	if err := validateWorkflowSelection(cfg, opts.Workflows); err != nil {
+		return 0, err
+	}
+	if err := validateDedupThreshold(opts.DedupThreshold); err != nil {
+		return 0, err
+	}
+
+	mod, err := buildModerator(cfg, log)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = mod.Close() }()
+	// After buildModerator: the label declaration lives on the adapter,
+	// so this check cannot run in config.Load.
+	if err := validateProviderLabelBoot(cfg, mod); err != nil {
+		return 0, fmt.Errorf("boot validation: %w", err)
+	}
+
+	auditLog, err := openAudit(cfg)
+	if err != nil {
+		return 0, err
+	}
+	if auditLog != nil {
+		// A failed close on the audit log means the last decision may
+		// not have reached disk. Nothing can be done about it here, but
+		// it must not vanish: an audit trail that silently loses its
+		// tail is worse than one that admits the gap.
+		defer func() {
+			if err := auditLog.Close(); err != nil {
+				log.Error("closing audit log failed", "err", err)
+			}
+		}()
+	}
+
+	sink, closeSinks, err := buildSinks(cfg, out, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = closeSinks() }()
+	p := buildPipeline(cfg, mod, sink, auditLog, log)
+	p.FrameSource = newFrameSource(cfg, log)
+
+	exit := 0
+	for i, path := range args {
+		abs, err := filepath.Abs(path)
+		if err != nil {
+			return 0, fmt.Errorf("resolve %s: %w", path, err)
+		}
+		if _, err := os.Stat(abs); err != nil {
+			return 0, fmt.Errorf("input %s: %w", path, err)
+		}
+		j := queue.Job{
+			ID: queue.JobID(fmt.Sprintf("scan-%d-%d", time.Now().UnixNano(), i)),
+			Source: moderation.Source{
+				Kind: "file", Ref: abs, MediaType: mediaTypeFor(abs),
+			},
+			Workflows:      opts.Workflows,
+			DedupThreshold: opts.DedupThreshold,
+			SubmittedAt:    time.Now().UTC(),
+		}
+		env, disp, perr := p.ProcessJob(ctx, j)
+		if disp != queue.Ack {
+			exit = 2
+			log.Error("scan job failed", "input", path, "err", perr)
+			continue
+		}
+		if env.Result != nil && env.Result.Overall.Verdict != moderation.VerdictAllow && exit == 0 {
+			exit = 1
+		}
+	}
+	return exit, nil
 }
 
 func init() {

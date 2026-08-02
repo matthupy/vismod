@@ -16,8 +16,10 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/spf13/cobra"
 
+	"github.com/vismod/vismod/internal/audit"
 	"github.com/vismod/vismod/internal/config"
 	"github.com/vismod/vismod/internal/observe"
+	"github.com/vismod/vismod/internal/pipeline"
 	"github.com/vismod/vismod/internal/queue"
 	"github.com/vismod/vismod/internal/ui"
 	"github.com/vismod/vismod/pkg/moderation"
@@ -42,7 +44,36 @@ queue.driver=redis.`,
 
 func init() { rootCmd.AddCommand(serveCmd) }
 
-func runServe(parent context.Context) error {
+// server is the assembled worker: everything runServe needs, built and
+// validated before anything is started or any port is bound.
+//
+// The split exists so boot wiring can be exercised without entering the
+// blocking run loop — a 100-statement func that ends in <-ctx.Done() can
+// only be tested end to end, and then only by the one path that happens
+// to boot cleanly.
+type server struct {
+	cfg      config.Config
+	log      *slog.Logger
+	metrics  *observe.Metrics
+	bp       *observe.Backpressure
+	health   *observe.Health
+	mod      moderation.Moderator
+	pipeline *pipeline.Pipeline
+	queue    queue.Queue
+	tracker  *observe.JobTracker
+	sw       *intakeSwitch
+
+	auditLog   *audit.Log
+	closeSinks func() error
+}
+
+// newServer performs all of boot: validation, adapter construction, sinks,
+// audit log, pipeline, queue. Every failure here is a boot failure — the
+// caller gets an error and nothing has been started.
+//
+// On any error the resources already opened are released, so a failed boot
+// never leaks a file handle or a Redis connection.
+func newServer(cfg config.Config) (*server, error) {
 	log := observe.NewLogger(cfg.LogLevel)
 	metrics := observe.NewMetrics()
 	bp := observe.NewBackpressure(
@@ -53,53 +84,47 @@ func runServe(parent context.Context) error {
 	// Fail fast (§F.2): ffmpeg/ffprobe present, every workflow passes the
 	// guardrails, and the selected adapter's credentials resolve.
 	if err := validateFrameBoot(cfg); err != nil {
-		return fmt.Errorf("boot validation: %w", err)
+		return nil, fmt.Errorf("boot validation: %w", err)
 	}
 	mod, err := buildModerator(cfg, log)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	defer func() { _ = mod.Close() }()
 	// After buildModerator: the declaration lives on the adapter, so this
 	// cannot run in config.Load. Before instrumentation: the wrapper forwards
 	// ModelVersion() but NOT ProviderLabels(), so asserting it here keeps the
 	// check independent of what the wrapper happens to forward.
 	if err := validateProviderLabelBoot(cfg, mod); err != nil {
-		return fmt.Errorf("boot validation: %w", err)
+		_ = mod.Close()
+		return nil, fmt.Errorf("boot validation: %w", err)
 	}
 	mod = observe.InstrumentModerator(mod, metrics)
 
 	auditLog, err := openAudit(cfg)
 	if err != nil {
-		return err
-	}
-	if auditLog != nil {
-		// Matches the closeSinks handling below: a failed close on the audit
-		// log means the last decision may not have reached disk, and an
-		// audit trail that silently loses its tail is worse than one that
-		// admits the gap.
-		defer func() {
-			if err := auditLog.Close(); err != nil {
-				log.Error("closing audit log failed", "err", err)
-			}
-		}()
+		_ = mod.Close()
+		return nil, err
 	}
 
 	sink, closeSinks, err := buildSinks(cfg, os.Stdout, metrics)
 	if err != nil {
-		return err
-	}
-	defer func() {
-		if err := closeSinks(); err != nil {
-			log.Error("closing result sinks failed", "err", err)
+		_ = mod.Close()
+		if auditLog != nil {
+			_ = auditLog.Close()
 		}
-	}()
+		return nil, err
+	}
 	p := buildPipeline(cfg, mod, sink, auditLog, log)
 	p.FrameSource = newFrameSource(cfg, log)
 
 	q, err := newQueue(cfg, log)
 	if err != nil {
-		return err
+		_ = mod.Close()
+		if auditLog != nil {
+			_ = auditLog.Close()
+		}
+		_ = closeSinks()
+		return nil, err
 	}
 	if cfg.Queue.Driver == "memory" {
 		warn := "queue.driver=memory is NON-DURABLE, at-most-once, single-process; a crash loses queued and in-flight jobs — not for production intake (multi-replica requires driver=redis)"
@@ -116,11 +141,56 @@ func runServe(parent context.Context) error {
 		})
 	}
 
+	return &server{
+		cfg: cfg, log: log, metrics: metrics, bp: bp, health: health,
+		mod: mod, pipeline: p, queue: q,
+		tracker: observe.NewJobTracker(200), sw: &intakeSwitch{},
+		auditLog: auditLog, closeSinks: closeSinks,
+	}, nil
+}
+
+// close releases everything newServer opened. Ordering mirrors the
+// original defers: sinks and the audit log are the two that can lose the
+// tail of the record, so their failures are logged rather than swallowed.
+func (s *server) close() {
+	_ = s.mod.Close()
+	if s.auditLog != nil {
+		// A failed close on the audit log means the last decision may not
+		// have reached disk, and an audit trail that silently loses its
+		// tail is worse than one that admits the gap.
+		if err := s.auditLog.Close(); err != nil {
+			s.log.Error("closing audit log failed", "err", err)
+		}
+	}
+	if err := s.closeSinks(); err != nil {
+		s.log.Error("closing result sinks failed", "err", err)
+	}
+}
+
+// runServe boots the worker and runs it until a signal arrives.
+func runServe(parent context.Context) error {
+	s, err := newServer(cfg)
+	if err != nil {
+		return err
+	}
+	defer s.close()
+
 	ctx, stop := signal.NotifyContext(parent, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	return s.run(ctx)
+}
+
+// run starts the worker pool, the metrics/intake/UI servers and the depth
+// poller, then blocks until ctx is done and drains.
+//
+// Cancelling ctx is the ONLY exit: a drain failure is reported, never
+// silently accepted, because jobs left in flight at exit were accepted and
+// never answered.
+func (s *server) run(ctx context.Context) error {
+	cfg, log, metrics, p, q := s.cfg, s.log, s.metrics, s.pipeline, s.queue
+	bp, tracker := s.bp, s.tracker
 
 	// Worker handler: pipeline + backpressure + metrics + UI job feed.
-	tracker := observe.NewJobTracker(200)
 	handler := func(hctx context.Context, j queue.Job) (queue.Disposition, error) {
 		metrics.WorkersActive.Inc()
 		defer metrics.WorkersActive.Dec()
@@ -190,8 +260,8 @@ func runServe(parent context.Context) error {
 		}
 	}()
 
-	sw := &intakeSwitch{}
-	metricsSrv := observe.Serve(cfg.MetricsAddr, metrics, health, log)
+	sw := s.sw
+	metricsSrv := observe.Serve(cfg.MetricsAddr, metrics, s.health, log)
 	intakeSrv := serveIntake(cfg, q, bp, sw, log)
 
 	var uiSrv *http.Server
@@ -200,7 +270,7 @@ func runServe(parent context.Context) error {
 	}
 
 	log.Info("vismod serve started",
-		"adapter", mod.Name(), "queue_driver", cfg.Queue.Driver,
+		"adapter", s.mod.Name(), "queue_driver", cfg.Queue.Driver,
 		"workers", cfg.Queue.Workers, "metrics_addr", cfg.MetricsAddr,
 		"intake_addr", cfg.IntakeAddr)
 
