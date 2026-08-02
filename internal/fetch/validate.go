@@ -15,12 +15,20 @@ import (
 // enforced per-connection in the dialer (see Fetcher). This function only
 // rejects what is decidable from the text.
 func ValidateURL(raw string, allowHosts map[string]bool) (*url.URL, error) {
+	return validateURL(raw, allowHosts, "https")
+}
+
+// validateURL is ValidateURL with the required scheme as a parameter.
+// Production always passes "https"; the Fetcher passes its allowScheme so
+// tests can reach an httptest server without a config flag that would
+// weaken production. Nothing outside this package can vary it.
+func validateURL(raw string, allowHosts map[string]bool, scheme string) (*url.URL, error) {
 	u, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil {
 		return nil, fmt.Errorf("fetch: url is not parseable")
 	}
-	if u.Scheme != "https" {
-		return nil, fmt.Errorf("fetch: url scheme must be https, got %q", u.Scheme)
+	if u.Scheme != scheme {
+		return nil, fmt.Errorf("fetch: url scheme must be %s, got %q", scheme, u.Scheme)
 	}
 	if u.User != nil {
 		return nil, fmt.Errorf("fetch: url must not contain userinfo — credentials are env-only")

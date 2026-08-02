@@ -1,0 +1,264 @@
+package fetch
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"mime"
+	"net"
+	"net/http"
+	"net/netip"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/vismod/vismod/internal/moderate"
+	"github.com/vismod/vismod/pkg/moderation"
+)
+
+const (
+	defaultMaxBytes    = 256 << 20 // 256 MiB
+	defaultTimeout     = 60 * time.Second
+	defaultMaxAttempts = 3
+	baseBackoff        = 500 * time.Millisecond
+	dialTimeout        = 10 * time.Second
+)
+
+// Config is the source.url block.
+type Config struct {
+	Enabled           bool
+	AllowHosts        []string
+	MaxBytes          int64
+	Timeout           time.Duration
+	MaxAttempts       int
+	AllowedMediaTypes []string
+}
+
+// Fetcher downloads allow-listed media URLs to local files.
+type Fetcher struct {
+	cfg        Config
+	allowHosts map[string]bool
+	allowTypes map[string]bool
+	client     *http.Client
+
+	// allowScheme is "https" in production. Tests set it to "http" so
+	// httptest servers are reachable; it is not settable from config.
+	allowScheme string
+
+	// ipPolicy runs per-connection against the address actually dialed.
+	// This is the DNS-rebinding defense: a name that validated at parse
+	// time cannot re-resolve into a denied range without hitting this.
+	ipPolicy func(netip.Addr) error
+}
+
+// terminalErr marks a failure that must not be retried.
+type terminalErr struct{ err error }
+
+func (e terminalErr) Error() string { return e.err.Error() }
+func (e terminalErr) Unwrap() error { return e.err }
+
+func terminal(format string, a ...any) error {
+	return terminalErr{fmt.Errorf(format, a...)}
+}
+
+// New builds a Fetcher. It refuses an enabled config with no allow-list:
+// that combination cannot fetch anything anyway, and accepting it would
+// make "enabled" look meaningful when it is not.
+func New(cfg Config) (*Fetcher, error) {
+	if !cfg.Enabled {
+		return nil, nil
+	}
+	if len(cfg.AllowHosts) == 0 {
+		return nil, fmt.Errorf("config: source.url.enabled=true requires at least one entry in source.url.allow_hosts")
+	}
+	if cfg.MaxBytes <= 0 {
+		cfg.MaxBytes = defaultMaxBytes
+	}
+	if cfg.Timeout <= 0 {
+		cfg.Timeout = defaultTimeout
+	}
+	if cfg.MaxAttempts <= 0 {
+		cfg.MaxAttempts = defaultMaxAttempts
+	}
+
+	f := &Fetcher{
+		cfg:         cfg,
+		allowHosts:  lowerSet(cfg.AllowHosts),
+		allowTypes:  lowerSet(cfg.AllowedMediaTypes),
+		allowScheme: "https",
+		ipPolicy:    DenyPrivate,
+	}
+
+	dialer := &net.Dialer{Timeout: dialTimeout}
+	dialer.Control = func(_, address string, _ syscall.RawConn) error {
+		host, _, err := net.SplitHostPort(address)
+		if err != nil {
+			return fmt.Errorf("fetch: unparseable dial address %q", address)
+		}
+		ip, err := netip.ParseAddr(host)
+		if err != nil {
+			return fmt.Errorf("fetch: dial address %q is not an IP", host)
+		}
+		return f.ipPolicy(ip)
+	}
+	f.client = &http.Client{
+		Timeout:   cfg.Timeout,
+		Transport: &http.Transport{DialContext: dialer.DialContext},
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			// A redirect is a destination vismod did not choose.
+			return errors.New("fetch: redirects are not followed")
+		},
+	}
+	return f, nil
+}
+
+func lowerSet(in []string) map[string]bool {
+	m := make(map[string]bool, len(in))
+	for _, s := range in {
+		m[strings.ToLower(strings.TrimSpace(s))] = true
+	}
+	return m
+}
+
+// Fetch downloads rawURL into dir.
+//
+// cleanup is ALWAYS non-nil and is safe to call more than once. Defer it
+// immediately, on every exit path, before ack — the same contract as
+// FrameSource.Frames.
+func (f *Fetcher) Fetch(ctx context.Context, rawURL, dir string) (string, func(), error) {
+	var mu sync.Mutex
+	once := &sync.Once{}
+	path := filepath.Join(dir, "source"+extOf(rawURL))
+	// cleanup reads `once` under mu because the retry loop replaces it
+	// after each discarded attempt, and the caller may hold the closure.
+	cleanup := func() {
+		mu.Lock()
+		o := once
+		mu.Unlock()
+		o.Do(func() { _ = os.Remove(path) })
+	}
+	discard := func() {
+		cleanup()
+		mu.Lock()
+		once = &sync.Once{}
+		mu.Unlock()
+	}
+
+	u, err := validateURL(rawURL, f.allowHosts, f.allowScheme)
+	if err != nil {
+		return "", cleanup, terminalErr{err}
+	}
+
+	var lastErr error
+	for attempt := 1; attempt <= f.cfg.MaxAttempts; attempt++ {
+		err := f.attempt(ctx, u.String(), path)
+		if err == nil {
+			return path, cleanup, nil
+		}
+		discard() // never leave a partial file between attempts
+		var te terminalErr
+		if errors.As(err, &te) {
+			return "", cleanup, err
+		}
+		lastErr = err
+		if ctx.Err() != nil {
+			return "", cleanup, ctx.Err()
+		}
+		if attempt < f.cfg.MaxAttempts {
+			select {
+			case <-ctx.Done():
+				return "", cleanup, ctx.Err()
+			case <-time.After(baseBackoff * time.Duration(1<<(attempt-1))):
+			}
+		}
+	}
+	return "", cleanup, moderation.Retryable(fmt.Errorf("fetch: after %d attempts: %w", f.cfg.MaxAttempts, lastErr))
+}
+
+func (f *Fetcher) attempt(ctx context.Context, rawURL, path string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return terminalErr{err}
+	}
+	resp, err := f.client.Do(req)
+	if err != nil {
+		// Dialer.Control rejections and redirect refusals arrive here.
+		// Both are terminal: retrying cannot change the destination.
+		if strings.Contains(err.Error(), "fetch: ") {
+			return terminalErr{err}
+		}
+		return err // transport error: retryable
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		if !moderate.RetryableStatus(resp.StatusCode) {
+			return terminal("fetch: %s returned %d", redactForError(rawURL), resp.StatusCode)
+		}
+		if ra := moderate.RetryAfter(resp); ra > 0 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(ra):
+			}
+		}
+		return fmt.Errorf("fetch: %s returned %d", redactForError(rawURL), resp.StatusCode)
+	}
+
+	if err := f.checkMediaType(resp.Header.Get("Content-Type")); err != nil {
+		return err
+	}
+
+	out, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return terminalErr{fmt.Errorf("fetch: create %s: %w", path, err)}
+	}
+	defer out.Close()
+
+	// Read ONE byte past the cap so an exactly-at-cap body still succeeds
+	// while an oversize one is detectable. Content-Length is never trusted.
+	n, err := io.Copy(out, io.LimitReader(resp.Body, f.cfg.MaxBytes+1))
+	if err != nil {
+		return err // transport/context failure: retryable
+	}
+	if n > f.cfg.MaxBytes {
+		return terminal("fetch: body exceeds source.url.max_bytes (%d)", f.cfg.MaxBytes)
+	}
+	return nil
+}
+
+func (f *Fetcher) checkMediaType(header string) error {
+	if len(f.allowTypes) == 0 {
+		return nil
+	}
+	mt, _, err := mime.ParseMediaType(header)
+	if err != nil {
+		return terminal("fetch: unparseable Content-Type")
+	}
+	if !f.allowTypes[strings.ToLower(mt)] {
+		return terminal("fetch: Content-Type %q is not in source.url.allowed_media_types", mt)
+	}
+	return nil
+}
+
+// redactForError keeps a query string out of an error string, which ends
+// up in the envelope's Error field and in logs.
+func redactForError(raw string) string {
+	ref, _ := Redact(raw)
+	return ref
+}
+
+// extOf preserves a recognizable extension so ffprobe's container sniffing
+// has the usual hint. It never trusts the value for anything else.
+func extOf(raw string) string {
+	ref, _ := Redact(raw)
+	ext := filepath.Ext(ref)
+	if len(ext) > 5 || strings.ContainsAny(ext, `/\`) {
+		return ""
+	}
+	return ext
+}
