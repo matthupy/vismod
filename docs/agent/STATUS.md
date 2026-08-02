@@ -208,10 +208,41 @@ Docs updated to match: `config.example.yaml` documents the block,
 a `file` sink needs one path per replica (same hazard as the audit log),
 and `AGENTS.md` records the `MultiSink` fan-out/claim-release gotcha.
 
+Latest: test coverage 81.9% -> 93.8%, concentrated on the wiring and
+failure paths. Two production changes were needed to make the biggest gap
+testable at all, both structural rather than behavioral:
+
+1. `scan`'s logic moved out of its cobra `RunE` closure into
+   `cli.runScan(ctx, out, args, scanOptions) (exitCode, error)`. `RunE`
+   now only maps the code to `os.Exit`, which also means runScan's own
+   deferred closes run before the process exits (they did not before).
+2. `runServe` split into `cli.newServer(cfg) (*server, error)` — all boot
+   wiring and validation, releasing whatever it had already opened on a
+   partial failure — and `(*server).run(ctx)`, the blocking loop.
+   `runServe` is the thin wrapper adding `signal.NotifyContext`.
+
+Worth knowing: `go tool cover -func` does NOT list func literals, so
+`scan.go` read as fully covered while missing 52 statements inside its
+`RunE`. Per-package percentages are the honest number for any file whose
+logic lives in a closure.
+
+Per package: cli 39.8 -> 91.5, ui 69.1 -> 97.1, queue 83.3 -> 96.3,
+pipeline 87.2 -> 96.6, audit 84.3 -> 93.6, frames 85.9 -> 94.8, hive
+82.1 -> 96.4, microsoft 84.3 -> 93.1, google 63.2 -> 89.5.
+
+The google adapter now has a bufconn-backed fake Vision gRPC service, so
+the REQUEST it sends is pinned (exactly `SAFE_SEARCH_DETECTION`, bytes
+inline, never an image `source` URI for the vendor to fetch) — goldens
+could not check that, since they are built from responses this repo
+authored. That promoted `google.golang.org/api`, `google.golang.org/grpc`
+and `genproto/googleapis/rpc` from indirect to direct in `go.mod`; no new
+modules, same versions. `prometheus/client_golang/prometheus/testutil` was
+deliberately NOT used — it pulls in `kylelemons/godebug`.
+
 ## Gate status
 
 `go build ./...`, `go vet ./...`, `go test ./...` all pass locally as of
-2026-08-01.
+2026-08-02.
 
 ## In flight
 
