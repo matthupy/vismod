@@ -16,6 +16,49 @@ Delete an entry when it lands; record the outcome in `STATUS.md`.
 
 ---
 
+## 0. Document the url source kind (code has landed, docs have not)
+
+`kind:"url"` intake, `internal/fetch`, `source.url` config, fetch
+metrics and `Source.RefDigest` all shipped on `feat/url-source-kind`.
+No prose was written for any of it, and one shipped doc is now WRONG:
+`SECURITY.md` still states that media-source URLs are disabled as an
+SSRF vector. Fix that first.
+
+Acceptance criteria:
+- `SECURITY.md` describes the THREE URL trust classes separately and
+  does not apply the media-source deny-list rule to provider endpoints
+  or webhook sinks: (1) media source urls — job-supplied, untrusted,
+  https-only, exact host allow-list, private/link-local/CGNAT denied at
+  dial, no redirects, size cap on bytes read, transient download,
+  presigned query string never recorded; (2) provider endpoint urls —
+  operator config, private ranges expected; (3) webhook sink urls —
+  operator config, private ranges expected.
+- `config.example.yaml` carries the `source:` block (off by default,
+  `allow_hosts: []`, `max_bytes`, `timeout`, `max_attempts`,
+  `allowed_media_types`) with the security note.
+- `README.md`'s `POST /jobs` section documents `kind:"url"`, that it is
+  off by default, and that `ref` must be an allow-listed `https` URL.
+- Scanning-from-URL instructions exist for the REST API with worked
+  `curl` (macOS/Linux) and PowerShell (`Invoke-RestMethod`, Windows)
+  commands, covering an image job, a video job with `workflows`, and
+  reading back the result envelope. Note that one process runs ONE
+  vendor (`adapter.name`): scanning the same URL through several
+  vendors means several instances on separate `intake_addr` ports.
+- `CLAUDE.md` "Shape of the code" and `AGENTS.md` "Architecture map"
+  both list `internal/fetch/`.
+- `AGENTS.md` gains three gotchas: the two `Source` values per url job
+  (`resolved{local, env}`); `fetch.New` returning a typed-nil `*Fetcher`
+  that `cli.newFetcher` must convert to an untyped nil; and the host
+  allow-list (parse-time) versus the address deny-list (per-dial, the
+  only DNS-rebinding defense) being separate checks.
+- `docs/result-envelope.md` documents `ref_digest` and SchemaVersion
+  1.2.0.
+
+Files: `SECURITY.md`, `config.example.yaml`, `README.md`, `CLAUDE.md`,
+`AGENTS.md`, `docs/result-envelope.md`, `docs/index.md`.
+
+---
+
 ## 1. Audit the decision before fanning out to sinks
 
 The sink write happens BEFORE `p.Audit.Record` in
