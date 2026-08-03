@@ -14,7 +14,7 @@ func allowed(hosts ...string) map[string]bool {
 }
 
 func TestValidateURLAcceptsAllowListedHTTPS(t *testing.T) {
-	u, err := ValidateURL("https://media.example.com/clip.mp4", allowed("media.example.com"))
+	u, err := ValidateURL("https://media.example.com/clip.mp4", allowed("media.example.com"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -24,13 +24,13 @@ func TestValidateURLAcceptsAllowListedHTTPS(t *testing.T) {
 }
 
 func TestValidateURLHostMatchIsCaseInsensitive(t *testing.T) {
-	if _, err := ValidateURL("https://Media.Example.COM/clip.mp4", allowed("media.example.com")); err != nil {
+	if _, err := ValidateURL("https://Media.Example.COM/clip.mp4", allowed("media.example.com"), nil); err != nil {
 		t.Errorf("host comparison must be case-insensitive: %v", err)
 	}
 }
 
 func TestValidateURLAllowListIgnoresPort(t *testing.T) {
-	if _, err := ValidateURL("https://media.example.com:8443/clip.mp4", allowed("media.example.com")); err != nil {
+	if _, err := ValidateURL("https://media.example.com:8443/clip.mp4", allowed("media.example.com"), nil); err != nil {
 		t.Errorf("allow-list matches hostname, not host:port: %v", err)
 	}
 }
@@ -51,16 +51,57 @@ func TestValidateURLNegativeCases(t *testing.T) {
 		"unparseable":        "https://exa mple.com/\x7f",
 	} {
 		t.Run(name, func(t *testing.T) {
-			if _, err := ValidateURL(raw, hosts); err == nil {
+			if _, err := ValidateURL(raw, hosts, nil); err == nil {
 				t.Fatalf("%q must be rejected, got nil error", raw)
 			}
 		})
 	}
 }
 
-func TestValidateURLEmptyAllowListRejectsEverything(t *testing.T) {
-	if _, err := ValidateURL("https://media.example.com/clip.mp4", map[string]bool{}); err == nil {
-		t.Fatal("an empty allow-list must reject every host")
+// An empty allow_hosts means "any host": url sources work out of the box
+// and an operator narrows them in production. The address policy, not the
+// host list, is what keeps a job off non-public infrastructure.
+func TestValidateURLEmptyAllowListPermitsAnyHost(t *testing.T) {
+	if _, err := ValidateURL("https://anything.example.com/clip.mp4", map[string]bool{}, nil); err != nil {
+		t.Fatalf("an empty allow-list must permit any host, got %v", err)
+	}
+}
+
+func TestValidateURLEmptyAllowListStillRejectsBadURLs(t *testing.T) {
+	for name, raw := range map[string]string{
+		"http scheme": "http://media.example.com/clip.mp4",
+		"file scheme": "file:///etc/passwd",
+		"userinfo":    "https://user:pw@media.example.com/clip.mp4",
+		"empty host":  "https:///clip.mp4",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := ValidateURL(raw, nil, nil); err == nil {
+				t.Fatalf("%q must be rejected even with no allow-list", raw)
+			}
+		})
+	}
+}
+
+// A private host is permitted without appearing in allow_hosts, and only
+// there is plain http accepted.
+func TestValidateURLPrivateHosts(t *testing.T) {
+	private := allowed("host.docker.internal")
+
+	if _, err := ValidateURL("http://host.docker.internal:8000/clip.mp4",
+		allowed("media.example.com"), private); err != nil {
+		t.Errorf("a private host must be permitted over http: %v", err)
+	}
+	if _, err := ValidateURL("https://host.docker.internal/clip.mp4",
+		allowed("media.example.com"), private); err != nil {
+		t.Errorf("a private host must still accept https: %v", err)
+	}
+	if _, err := ValidateURL("http://media.example.com/clip.mp4",
+		allowed("media.example.com"), private); err == nil {
+		t.Error("http must stay rejected for a host that is not in allow_private_hosts")
+	}
+	if _, err := ValidateURL("http://other.example.com/clip.mp4",
+		nil, private); err == nil {
+		t.Error("an empty allow_hosts must not extend the http exemption to every host")
 	}
 }
 

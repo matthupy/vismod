@@ -101,7 +101,7 @@ func TestFetchFailureIsErrorVerdictNeverAllow(t *testing.T) {
 
 func TestURLSourceWithNoFetcherIsErrorVerdict(t *testing.T) {
 	p, _ := newTestPipeline(t, &fakeModerator{}, nil)
-	p.Fetcher = nil // source.url.enabled=false
+	p.Fetcher = nil // no fetcher wired
 
 	env, disp, _ := p.ProcessJob(context.Background(), urlJob())
 
@@ -111,8 +111,8 @@ func TestURLSourceWithNoFetcherIsErrorVerdict(t *testing.T) {
 	if disp != queue.DeadLetter {
 		t.Errorf("disposition = %v, want DeadLetter", disp)
 	}
-	if !strings.Contains(env.Error, "not enabled") {
-		t.Errorf("error should explain the feature is off: %q", env.Error)
+	if !strings.Contains(env.Error, "no url fetcher") {
+		t.Errorf("error should explain that no fetcher is wired: %q", env.Error)
 	}
 }
 

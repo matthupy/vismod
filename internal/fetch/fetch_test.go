@@ -23,7 +23,6 @@ func testFetcher(t *testing.T, srvURL string, mutate func(*Config)) *Fetcher {
 	t.Helper()
 	host := mustHost(t, srvURL)
 	cfg := Config{
-		Enabled:           true,
 		AllowHosts:        []string{host},
 		MaxBytes:          1 << 20,
 		Timeout:           5 * time.Second,
@@ -309,9 +308,32 @@ func TestFetchRejectsNonAllowListedHostBeforeDialing(t *testing.T) {
 	}
 }
 
-func TestNewRefusesEmptyAllowList(t *testing.T) {
-	if _, err := New(Config{Enabled: true, AllowHosts: nil}); err == nil {
-		t.Fatal("enabled with an empty allow-list must refuse construction")
+func TestNewWithoutAllowListBuildsAUsableFetcher(t *testing.T) {
+	f, err := New(Config{AllowHosts: nil})
+	if err != nil {
+		t.Fatalf("an empty allow-list is not an error, got %v", err)
+	}
+	if f == nil {
+		t.Fatal("an empty allow-list means any host, not no fetcher")
+	}
+}
+
+// The per-dial policy, not the host list, is what keeps a job off
+// non-public address space when allow_hosts is empty.
+func TestPrivateHostsSelectTheWeakerAddressPolicy(t *testing.T) {
+	f, err := New(Config{AllowPrivateHosts: []string{"host.docker.internal"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	loopback := netip.MustParseAddr("127.0.0.1")
+	if err := f.ipPolicy(loopback); err == nil {
+		t.Error("the default policy must still deny loopback")
+	}
+	if err := f.privatePolicy(loopback); err != nil {
+		t.Errorf("a named private host must reach loopback: %v", err)
+	}
+	if err := f.privatePolicy(netip.MustParseAddr("169.254.169.254")); err == nil {
+		t.Error("the metadata address must stay denied for private hosts too")
 	}
 }
 

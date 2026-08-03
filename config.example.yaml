@@ -232,20 +232,23 @@ frames:
     hamming_threshold: 14
 
 # ── Remote media sources (kind:"url") ────────────────────────────────────
-# OFF by default. Enabling lets a JOB choose an outbound destination, which
-# is the one place in vismod where an untrusted payload picks who gets
-# contacted — so every control here fails closed and none of them can be
-# switched off:
-#   - https only, and the host must match allow_hosts EXACTLY (no
-#     wildcards, no suffix matching: "example.com" does NOT permit
-#     "evil.example.com").
-#   - enabled: true with an empty allow_hosts REFUSES TO BOOT.
+# WORKS OUT OF THE BOX: with allow_hosts empty, a job may name any host
+# that survives the address policy below. This is the one place in vismod
+# where an untrusted payload picks who gets contacted, so:
+#   - SET allow_hosts IN PRODUCTION. Empty means any host; a populated list
+#     narrows to exactly those hostnames, matched EXACTLY (no wildcards, no
+#     suffix matching: "example.com" does NOT permit "evil.example.com").
+#   - https only. Plain http is accepted for allow_private_hosts entries
+#     only (see below).
 #   - Loopback, RFC 1918, 169.254.0.0/16 (cloud metadata), IPv6 link-local
 #     and ULA, CGNAT 100.64.0.0/10, unspecified and multicast addresses are
 #     denied at DIAL time, against the address actually connected to. That
-#     per-connection check is the DNS-rebinding defense and has no config
-#     switch. Do not point a media source at your own infrastructure — use
-#     kind:"file" for local media.
+#     per-connection check is the DNS-rebinding defense.
+#   - allow_private_hosts is the ONLY way to reach non-public address
+#     space, and only for the exact hostnames it names — for media you
+#     serve yourself from the machine or LAN running vismod. Even there,
+#     the instance-metadata endpoints (169.254.0.0/16 and fd00:ec2::/32)
+#     stay denied. Everything else keeps the full deny-list.
 #   - Redirects are refused, userinfo in the URL is refused, and the size
 #     cap is enforced on bytes read (Content-Length is never trusted).
 #   - The download is transient: it lands in a job-scoped temp file and is
@@ -255,8 +258,14 @@ frames:
 #     URL as source.ref_digest instead. See SECURITY.md.
 source:
   url:
-    enabled: false
-    allow_hosts: []             # exact hostnames, e.g. ["media.example.com"]
+    allow_hosts: []             # exact hostnames, e.g. ["media.example.com"];
+                                # empty = ANY host. Set this in production.
+    allow_private_hosts: []     # hosts that may resolve into loopback /
+                                # RFC 1918 / ULA space and may use http,
+                                # e.g. ["host.docker.internal"]. For media
+                                # you serve yourself; metadata ranges stay
+                                # denied. A host here need not also appear
+                                # in allow_hosts.
     max_bytes: 268435456        # 256 MiB; enforced on bytes read
     timeout: 60s                # whole-download budget per attempt
     max_attempts: 3             # transient failures only; rejections never retry
@@ -312,8 +321,8 @@ metrics_addr: ":9090"           # /metrics /healthz /readyz
 #    "dedup_threshold": 8}                  # optional; 0..64 enables dedup at
 #                                           # that Hamming distance, -1 disables;
 #                                           # omitted = frames.dedup config
-# kind:"url" takes an allow-listed https URL as ref and requires the
-# source.url block above; it is rejected with 400 while that is disabled.
+# kind:"url" takes an https URL as ref. With source.url.allow_hosts empty
+# any host is accepted; populate it to narrow. See the source: block above.
 intake_addr: "127.0.0.1:8080"
 
 # ── Web UI (stretch; read-mostly; never renders media) ──────────────────

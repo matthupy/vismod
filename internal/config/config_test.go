@@ -469,13 +469,13 @@ func TestOutputWebhookPlaintextInwardIsAllowed(t *testing.T) {
 	}
 }
 
-func TestSourceURLDefaultsDisabled(t *testing.T) {
+func TestSourceURLDefaultsToAnEmptyAllowList(t *testing.T) {
 	cfg, err := Load(writeTempYAML(t, "ffmpeg:\n  max_frames: 8\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Source.URL.Enabled {
-		t.Error("url sources must be OFF by default")
+	if len(cfg.Source.URL.AllowHosts) != 0 {
+		t.Error("url sources must name no host by default")
 	}
 }
 
@@ -485,9 +485,10 @@ ffmpeg:
   max_frames: 8
 source:
   url:
-    enabled: true
     allow_hosts:
       - media.example.com
+    allow_private_hosts:
+      - host.docker.internal
     max_bytes: 1048576
     timeout: 30s
     max_attempts: 5
@@ -498,25 +499,38 @@ source:
 		t.Fatal(err)
 	}
 	u := cfg.Source.URL
-	if !u.Enabled || len(u.AllowHosts) != 1 || u.MaxBytes != 1048576 ||
+	if len(u.AllowHosts) != 1 || len(u.AllowPrivateHosts) != 1 || u.MaxBytes != 1048576 ||
 		u.Timeout != 30*time.Second || u.MaxAttempts != 5 || len(u.AllowedMediaTypes) != 1 {
 		t.Errorf("parsed wrong: %+v", u)
 	}
 }
 
-func TestSourceURLEnabledWithoutAllowHostsRefusesBoot(t *testing.T) {
-	_, err := Load(writeTempYAML(t, `
+func TestSourceURLWildcardPrivateHostRefusesBoot(t *testing.T) {
+	y := "ffmpeg:\n  max_frames: 8\nsource:\n  url:\n    allow_private_hosts: [\"*.internal\"]\n"
+	_, err := Load(writeTempYAML(t, y))
+	if err == nil {
+		t.Fatal("a wildcard private host must refuse to boot: matching is exact")
+	}
+	if !strings.Contains(err.Error(), "allow_private_hosts") {
+		t.Errorf("error must name the offending key, got %v", err)
+	}
+}
+
+// An empty allow_hosts is a valid config: it boots, and every host is
+// permitted subject to the per-dial address policy.
+func TestSourceURLWithoutAllowHostsBoots(t *testing.T) {
+	cfg, err := Load(writeTempYAML(t, `
 ffmpeg:
   max_frames: 8
 source:
   url:
-    enabled: true
+    max_bytes: 1048576
 `))
-	if err == nil {
-		t.Fatal("enabled with no allow_hosts must refuse to boot")
+	if err != nil {
+		t.Fatalf("want boot, got %v", err)
 	}
-	if !strings.Contains(err.Error(), "allow_hosts") {
-		t.Errorf("error must name the offending key, got %v", err)
+	if len(cfg.Source.URL.AllowHosts) != 0 {
+		t.Errorf("allow_hosts = %v, want empty", cfg.Source.URL.AllowHosts)
 	}
 }
 
@@ -526,7 +540,7 @@ func TestSourceURLNegativeNumbersRefuseBoot(t *testing.T) {
 		"negative timeout":   "    timeout: -5s\n",
 	} {
 		t.Run(name, func(t *testing.T) {
-			y := "ffmpeg:\n  max_frames: 8\nsource:\n  url:\n    enabled: true\n    allow_hosts: [media.example.com]\n" + body
+			y := "ffmpeg:\n  max_frames: 8\nsource:\n  url:\n    allow_hosts: [media.example.com]\n" + body
 			if _, err := Load(writeTempYAML(t, y)); err == nil {
 				t.Fatal("want boot refusal")
 			}
@@ -535,7 +549,7 @@ func TestSourceURLNegativeNumbersRefuseBoot(t *testing.T) {
 }
 
 func TestSourceURLWildcardHostRefusesBoot(t *testing.T) {
-	y := "ffmpeg:\n  max_frames: 8\nsource:\n  url:\n    enabled: true\n    allow_hosts: [\"*.example.com\"]\n"
+	y := "ffmpeg:\n  max_frames: 8\nsource:\n  url:\n    allow_hosts: [\"*.example.com\"]\n"
 	if _, err := Load(writeTempYAML(t, y)); err == nil {
 		t.Fatal("a wildcard host must refuse to boot: matching is exact")
 	}

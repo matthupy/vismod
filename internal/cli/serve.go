@@ -289,9 +289,12 @@ func (s *server) run(ctx context.Context) error {
 		uiSrv = ui.New(cfg, q, dlqOf(q), statesOf(q), activeOf(q), sw, tracker, log).Start()
 	}
 
-	if cfg.Source.URL.Enabled {
-		log.Warn("url media sources are ENABLED; jobs may cause outbound fetches",
-			"allow_hosts", strings.Join(cfg.Source.URL.AllowHosts, ","))
+	if len(cfg.Source.URL.AllowHosts) == 0 {
+		log.Warn("url media sources accept ANY host; a job can name any public destination. Set source.url.allow_hosts to narrow this")
+	}
+	if hosts := cfg.Source.URL.AllowPrivateHosts; len(hosts) > 0 {
+		log.Warn("url media sources may reach NON-PUBLIC addresses for these hosts",
+			"allow_private_hosts", strings.Join(hosts, ","))
 	}
 
 	log.Info("vismod serve started",
@@ -406,17 +409,20 @@ type intakeRequest struct {
 // execution-side half runs in the fetcher, because a job can also arrive
 // straight onto the redis queue without passing through here.
 func validateURLIntake(cfg config.Config, rawRef string) error {
-	if !cfg.Source.URL.Enabled {
-		return fmt.Errorf(`kind "url" requires source.url.enabled=true`)
-	}
-	allow := make(map[string]bool, len(cfg.Source.URL.AllowHosts))
-	for _, h := range cfg.Source.URL.AllowHosts {
-		allow[strings.ToLower(strings.TrimSpace(h))] = true
-	}
-	if _, err := fetch.ValidateURL(rawRef, allow); err != nil {
+	if _, err := fetch.ValidateURL(rawRef,
+		hostSet(cfg.Source.URL.AllowHosts),
+		hostSet(cfg.Source.URL.AllowPrivateHosts)); err != nil {
 		return err
 	}
 	return nil
+}
+
+func hostSet(hosts []string) map[string]bool {
+	m := make(map[string]bool, len(hosts))
+	for _, h := range hosts {
+		m[strings.ToLower(strings.TrimSpace(h))] = true
+	}
+	return m
 }
 
 // serveIntake exposes the dev/demo HTTP intake: POST /jobs with a JSON

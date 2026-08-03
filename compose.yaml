@@ -47,9 +47,13 @@ services:
 
   vismod-a:
     <<: *vismod
+    # Bound to the host's loopback, NOT 0.0.0.0. A bare "8080:8080"
+    # publishes on every host interface, which would put an unauthenticated
+    # intake — one that can drive outbound fetches for kind:"url" jobs — on
+    # whatever network this machine is attached to.
     ports:
-      - "8080:8080"   # dev intake: POST /jobs
-      - "8081:8081"   # operator UI (basic auth, creds from .env)
+      - "127.0.0.1:8080:8080"   # dev intake: POST /jobs
+      - "127.0.0.1:8081:8081"   # operator UI (basic auth, creds from .env)
     volumes:
       - ./deploy/compose/config.compose.yaml:/etc/vismod/config.yaml:ro
       - ./media:/data:ro

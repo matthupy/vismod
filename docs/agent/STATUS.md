@@ -242,8 +242,13 @@ deliberately NOT used — it pulls in `kylelemons/godebug`.
 Latest: the `kind:"url"` media source (`feat/url-source-kind`, PR #40).
 New `internal/fetch` downloads an allow-listed `https` asset to a
 job-scoped temp file, the pipeline scans it exactly as a local file, and
-the download is deleted before ack. OFF by default; `enabled: true` with
-an empty `allow_hosts` refuses to boot. Two independent checks by
+the download is deleted before ack. It is ON by default: there is no
+`enabled` flag, and an empty `source.url.allow_hosts` permits any host,
+so an evaluator can POST a public URL against a stock config. Operators
+narrow with `allow_hosts`; non-public address space needs the separate
+`allow_private_hosts`, which relaxes the address policy (and permits
+`http`) for exactly the hostnames it names while keeping the
+instance-metadata ranges denied. Two independent checks by
 design — a parse-time host allow-list and a per-dial address deny-list
 (the only DNS-rebinding defense). A presigned URL's query string is
 treated as a credential: `Source.Ref` records scheme+host+path and the
