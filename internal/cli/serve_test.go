@@ -56,6 +56,36 @@ func post(h http.Handler, body string) *httptest.ResponseRecorder {
 	return rec
 }
 
+// postJob posts body to a fresh intake handler backed by a real memq and
+// returns the response together with any job that reached a worker. Each
+// call posts exactly one request, so the slice holds at most one job; a
+// rejected request enqueues nothing and the slice is empty.
+func postJob(t *testing.T, body string) (*httptest.ResponseRecorder, []queue.Job) {
+	t.Helper()
+	q := testMemq(t)
+	h := newIntake(t, intakeConfig(), q, openBackpressure(), &intakeSwitch{})
+
+	got := make(chan queue.Job, 1)
+	if err := q.Start(t.Context(), func(_ context.Context, j queue.Job) (queue.Disposition, error) {
+		got <- j
+		return queue.Ack, nil
+	}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	rec := post(h, body)
+	if rec.Code != http.StatusAccepted {
+		return rec, nil
+	}
+	select {
+	case j := <-got:
+		return rec, []queue.Job{j}
+	case <-time.After(5 * time.Second):
+		t.Fatal("accepted job never reached a worker")
+		return rec, nil
+	}
+}
+
 func testMemq(t *testing.T) *queue.Memq {
 	t.Helper()
 	q := queue.NewMemq(queue.QueueConfig{Workers: 1, Buffer: 4, DeadLetterMax: 10}, testLogger())
@@ -497,6 +527,51 @@ func TestIntakeStillRejectsUnknownKinds(t *testing.T) {
 	h := newIntake(t, urlIntakeConfig(), testMemq(t), openBackpressure(), &intakeSwitch{})
 	if rec := post(h, `{"kind":"s3","ref":"s3://b/k","media_type":"video"}`); rec.Code != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400", rec.Code)
+	}
+}
+
+// Metadata is optional, opaque, and capped. Accepted metadata is stored
+// COMPACTED, because the cap must measure content, not indentation.
+func TestIntakeMetadata(t *testing.T) {
+	t.Run("accepted and compacted", func(t *testing.T) {
+		body := `{"kind":"file","ref":"/data/a.png","metadata":{ "ticket" : "T-1" }}`
+		rec, jobs := postJob(t, body)
+		if rec.Code != http.StatusAccepted {
+			t.Fatalf("got %d, want 202: %s", rec.Code, rec.Body.String())
+		}
+		if len(jobs) != 1 {
+			t.Fatalf("want 1 enqueued job, got %d", len(jobs))
+		}
+		if string(jobs[0].Metadata) != `{"ticket":"T-1"}` {
+			t.Errorf("metadata must be stored compacted, got %s", jobs[0].Metadata)
+		}
+	})
+
+	t.Run("omitted stays nil", func(t *testing.T) {
+		rec, jobs := postJob(t, `{"kind":"file","ref":"/data/a.png"}`)
+		if rec.Code != http.StatusAccepted {
+			t.Fatalf("got %d, want 202", rec.Code)
+		}
+		if jobs[0].Metadata != nil {
+			t.Errorf("absent metadata must stay nil, got %s", jobs[0].Metadata)
+		}
+	})
+
+	for name, meta := range map[string]string{
+		"array":    `["a"]`,
+		"scalar":   `"a"`,
+		"oversize": `{"k":"` + strings.Repeat("a", queue.MaxMetadataBytes) + `"}`,
+	} {
+		t.Run("rejected: "+name, func(t *testing.T) {
+			body := `{"kind":"file","ref":"/data/a.png","metadata":` + meta + `}`
+			rec, jobs := postJob(t, body)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("got %d, want 400", rec.Code)
+			}
+			if len(jobs) != 0 {
+				t.Errorf("a rejected job must not be enqueued, got %d", len(jobs))
+			}
+		})
 	}
 }
 
