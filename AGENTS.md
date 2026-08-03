@@ -280,7 +280,7 @@ README.md, CLAUDE.md, SECURITY.md (workflow trust boundary, SSRF
 posture, audit scope), RESPONSIBLE_USE.md (vendor-scope detection,
 human-in-the-loop), MODEL_LIMITATIONS.md, CONTRIBUTING.md,
 config.example.yaml, docs/custom-ffmpeg-workflows.md,
-docs/rest-api.md (intake contract, url rules), deploy/README.md
-(autoscaling contract), deploy/compose/README.md (per-replica volume
-constraints). If you change behavior they describe, update them in the
-same commit.
+docs/rest-api.md (intake contract, url rules), docs/result-envelope.md
+(envelope field contract), deploy/README.md (autoscaling contract),
+deploy/compose/README.md (per-replica volume constraints). If you
+change behavior they describe, update them in the same commit.

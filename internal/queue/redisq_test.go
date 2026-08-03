@@ -2,6 +2,8 @@ package queue
 
 import (
 	"context"
+	"encoding/json"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -90,6 +92,51 @@ func TestRedisqRedeliveryIsDedupedDownstream(t *testing.T) {
 	}
 	// The dedupe itself is Sink/audit behavior, proven in
 	// result.TestJSONLSinkIdempotentPerJobID and audit.TestIdempotentPerJobID.
+}
+
+// Metadata must survive the durable Redis round-trip byte-for-byte: this
+// is the exact path the execution-time validator in pipeline.ProcessJob
+// exists to defend, since a job can reach Redis without ever passing
+// through POST /jobs. A no-metadata job must round-trip to nil, not the
+// literal JSON "null" that json.RawMessage + omitempty can produce.
+func TestRedisqMetadataRoundTrips(t *testing.T) {
+	rdb, _ := newMini(t)
+	q := NewRedisq(QueueConfig{Workers: 1}, rdb, "vismod-test", nil)
+
+	withMeta := job("with-meta")
+	withMeta.Metadata = json.RawMessage(`{"ticket":"T-1","tenant":"acme"}`)
+	noMeta := job("no-meta")
+
+	if _, err := q.Enqueue(context.Background(), withMeta); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := q.Enqueue(context.Background(), noMeta); err != nil {
+		t.Fatal(err)
+	}
+
+	seen := map[JobID]Job{}
+	var mu sync.Mutex
+	var done atomic.Int32
+	_ = q.Start(context.Background(), func(_ context.Context, j Job) (Disposition, error) {
+		mu.Lock()
+		seen[j.ID] = j
+		mu.Unlock()
+		done.Add(1)
+		return Ack, nil
+	})
+	waitFor(t, 3*time.Second, func() bool { return done.Load() == 2 }, "both jobs delivered")
+	_ = q.Close(context.Background())
+
+	mu.Lock()
+	defer mu.Unlock()
+	got := seen["with-meta"]
+	if string(got.Metadata) != `{"ticket":"T-1","tenant":"acme"}` {
+		t.Errorf("metadata must survive the redis round-trip unchanged, got %q", got.Metadata)
+	}
+	gotNo := seen["no-meta"]
+	if gotNo.Metadata != nil {
+		t.Errorf("job with no metadata must round-trip to nil, got %q (len %d)", gotNo.Metadata, len(gotNo.Metadata))
+	}
 }
 
 func TestRedisqPing(t *testing.T) {

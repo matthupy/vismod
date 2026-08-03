@@ -38,7 +38,7 @@ var (
 var scanCmd = &cobra.Command{
 	Use:   "scan <file>...",
 	Short: "Moderate one or more local image/video files and print JSONL envelopes",
-	Long: `scan runs each file through the active moderation model and writes one
+	Long: fmt.Sprintf(`scan runs each file through the active moderation model and writes one
 JSON-lines result envelope per file to stdout.
 
 --workflow selects the FFmpeg extraction workflow(s) for video inputs
@@ -51,11 +51,12 @@ Omitted = the configured behavior.
 
 --metadata attaches an opaque JSON object to every envelope this
 invocation emits, for correlating verdicts with your own records. vismod
-never interprets it; it must be a JSON object and at most 4096 bytes once
+never interprets it; it must be a JSON object and at most %d bytes once
 compacted. Do not put secrets in it.
 
 Exit codes: 0 = all allow; 1 = at least one flag/block; 2 = at least one
 error verdict or processing failure (fail safe: an error is never allow).`,
+		queue.MaxMetadataBytes),
 	Args: cobra.MinimumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		opts := scanOptions{Workflows: scanWorkflows}

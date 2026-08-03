@@ -88,3 +88,34 @@ func TestMetadataNeverReachesLogs(t *testing.T) {
 		t.Errorf("metadata must never appear in a log line:\n%s", logBuf.String())
 	}
 }
+
+// Metadata must never reach logs on the INVALID-metadata path either.
+// procErr -> env.Error -> the dead-letter reason -> a queue driver's
+// "job dead-lettered" log.Warn call is the exact chain that would carry
+// caller bytes into logs if ValidateMetadata's wrapped error ever echoed
+// the input. The marker is multi-character and deliberately placed
+// inside a syntactically-invalid (truncated) payload: a wrapped
+// json.SyntaxError may legitimately name a single offending character,
+// which is not a leak, so the assertion is on the multi-character marker
+// rather than on the absence of every caller byte.
+func TestInvalidMetadataNeverReachesLogs(t *testing.T) {
+	var logBuf bytes.Buffer
+	mod := &fakeModerator{scores: map[string]float64{"benign": 0.05}}
+	p, _ := newTestPipeline(t, mod, nil)
+	p.Log = slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	j := imageJob(writeInput(t, "benign"))
+	// Truncated JSON: invalid (unexpected end of input), but still
+	// carries the marker string verbatim in the raw bytes.
+	j.Metadata = json.RawMessage(`{"secret_marker":"do-not-log-me"`)
+
+	env, disp, err := p.ProcessJob(context.Background(), j)
+	if disp != queue.DeadLetter {
+		t.Fatalf("invalid metadata must dead-letter, got disp=%v err=%v", disp, err)
+	}
+	if !strings.Contains(env.Error, "metadata") {
+		t.Fatalf("the envelope error must name metadata as the cause, got %q", env.Error)
+	}
+	if strings.Contains(logBuf.String(), "do-not-log-me") {
+		t.Errorf("invalid metadata must never appear in a log line:\n%s", logBuf.String())
+	}
+}
