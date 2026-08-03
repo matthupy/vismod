@@ -58,8 +58,14 @@ func post(h http.Handler, body string) *httptest.ResponseRecorder {
 
 // postJob posts body to a fresh intake handler backed by a real memq and
 // returns the response together with any job that reached a worker. Each
-// call posts exactly one request, so the slice holds at most one job; a
-// rejected request enqueues nothing and the slice is empty.
+// call posts exactly one request, so the slice holds at most one job.
+//
+// The queue is drained either way: on a rejection this is what makes
+// "the job was not enqueued" a real assertion instead of one that passes
+// merely because the caller never looked. A short bound is enough there
+// since a rejection never enqueues, so no delivery is ever actually
+// pending; the longer bound on acceptance allows for real scheduling
+// latency.
 func postJob(t *testing.T, body string) (*httptest.ResponseRecorder, []queue.Job) {
 	t.Helper()
 	q := testMemq(t)
@@ -74,14 +80,17 @@ func postJob(t *testing.T, body string) (*httptest.ResponseRecorder, []queue.Job
 	}
 
 	rec := post(h, body)
-	if rec.Code != http.StatusAccepted {
-		return rec, nil
+	wait := 200 * time.Millisecond
+	if rec.Code == http.StatusAccepted {
+		wait = 5 * time.Second
 	}
 	select {
 	case j := <-got:
 		return rec, []queue.Job{j}
-	case <-time.After(5 * time.Second):
-		t.Fatal("accepted job never reached a worker")
+	case <-time.After(wait):
+		if rec.Code == http.StatusAccepted {
+			t.Fatal("accepted job never reached a worker")
+		}
 		return rec, nil
 	}
 }
