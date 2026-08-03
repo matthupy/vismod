@@ -55,15 +55,20 @@ POST media bytes to this endpoint** — there is no field for them.
 
 ## Scanning from a URL
 
-### 1. Enable it (off by default)
+### 1. Nothing to enable
 
-`kind:"url"` lets a job choose an outbound destination, so it stays off
-until you name the hosts you trust:
+`kind:"url"` works with the config you already have. Start the worker and
+POST a public `https` URL:
+
+```sh
+vismod serve -c config.yaml
+```
+
+In production, narrow the destinations a job can name:
 
 ```yaml
 source:
   url:
-    enabled: true
     allow_hosts: ["media.example.com"]   # exact hostnames; no wildcards
     max_bytes: 268435456                 # 256 MiB, enforced on bytes read
     timeout: 60s
@@ -71,18 +76,38 @@ source:
     allowed_media_types: [video/mp4, image/jpeg, image/png, image/webp]
 ```
 
-`enabled: true` with an empty `allow_hosts` **refuses to boot**. Private,
-loopback, link-local (cloud metadata) and CGNAT addresses are denied at
-connect time and there is no switch that turns that off — so a media
-source cannot point at your own infrastructure. Use `kind:"file"` for
-local media. The full rule set and the reasoning are in
-[SECURITY.md](https://github.com/matthupy/vismod/blob/main/SECURITY.md).
+Empty `allow_hosts` means any host. Either way, private, loopback,
+link-local (cloud metadata) and CGNAT addresses are denied at connect
+time, so a job cannot point vismod at your own infrastructure.
 
-Start the worker:
+### 1b. Scanning media you serve yourself
 
-```sh
-vismod serve -c config.yaml
+To scan from a media server on the machine or LAN running vismod — say
+`python3 -m http.server 8000` on macOS/Linux or `py -m http.server 8000`
+on Windows, reached from a container as `host.docker.internal` — name
+that host explicitly:
+
+```yaml
+source:
+  url:
+    allow_private_hosts: ["host.docker.internal"]
 ```
+
+Only hostnames on that list may resolve into loopback / RFC 1918 / ULA
+space, and only they may be reached over plain `http`. The
+instance-metadata ranges stay denied for them too, and every other host
+keeps the full deny-list. A host here does not also need to be in
+`allow_hosts`.
+
+`host.docker.internal` is provided by Docker Desktop on Windows and
+macOS. On plain Linux, add
+`extra_hosts: ["host.docker.internal:host-gateway"]` to the service
+(Docker Engine 20.10+), or just name the host's LAN address instead. See
+[deploy/compose/README.md](../deploy/compose/README.md) for the worked
+version.
+
+The full rule set and the reasoning are in
+[SECURITY.md](https://github.com/matthupy/vismod/blob/main/SECURITY.md).
 
 ### 2. Submit an image
 
@@ -213,10 +238,9 @@ caller or into an access log.
 
 | Message | Cause |
 |---|---|
-| `kind "url" requires source.url.enabled=true` | The feature is off |
-| `url scheme must be https, got "http"` | Any scheme but `https` |
+| `url scheme must be https, got "http"` | Any scheme but `https`, unless the host is in `source.url.allow_private_hosts` |
 | `url must not contain userinfo — credentials are env-only` | `https://user:pass@host/…` |
-| `host "…" is not in source.url.allow_hosts` | Exact-match miss (a subdomain of an allowed host is still a miss) |
+| `host "…" is not in source.url.allow_hosts` | Exact-match miss against a populated `allow_hosts` (a subdomain of an allowed host is still a miss) |
 | `url is not parseable` / `url has no host` | Malformed input |
 
 Failures that can only be seen once the fetch runs — a denied address, a

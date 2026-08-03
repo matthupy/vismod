@@ -159,7 +159,8 @@ func TestIntakeRejectsBadRequests(t *testing.T) {
 		{"malformed json", `{"kind":`},
 		{"empty body", ``},
 		{"missing kind", `{"ref":"a.jpg"}`},
-		{"unsupported kind", `{"kind":"url","ref":"https://example.invalid/a.jpg"}`},
+		{"unsupported kind", `{"kind":"s3","ref":"s3://bucket/a.jpg"}`},
+		{"url with a denied scheme", `{"kind":"url","ref":"http://example.invalid/a.jpg"}`},
 		{"missing ref", `{"kind":"file","ref":""}`},
 		{"unknown workflow", `{"kind":"file","ref":"a.mp4","workflows":["nope"]}`},
 		{"dedup threshold too high", `{"kind":"file","ref":"a.mp4","dedup_threshold":65}`},
@@ -369,22 +370,55 @@ func (stubQueue) Start(context.Context, queue.Handler) error              { retu
 func (stubQueue) QueueDepth(context.Context) (int, error)                 { return 0, nil }
 func (stubQueue) Close(context.Context) error                             { return nil }
 
-// urlIntakeConfig is intakeConfig with url sources enabled for one host.
+// urlIntakeConfig is intakeConfig with one allow-listed media host.
 func urlIntakeConfig() config.Config {
 	cfg := intakeConfig()
-	cfg.Source.URL.Enabled = true
 	cfg.Source.URL.AllowHosts = []string{"media.example.com"}
 	return cfg
 }
 
-func TestIntakeRejectsURLKindWhenDisabled(t *testing.T) {
-	h := newIntake(t, intakeConfig(), testMemq(t), openBackpressure(), &intakeSwitch{})
+// With no allow_hosts configured a url job is accepted: the feature works
+// out of the box, and the address policy — not the host list — is what
+// keeps a job off non-public infrastructure.
+func TestIntakeAcceptsURLKindWithAnEmptyAllowList(t *testing.T) {
+	q := testMemq(t)
+	h := newIntake(t, intakeConfig(), q, openBackpressure(), &intakeSwitch{})
 	rec := post(h, `{"kind":"url","ref":"https://media.example.com/clip.mp4","media_type":"video"}`)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202: %s", rec.Code, rec.Body.String())
+	}
+	if got := depth(t, q); got != 1 {
+		t.Errorf("queue depth = %d, want 1", got)
+	}
+}
+
+// A populated allow_hosts narrows: a host that is not on it is refused.
+func TestIntakeRejectsHostOutsideAPopulatedAllowList(t *testing.T) {
+	h := newIntake(t, urlIntakeConfig(), testMemq(t), openBackpressure(), &intakeSwitch{})
+	rec := post(h, `{"kind":"url","ref":"https://evil.example.com/clip.mp4","media_type":"video"}`)
 	if rec.Code != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400", rec.Code)
 	}
-	if !strings.Contains(rec.Body.String(), "source.url.enabled") {
-		t.Errorf("body should explain the feature is off: %s", rec.Body.String())
+	if !strings.Contains(rec.Body.String(), "source.url.allow_hosts") {
+		t.Errorf("body should name the allow-list: %s", rec.Body.String())
+	}
+}
+
+// http is accepted only for a host in allow_private_hosts.
+func TestIntakeAcceptsHTTPForAPrivateHostOnly(t *testing.T) {
+	cfg := intakeConfig()
+	cfg.Source.URL.AllowPrivateHosts = []string{"host.docker.internal"}
+
+	q := testMemq(t)
+	h := newIntake(t, cfg, q, openBackpressure(), &intakeSwitch{})
+	if rec := post(h, `{"kind":"url","ref":"http://host.docker.internal:8000/clip.mp4","media_type":"video"}`); rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202: %s", rec.Code, rec.Body.String())
+	}
+	if rec := post(h, `{"kind":"url","ref":"http://media.example.com/clip.mp4","media_type":"video"}`); rec.Code != http.StatusBadRequest {
+		t.Errorf("http from a non-private host: status = %d, want 400", rec.Code)
+	}
+	if got := depth(t, q); got != 1 {
+		t.Errorf("queue depth = %d, want 1", got)
 	}
 }
 
@@ -466,23 +500,13 @@ func TestIntakeStillRejectsUnknownKinds(t *testing.T) {
 	}
 }
 
-func TestDisabledFetcherIsAnUntypedNil(t *testing.T) {
-	cfg := config.Defaults()
-	cfg.Source.URL.Enabled = false
-	f, err := newFetcher(cfg)
+// url sources are usable with no source.url block at all.
+func TestFetcherBootsFromDefaults(t *testing.T) {
+	f, err := newFetcher(config.Defaults())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if f != nil {
-		t.Fatal("a disabled fetcher must be an untyped nil, or pipeline's nil check silently fails and url jobs panic")
-	}
-}
-
-func TestEnabledFetcherWithEmptyAllowListFailsBoot(t *testing.T) {
-	cfg := config.Defaults()
-	cfg.Source.URL.Enabled = true
-	cfg.Source.URL.AllowHosts = nil
-	if _, err := newFetcher(cfg); err == nil {
-		t.Fatal("construction IS boot validation: an empty allow-list must fail here")
+	if f == nil {
+		t.Fatal("the default config must still yield a usable fetcher")
 	}
 }

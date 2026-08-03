@@ -50,7 +50,7 @@ type EventSink interface {
 var errEmptyVideoSkipped = errors.New("empty video skipped by operator override")
 
 // SourceFetcher resolves a remote source URL to a local file. nil means
-// url sources are disabled (source.url.enabled=false).
+// no fetcher was wired, and every url job fails with verdict:"error".
 type SourceFetcher interface {
 	Fetch(ctx context.Context, rawURL, dir string) (path string, cleanup func(), err error)
 }
@@ -236,7 +236,7 @@ func (p *Pipeline) resolveSource(ctx context.Context, j queue.Job) (resolved, fu
 
 	if p.Fetcher == nil {
 		return resolved{local: envSrc, env: envSrc}, func() {},
-			fmt.Errorf("url sources are not enabled (source.url.enabled=false)")
+			fmt.Errorf("no url fetcher is wired into this pipeline")
 	}
 
 	dir, err := os.MkdirTemp("", "vismod-fetch-")

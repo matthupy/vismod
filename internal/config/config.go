@@ -235,17 +235,23 @@ type FramesConfig struct {
 	Dedup       DedupConfig `mapstructure:"dedup"`
 }
 
-// URLSourceConfig enables jobs whose Source.Kind is "url".
+// URLSourceConfig governs jobs whose Source.Kind is "url".
 //
-// OFF by default. The destination is chosen by an untrusted job payload,
-// so this is the one config block where every omission fails closed:
-// enabling it without an allow-list refuses to boot, and there is no
-// switch that disables the address deny-list.
+// url sources work with no configuration: an empty AllowHosts permits any
+// host that survives the per-dial address policy. The destination is
+// chosen by an untrusted job payload, so what is NOT implicit is
+// non-public address space — reaching it requires naming the host in
+// AllowPrivateHosts, and the metadata ranges stay denied even then.
 type URLSourceConfig struct {
-	Enabled bool `mapstructure:"enabled"`
 	// AllowHosts are exact hostnames (no wildcards, no suffix matching:
-	// "example.com" does NOT permit "evil.example.com").
-	AllowHosts        []string      `mapstructure:"allow_hosts"`
+	// "example.com" does NOT permit "evil.example.com"). Empty means any
+	// host; set it in production to narrow the destinations a job can name.
+	AllowHosts []string `mapstructure:"allow_hosts"`
+	// AllowPrivateHosts are hostnames that may additionally resolve into
+	// loopback / RFC 1918 / IPv6 ULA space and may be reached over plain
+	// http — self-hosted media on the machine or LAN running vismod.
+	// A host here does NOT need to also appear in AllowHosts.
+	AllowPrivateHosts []string      `mapstructure:"allow_private_hosts"`
 	MaxBytes          int64         `mapstructure:"max_bytes"`
 	Timeout           time.Duration `mapstructure:"timeout"`
 	MaxAttempts       int           `mapstructure:"max_attempts"`
@@ -406,7 +412,6 @@ func Defaults() Config {
 		},
 		Frames: FramesConfig{Concurrency: 4, Dedup: DedupConfig{Enabled: false, HammingThreshold: 8}},
 		Source: SourceConfig{URL: URLSourceConfig{
-			Enabled:     false,
 			MaxBytes:    256 << 20,
 			Timeout:     60 * time.Second,
 			MaxAttempts: 3,
@@ -508,18 +513,19 @@ func Validate(cfg Config) error {
 }
 
 func validateURLSource(u URLSourceConfig) error {
-	if !u.Enabled {
-		return nil
-	}
-	if len(u.AllowHosts) == 0 {
-		return fmt.Errorf("config: source.url.enabled=true requires at least one entry in source.url.allow_hosts — an empty allow-list can fetch nothing, and accepting it would make \"enabled\" misleading")
-	}
-	for i, h := range u.AllowHosts {
-		if strings.TrimSpace(h) == "" {
-			return fmt.Errorf("config: source.url.allow_hosts[%d] is empty", i)
-		}
-		if strings.ContainsAny(h, "*/") {
-			return fmt.Errorf("config: source.url.allow_hosts[%d] = %q — hostnames are matched exactly; wildcards and paths are not supported", i, h)
+	// An empty allow_hosts is valid: it means any host, narrowed only by
+	// the per-dial address policy.
+	for key, hosts := range map[string][]string{
+		"allow_hosts":         u.AllowHosts,
+		"allow_private_hosts": u.AllowPrivateHosts,
+	} {
+		for i, h := range hosts {
+			if strings.TrimSpace(h) == "" {
+				return fmt.Errorf("config: source.url.%s[%d] is empty", key, i)
+			}
+			if strings.ContainsAny(h, "*/") {
+				return fmt.Errorf("config: source.url.%s[%d] = %q — hostnames are matched exactly; wildcards and paths are not supported", key, i, h)
+			}
 		}
 	}
 	if u.MaxBytes < 0 {

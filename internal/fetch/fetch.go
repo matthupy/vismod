@@ -30,29 +30,33 @@ const (
 
 // Config is the source.url block.
 type Config struct {
-	Enabled           bool
 	AllowHosts        []string
+	AllowPrivateHosts []string
 	MaxBytes          int64
 	Timeout           time.Duration
 	MaxAttempts       int
 	AllowedMediaTypes []string
 }
 
-// Fetcher downloads allow-listed media URLs to local files.
+// Fetcher downloads media URLs to local files.
 type Fetcher struct {
 	cfg        Config
-	allowHosts map[string]bool
+	hosts      hostRules
 	allowTypes map[string]bool
 	client     *http.Client
 
-	// allowScheme is "https" in production. Tests set it to "http" so
-	// httptest servers are reachable; it is not settable from config.
+	// allowScheme is "" in production. Tests set it to "http" so httptest
+	// servers are reachable; it is not settable from config.
 	allowScheme string
 
 	// ipPolicy runs per-connection against the address actually dialed.
 	// This is the DNS-rebinding defense: a name that validated at parse
 	// time cannot re-resolve into a denied range without hitting this.
 	ipPolicy func(netip.Addr) error
+
+	// privatePolicy replaces ipPolicy for hosts in allow_private_hosts.
+	// It still denies the ranges that are never a media server.
+	privatePolicy func(netip.Addr) error
 }
 
 // terminalErr marks a failure that must not be retried.
@@ -65,16 +69,12 @@ func terminal(format string, a ...any) error {
 	return terminalErr{fmt.Errorf(format, a...)}
 }
 
-// New builds a Fetcher. It refuses an enabled config with no allow-list:
-// that combination cannot fetch anything anyway, and accepting it would
-// make "enabled" look meaningful when it is not.
+// New builds a Fetcher. url sources are usable with no configuration at
+// all: an empty AllowHosts permits any host that survives the per-dial
+// address policy, and an operator narrows that in production. What is
+// never implicit is non-public address space — only AllowPrivateHosts
+// reaches it, and only for the exact hosts named there.
 func New(cfg Config) (*Fetcher, error) {
-	if !cfg.Enabled {
-		return nil, nil
-	}
-	if len(cfg.AllowHosts) == 0 {
-		return nil, fmt.Errorf("config: source.url.enabled=true requires at least one entry in source.url.allow_hosts")
-	}
 	if cfg.MaxBytes <= 0 {
 		cfg.MaxBytes = defaultMaxBytes
 	}
@@ -86,34 +86,58 @@ func New(cfg Config) (*Fetcher, error) {
 	}
 
 	f := &Fetcher{
-		cfg:         cfg,
-		allowHosts:  lowerSet(cfg.AllowHosts),
-		allowTypes:  lowerSet(cfg.AllowedMediaTypes),
-		allowScheme: "https",
-		ipPolicy:    DenyPrivate,
+		cfg: cfg,
+		hosts: hostRules{
+			allow:   lowerSet(cfg.AllowHosts),
+			private: lowerSet(cfg.AllowPrivateHosts),
+		},
+		allowTypes:    lowerSet(cfg.AllowedMediaTypes),
+		ipPolicy:      DenyPrivate,
+		privatePolicy: DenyMetadata,
 	}
 
-	dialer := &net.Dialer{Timeout: dialTimeout}
-	dialer.Control = func(_, address string, _ syscall.RawConn) error {
-		host, _, err := net.SplitHostPort(address)
-		if err != nil {
-			return fmt.Errorf("fetch: unparseable dial address %q", address)
-		}
-		ip, err := netip.ParseAddr(host)
-		if err != nil {
-			return fmt.Errorf("fetch: dial address %q is not an IP", host)
-		}
-		return f.ipPolicy(ip)
-	}
 	f.client = &http.Client{
 		Timeout:   cfg.Timeout,
-		Transport: &http.Transport{DialContext: dialer.DialContext},
+		Transport: &http.Transport{DialContext: f.dial},
 		CheckRedirect: func(*http.Request, []*http.Request) error {
 			// A redirect is a destination vismod did not choose.
 			return errors.New("fetch: redirects are not followed")
 		},
 	}
 	return f, nil
+}
+
+// dial picks the address policy from the HOSTNAME being dialed, then
+// enforces it against the address actually connected to.
+//
+// The policy must be chosen here rather than at construction because it
+// varies per request: allow_private_hosts relaxes the address rules for
+// the hosts it names and for nothing else. Reading the hostname from the
+// pre-resolution addr is what keeps the relaxation from leaking — a
+// public host that re-resolves into RFC 1918 still gets DenyPrivate.
+func (f *Fetcher) dial(ctx context.Context, network, addr string) (net.Conn, error) {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, fmt.Errorf("fetch: unparseable dial address %q", addr)
+	}
+	policy := f.ipPolicy
+	if f.hosts.private[strings.ToLower(host)] {
+		policy = f.privatePolicy
+	}
+
+	d := &net.Dialer{Timeout: dialTimeout}
+	d.Control = func(_, address string, _ syscall.RawConn) error {
+		h, _, err := net.SplitHostPort(address)
+		if err != nil {
+			return fmt.Errorf("fetch: unparseable dial address %q", address)
+		}
+		ip, err := netip.ParseAddr(h)
+		if err != nil {
+			return fmt.Errorf("fetch: dial address %q is not an IP", h)
+		}
+		return policy(ip)
+	}
+	return d.DialContext(ctx, network, addr)
 }
 
 func lowerSet(in []string) map[string]bool {
@@ -148,7 +172,7 @@ func (f *Fetcher) Fetch(ctx context.Context, rawURL, dir string) (string, func()
 		mu.Unlock()
 	}
 
-	u, err := validateURL(rawURL, f.allowHosts, f.allowScheme)
+	u, err := validateURL(rawURL, f.hosts, f.allowScheme)
 	if err != nil {
 		return "", cleanup, terminalErr{err}
 	}

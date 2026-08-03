@@ -118,7 +118,7 @@ puts the verdict in your configured sinks — never in the HTTP response.
 curl -X POST localhost:8080/jobs -H 'content-type: application/json' \
   -d '{"kind":"file","ref":"/data/clip.mp4"}'
 
-# a remote asset (off by default — see below)
+# a remote asset (works out of the box)
 curl -X POST localhost:8080/jobs -H 'content-type: application/json' \
   -d '{"kind":"url","ref":"https://media.example.com/clip.mp4"}'
 ```
@@ -126,13 +126,16 @@ curl -X POST localhost:8080/jobs -H 'content-type: application/json' \
 `media_type` is inferred from the extension; `workflows` and
 `dedup_threshold` are optional per-job overrides.
 
-`kind:"url"` is **off by default** and `ref` must be an `https` URL whose
-host is listed exactly in `source.url.allow_hosts` — no wildcards, no
-suffix matching. Enabling it with an empty allow-list refuses to boot,
-and loopback/private/link-local/CGNAT addresses are denied at connect
-time with no switch to turn that off. vismod downloads the asset to a
-job-scoped temp file, scans it, and deletes it before ack; a presigned
-URL's query string is treated as a credential and never recorded.
+For `kind:"url"`, `ref` must be an `https` URL. It works with no
+configuration, and **`source.url.allow_hosts` is what you set in
+production** to narrow the destinations a job can name — exact hostnames,
+no wildcards, no suffix matching. Loopback, private, link-local and CGNAT
+addresses are denied at connect time; reaching media you serve yourself
+requires naming that host in `source.url.allow_private_hosts`, and the
+cloud-metadata ranges stay denied even then. vismod downloads the asset
+to a job-scoped temp file, scans it, and deletes it before ack; a
+presigned URL's query string is treated as a credential and never
+recorded.
 
 Worked `curl` and PowerShell examples — image, video with workflows, and
 reading the envelope back — are in **[docs/rest-api.md](docs/rest-api.md)**.

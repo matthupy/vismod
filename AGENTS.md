@@ -217,13 +217,19 @@ import needs justification.
   presigned URL's query string. That was a real bug in `serve.go`'s
   worker handler (the operator-UI job feed); `serve_run_test.go` guards
   it.
-- **`fetch.New` returns a typed nil when disabled, and
+- **`fetch.New` returns a typed nil when `allow_hosts` is empty, and
   `cli.newFetcher` must convert it to an untyped nil.** Returning the
   `*fetch.Fetcher` nil directly gives `pipeline.Fetcher` a non-nil
   interface holding a nil pointer, so the `p.Fetcher == nil` guard is
   false and a url job panics instead of producing `verdict:"error"`.
   `wire.go` has an explicit `if f == nil { return nil, nil }` for this;
   do not "simplify" it away.
+- **The address policy is chosen from the hostname, before resolution.**
+  `Fetcher.dial` picks `DenyMetadata` over `DenyPrivate` only when the
+  dialed hostname is in `allow_private_hosts`. Selecting it from the
+  resolved IP instead would invert the check: any host that resolved into
+  RFC 1918 would get the weaker policy, which is exactly the rebinding
+  attack.
 - **The host allow-list and the address deny-list are two checks on
   purpose.** `fetch.validateURL` runs at parse time on text; `DenyPrivate`
   runs per-connection from `net.Dialer.Control` against the address

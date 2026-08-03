@@ -42,12 +42,12 @@ func buildModerator(cfg config.Config, log *slog.Logger) (moderation.Moderator, 
 	})
 }
 
-// newFetcher builds the url-source fetcher, or nil when the feature is
-// off. Construction IS boot validation: a bad allow-list fails here.
+// newFetcher builds the url-source fetcher. Construction IS boot
+// validation: a bad allow-list fails here.
 func newFetcher(cfg config.Config) (pipeline.SourceFetcher, error) {
 	f, err := fetch.New(fetch.Config{
-		Enabled:           cfg.Source.URL.Enabled,
 		AllowHosts:        cfg.Source.URL.AllowHosts,
+		AllowPrivateHosts: cfg.Source.URL.AllowPrivateHosts,
 		MaxBytes:          cfg.Source.URL.MaxBytes,
 		Timeout:           cfg.Source.URL.Timeout,
 		MaxAttempts:       cfg.Source.URL.MaxAttempts,
@@ -57,7 +57,8 @@ func newFetcher(cfg config.Config) (pipeline.SourceFetcher, error) {
 		return nil, err
 	}
 	if f == nil {
-		// Disabled. Returning the typed nil *Fetcher would produce a
+		// fetch.New does not currently return a nil Fetcher, but if it ever
+		// does again, returning the typed nil *Fetcher would produce a
 		// non-nil interface holding a nil pointer, so pipeline's
 		// `p.Fetcher == nil` would be false and url jobs would panic
 		// instead of erroring. Do not simplify this away.

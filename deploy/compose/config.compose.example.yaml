@@ -57,8 +57,20 @@ log_level: info
 metrics_addr: ":9090"      # scraped by prometheus over the compose network
 
 # 0.0.0.0, not the 127.0.0.1 default: a loopback bind inside a container
-# is unreachable from a published port.
+# is unreachable from a published port. Exposure is controlled on the host
+# side instead — compose.yaml publishes this as 127.0.0.1:8080:8080, so
+# the unauthenticated intake is reachable from this machine only.
 intake_addr: "0.0.0.0:8080"
+
+# Remote media sources (kind:"url") work with no config here: any host
+# that survives the address deny-list. To scan media served from THIS
+# machine (`python3 -m http.server 8000` on macOS/Linux, `py -m
+# http.server 8000` on Windows), name that host explicitly — nothing else
+# may reach non-public addresses. See deploy/compose/README.md:
+#
+# source:
+#   url:
+#     allow_private_hosts: ["host.docker.internal"]
 
 ui:
   enabled: true

@@ -37,8 +37,8 @@ configured, every job ends `verdict:"error"` — see
 
 | Service | URL | Notes |
 |---|---|---|
-| Intake | `http://localhost:8080` | `POST /jobs`, dev intake, no auth. Only `vismod-a` publishes it — `vismod-b` is reachable over the compose network only. |
-| Operator UI | `http://localhost:8081` | Basic auth, credentials from `.env` (`VISMOD_UI_USER` / `VISMOD_UI_PASSWORD`). Also `vismod-a` only. |
+| Intake | `http://localhost:8080` | `POST /jobs`, dev intake, **no auth**. Published on `127.0.0.1` only — see below. Only `vismod-a` publishes it; `vismod-b` is reachable over the compose network only. |
+| Operator UI | `http://localhost:8081` | Basic auth, credentials from `.env` (`VISMOD_UI_USER` / `VISMOD_UI_PASSWORD`). Also `127.0.0.1` and `vismod-a` only. |
 | Prometheus | `http://localhost:9090` | Scrapes `vismod-a:9090` and `vismod-b:9090` every 5s. |
 | Grafana | `http://localhost:3000` | Anonymous viewer access, no login. Dashboard: "vismod overview" (uid `vismod-overview`), provisioned from `deploy/compose/grafana/`. |
 
@@ -53,6 +53,99 @@ stdout default applies.) Read them with:
 ```sh
 docker compose logs -f vismod-a vismod-b
 ```
+
+## Scanning from a URL
+
+Works with the stock config — no `source:` block needed.
+
+macOS / Linux:
+
+```sh
+curl -X POST localhost:8080/jobs -H 'content-type: application/json' \
+  -d '{"kind":"url","ref":"https://upload.wikimedia.org/wikipedia/commons/4/47/PNG_transparency_demonstration_1.png"}'
+```
+
+Windows PowerShell (`curl` there is an alias for `Invoke-WebRequest`, so
+use `Invoke-RestMethod`):
+
+```powershell
+$body = @{
+  kind = 'url'
+  ref  = 'https://upload.wikimedia.org/wikipedia/commons/4/47/PNG_transparency_demonstration_1.png'
+} | ConvertTo-Json
+
+Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:8080/jobs' `
+  -ContentType 'application/json' -Body $body
+```
+
+### From your own machine
+
+To scan media you serve yourself rather than from the public internet,
+serve it and name the host. Non-public addresses are denied for every
+host that is not on `allow_private_hosts`.
+
+Serve a directory of test media on the host — macOS / Linux:
+
+```sh
+python3 -m http.server 8000
+```
+
+Windows PowerShell:
+
+```powershell
+py -m http.server 8000
+```
+
+Then name the host and restart:
+
+```yaml
+# deploy/compose/config.compose.yaml
+source:
+  url:
+    allow_private_hosts: ["host.docker.internal"]
+```
+
+```sh
+docker compose up -d          # restart to pick up the config
+```
+
+macOS / Linux:
+
+```sh
+curl -X POST localhost:8080/jobs -H 'content-type: application/json' \
+  -d '{"kind":"url","ref":"http://host.docker.internal:8000/clip.mp4"}'
+```
+
+Windows PowerShell:
+
+```powershell
+$body = @{
+  kind = 'url'
+  ref  = 'http://host.docker.internal:8000/clip.mp4'
+} | ConvertTo-Json
+
+Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:8080/jobs' `
+  -ContentType 'application/json' -Body $body
+```
+
+`host.docker.internal` resolves to the host from inside the container on
+Docker Desktop (Windows and macOS). On plain Linux it does not exist by
+default — add it to the `vismod-a` / `vismod-b` services:
+
+```yaml
+extra_hosts:
+  - "host.docker.internal:host-gateway"
+```
+
+`host-gateway` needs Docker Engine 20.10 or newer. Also check that the
+media server is reachable from the container: on Linux it must bind
+`0.0.0.0` (the default above does), and a host firewall — `ufw`,
+`firewalld`, or Windows Defender Firewall prompting on first run — will
+otherwise drop the connection from the Docker bridge.
+
+The alternative, with no config change at all, is to drop files into
+`./media` (already mounted at `/data`) and post
+`{"kind":"file","ref":"/data/clip.mp4"}`.
 
 ## Constraints this stack is built around
 

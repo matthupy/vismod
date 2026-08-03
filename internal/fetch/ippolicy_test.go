@@ -71,3 +71,56 @@ func TestDenyPrivateRejectsInvalidAddr(t *testing.T) {
 		t.Fatal("zero Addr must be denied, got nil")
 	}
 }
+
+// DenyMetadata is the weaker policy for hosts in allow_private_hosts. It
+// exists to let an operator scan media they serve themselves, so private
+// space is reachable — but the metadata endpoints never are.
+func TestDenyMetadata(t *testing.T) {
+	for _, tc := range []struct {
+		addr    string
+		allowed bool
+		why     string
+	}{
+		// Public still works.
+		{"8.8.8.8", true, "public v4"},
+		{"2606:4700:4700::1111", true, "public v6"},
+
+		// The point of the list: self-hosted media.
+		{"127.0.0.1", true, "v4 loopback"},
+		{"::1", true, "v6 loopback"},
+		{"10.0.0.1", true, "rfc1918 10/8"},
+		{"172.17.0.1", true, "docker bridge gateway"},
+		{"192.168.65.2", true, "docker desktop host gateway"},
+		{"fd12:3456::1", true, "v6 unique local"},
+
+		// Still denied: metadata, and what is never a media server.
+		{"169.254.169.254", false, "aws/gcp metadata"},
+		{"169.254.0.1", false, "v4 link-local"},
+		{"fe80::1", false, "v6 link-local"},
+		{"fd00:ec2::254", false, "aws imds over ipv6, inside ULA"},
+		{"0.0.0.0", false, "unspecified v4"},
+		{"224.0.0.1", false, "v4 multicast"},
+		{"100.64.0.1", false, "cgnat 100.64/10"},
+		{"::ffff:169.254.169.254", false, "v4-mapped metadata"},
+	} {
+		t.Run(tc.addr+" "+tc.why, func(t *testing.T) {
+			ip, err := netip.ParseAddr(tc.addr)
+			if err != nil {
+				t.Fatalf("bad test address: %v", err)
+			}
+			err = DenyMetadata(ip)
+			if tc.allowed && err != nil {
+				t.Errorf("%s (%s) must be allowed, got %v", tc.addr, tc.why, err)
+			}
+			if !tc.allowed && err == nil {
+				t.Errorf("%s (%s) must be denied, got nil", tc.addr, tc.why)
+			}
+		})
+	}
+}
+
+func TestDenyMetadataRejectsInvalidAddr(t *testing.T) {
+	if err := DenyMetadata(netip.Addr{}); err == nil {
+		t.Fatal("zero Addr must be denied, got nil")
+	}
+}

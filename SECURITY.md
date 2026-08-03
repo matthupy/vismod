@@ -49,20 +49,23 @@ to the other.
 
 A job may name a remote asset (`{"kind":"url","ref":"https://…"}`), which
 is the only place in vismod where an untrusted payload chooses an
-outbound destination. The feature is **off by default**
-(`source.url.enabled: false`); with it off, `kind:"url"` is rejected at
-intake with `400` and by the pipeline with `verdict:"error"`. Media is
-still sent to providers as **inline content only** — Azure `blobUrl` and
-any provider-side remote-fetch parameter remain unused, because that
-would move the fetch outside these controls.
+outbound destination. It is **on by default**: with
+`source.url.allow_hosts` empty, a job may name any host that survives the
+address policy below. There is no separate enable flag — the destination
+rules are the control surface, and a second switch could only ever
+disagree with them. **Set `allow_hosts` in production**; it narrows to
+exactly the hostnames you list. Media is still sent to providers as
+**inline content only** — Azure `blobUrl` and any provider-side
+remote-fetch parameter remain unused, because that would move the fetch
+outside these controls.
 
-When it is enabled, every control below is fail-closed and none of them
-has an off switch (`internal/fetch`, one test per rule):
+Every control below is fail-closed (`internal/fetch`, one test per rule):
 
-- **`https` only, exact hostname allow-list** (`source.url.allow_hosts`).
-  No wildcards, no suffix matching: `example.com` does not permit
-  `evil.example.com`. `enabled: true` with an empty allow-list refuses to
-  boot rather than accepting a setting that cannot fetch anything.
+- **Exact hostname allow-list** (`source.url.allow_hosts`). Empty means
+  any host. When populated: no wildcards, no suffix matching —
+  `example.com` does not permit `evil.example.com`.
+- **`https` only.** The single exception is a host named in
+  `source.url.allow_private_hosts`, below.
 - **No userinfo** in the URL; credentials stay env-only.
 - **Address deny-list at dial time** (`fetch.DenyPrivate`, run from
   `net.Dialer.Control`): loopback, RFC 1918, `169.254.0.0/16` (cloud
@@ -70,6 +73,16 @@ has an off switch (`internal/fetch`, one test per rule):
   address, multicast, and CGNAT `100.64.0.0/10`. Addresses are unmapped
   first, so a v4-mapped form (`::ffff:127.0.0.1`) cannot smuggle a
   private v4 past the v4 predicates.
+- **Non-public address space requires `source.url.allow_private_hosts`.**
+  A hostname listed there — and only that hostname — is dialed under the
+  weaker `fetch.DenyMetadata` policy, which permits loopback, RFC 1918
+  and ULA so an operator can scan media they serve themselves, and may be
+  reached over plain `http`. It still denies the instance-metadata
+  endpoints (`169.254.0.0/16` and AWS's IPv6 `fd00:ec2::/32`, which sits
+  inside the otherwise-permitted ULA range), the unspecified address,
+  multicast, and CGNAT. The policy is selected from the **hostname being
+  dialed**, before resolution, so the relaxation cannot leak: a public
+  host that re-resolves into RFC 1918 still meets `DenyPrivate`.
 - **The host allow-list and the address deny-list are two separate
   checks, deliberately.** The allow-list runs at parse time, on text; the
   address policy runs per-connection, against the address actually
@@ -107,6 +120,15 @@ with a reason) and again in the fetcher (because with
 `queue.driver: redis` a job can arrive straight onto the queue without
 passing through intake). The same rule as the per-job workflow and dedup
 overrides.
+
+**Who can enqueue can choose destinations.** The `serve` intake
+(`intake_addr`) has no authentication — it is a dev/demo surface. Because
+url sources are on by default, anyone who can reach that port can make
+this process issue outbound requests. Do not publish it on an untrusted
+network: the compose stack binds it to the host's loopback
+(`127.0.0.1:8080:8080`), and a real deployment should put it behind an
+authenticated ingress or feed the queue directly. Setting `allow_hosts`
+bounds the damage to hosts you chose.
 
 - Frame extraction rejects any input path containing a protocol scheme.
 

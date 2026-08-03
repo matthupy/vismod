@@ -314,7 +314,6 @@ func TestRunServeDrainsOnCancel(t *testing.T) {
 // j.Source.Ref here would publish the credential on the dashboard.
 func TestServerRunNeverPutsAPresignedURLInTheJobFeed(t *testing.T) {
 	c := serveConfig(t)
-	c.Source.URL.Enabled = true
 	c.Source.URL.AllowHosts = []string{"media.example.com"}
 
 	s, err := newServer(c)
