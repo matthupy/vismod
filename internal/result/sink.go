@@ -23,13 +23,19 @@ type ModelIdentity struct {
 
 // ResultEnvelope is the per-job output record.
 type ResultEnvelope struct {
-	JobID      queue.JobID                  `json:"job_id"`
-	Source     moderation.Source            `json:"source"`
-	ModelID    ModelIdentity                `json:"model_id"`
-	Result     *moderation.NormalizedResult `json:"result,omitempty"`
-	Error      string                       `json:"error,omitempty"`
-	StartedAt  time.Time                    `json:"started_at"`
-	FinishedAt time.Time                    `json:"finished_at"`
+	JobID   queue.JobID                  `json:"job_id"`
+	Source  moderation.Source            `json:"source"`
+	ModelID ModelIdentity                `json:"model_id"`
+	Result  *moderation.NormalizedResult `json:"result,omitempty"`
+	Error   string                       `json:"error,omitempty"`
+	// Metadata is the opaque caller-supplied JSON from queue.Job, passed
+	// through untouched. vismod never interprets it and it never
+	// influences a verdict. Omitted when the caller supplied none.
+	// Present in sink output ONLY — never in the audit log, log lines,
+	// or the operator UI.
+	Metadata   json.RawMessage `json:"metadata,omitempty"`
+	StartedAt  time.Time       `json:"started_at"`
+	FinishedAt time.Time       `json:"finished_at"`
 }
 
 // Sink receives result envelopes. Write MUST be idempotent per JobID:
