@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -31,6 +32,7 @@ func mediaTypeFor(path string) string {
 var (
 	scanWorkflows      []string
 	scanDedupThreshold int
+	scanMetadata       string
 )
 
 var scanCmd = &cobra.Command{
@@ -47,6 +49,11 @@ selected workflows. Omitted = the configured default workflow.
 near-duplicate removal at that Hamming distance, -1 disables it.
 Omitted = the configured behavior.
 
+--metadata attaches an opaque JSON object to every envelope this
+invocation emits, for correlating verdicts with your own records. vismod
+never interprets it; it must be a JSON object and at most 4096 bytes once
+compacted. Do not put secrets in it.
+
 Exit codes: 0 = all allow; 1 = at least one flag/block; 2 = at least one
 error verdict or processing failure (fail safe: an error is never allow).`,
 	Args: cobra.MinimumNArgs(1),
@@ -57,6 +64,9 @@ error verdict or processing failure (fail safe: an error is never allow).`,
 		// read as "dedup at Hamming distance 0".
 		if cmd.Flags().Changed("dedup-threshold") {
 			opts.DedupThreshold = &scanDedupThreshold
+		}
+		if cmd.Flags().Changed("metadata") {
+			opts.Metadata = json.RawMessage(scanMetadata)
 		}
 		code, err := runScan(cmd.Context(), cmd.OutOrStdout(), args, opts)
 		if err != nil {
@@ -77,6 +87,8 @@ error verdict or processing failure (fail safe: an error is never allow).`,
 type scanOptions struct {
 	Workflows      []string
 	DedupThreshold *int
+	// Metadata is opaque caller JSON echoed back on each envelope.
+	Metadata json.RawMessage
 }
 
 // runScan moderates each input and returns the process exit code:
@@ -103,6 +115,11 @@ func runScan(ctx context.Context, out io.Writer, args []string, opts scanOptions
 	}
 	if err := validateDedupThreshold(opts.DedupThreshold); err != nil {
 		return 0, err
+	}
+
+	meta, metaErr := queue.ValidateMetadata(opts.Metadata)
+	if metaErr != nil {
+		return 0, metaErr
 	}
 
 	mod, err := buildModerator(cfg, log)
@@ -160,6 +177,7 @@ func runScan(ctx context.Context, out io.Writer, args []string, opts scanOptions
 			},
 			Workflows:      opts.Workflows,
 			DedupThreshold: opts.DedupThreshold,
+			Metadata:       meta,
 			SubmittedAt:    time.Now().UTC(),
 		}
 		env, disp, perr := p.ProcessJob(ctx, j)
@@ -180,5 +198,7 @@ func init() {
 		"FFmpeg workflow(s) for video inputs (repeatable or comma-separated); default: configured default_workflow")
 	scanCmd.Flags().IntVar(&scanDedupThreshold, "dedup-threshold", 0,
 		"near-duplicate removal override: 0..64 = Hamming threshold, -1 = disable; default: configured frames.dedup")
+	scanCmd.Flags().StringVar(&scanMetadata, "metadata", "",
+		"opaque JSON object echoed back on each result envelope; vismod never interprets it")
 	rootCmd.AddCommand(scanCmd)
 }

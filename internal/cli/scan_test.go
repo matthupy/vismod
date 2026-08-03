@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/vismod/vismod/internal/config"
 	"github.com/vismod/vismod/internal/moderate"
+	"github.com/vismod/vismod/internal/queue"
 	"github.com/vismod/vismod/pkg/moderation"
 )
 
@@ -340,5 +342,27 @@ func TestRunScanVideoInputValidatesFFmpegFirst(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "boot validation") {
 		t.Errorf("error should name boot validation, got: %v", err)
+	}
+}
+
+// Invalid metadata is a setup error: it fails BEFORE any scanning, so a
+// typo never costs a billed vendor call.
+func TestScanRejectsInvalidMetadata(t *testing.T) {
+	for name, meta := range map[string]string{
+		"array":    `["a"]`,
+		"scalar":   `42`,
+		"bad json": `{"a":`,
+		"oversize": `{"k":"` + strings.Repeat("a", queue.MaxMetadataBytes) + `"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			opts := scanOptions{Metadata: json.RawMessage(meta)}
+			code, err := runScan(context.Background(), io.Discard, []string{"nonexistent.png"}, opts)
+			if err == nil {
+				t.Fatalf("invalid metadata must be a setup error, got code=%d", code)
+			}
+			if !strings.Contains(err.Error(), "metadata") {
+				t.Errorf("the error must name metadata, got %v", err)
+			}
+		})
 	}
 }
