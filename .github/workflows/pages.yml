@@ -39,7 +39,7 @@ jobs:
 
       # enablement: true turns Pages on for the repo if it is not already,
       # rather than erroring out and demanding a trip through Settings.
-      - uses: actions/configure-pages@v5
+      - uses: actions/configure-pages@v6
         with:
           enablement: true
 
