@@ -56,7 +56,12 @@ go build ./... && go vet ./... && go test ./...
   changed is updated in the SAME commit.
 - No new module import unless the commit message justifies it.
 - No secret, media byte, provider `Raw`, or free text added to any
-  envelope, log, audit record, queue payload, or UI surface.
+  envelope, log, audit record, queue payload, or UI surface. ONE
+  carve-out: caller-supplied `metadata` (`queue.Job.Metadata` /
+  `ResultEnvelope.Metadata`, validated by `queue.ValidateMetadata`) is
+  opaque JSON permitted in the queue payload and the result envelope
+  ONLY — still forbidden in the audit log, in logs, and in the UI, and it
+  never influences a verdict. Do not widen it further.
 - If the change touched rollup, thresholds, or null handling: the
   existing rollup tests still pass UNMODIFIED. Making them pass by
   weakening them is a failed gate, not a fix.

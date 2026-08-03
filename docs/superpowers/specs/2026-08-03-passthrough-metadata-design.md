@@ -67,8 +67,12 @@ serialize byte-identical to today.
 
 ## Validation
 
-One shared validator, `validateMetadata(json.RawMessage) error`, in
-`internal/cli` beside `validateDedupThreshold`.
+One shared validator, `queue.ValidateMetadata(json.RawMessage)
+(json.RawMessage, error)`, in `internal/queue` beside the `Job` type it
+guards. It cannot live in `internal/cli` as first sketched: `internal/cli`
+imports `internal/pipeline`, so the pipeline could not import it back for
+execution-time validation. It returns the **compacted** bytes so no call
+site can forget to compact.
 
 Rules:
 

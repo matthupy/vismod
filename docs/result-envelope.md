@@ -54,6 +54,14 @@ A job submitted as `kind:"url"` ([REST intake](rest-api.md)) carries a
   jobs differ only in their query string — `ref` alone cannot tell them
   apart. Verifying a digest requires the original URL; vismod does not
   store it.
+- **`metadata`** is whatever you attached to the job (`POST /jobs` or
+  `scan --metadata`), echoed back verbatim and compacted. It is **absent**
+  when you supplied none — not `null` — so envelopes from callers who do
+  not use it are byte-identical to before. vismod never interprets it, so
+  it can never affect a verdict, and it is deliberately **not** written to
+  the audit log: the hash chain stays free of caller free text. It is also
+  never logged and never shown in the operator UI. Do not put secrets in
+  it — it reaches every configured sink, including your webhook receiver.
 
 `result.schema_version` is **`1.2.0`** as of the `ref_digest` addition
 (`1.1.0` added four categories). Both bumps are additive: no field was
@@ -61,6 +69,9 @@ removed, renamed, or given a new meaning, so a `1.1.0` consumer keeps
 working. Note that `source` is serialized by the envelope rather than by
 `NormalizedResult`, and the envelope carries no version of its own —
 `result.schema_version` is the only version signal for a `source` change.
+`metadata` rides the **envelope**, not `NormalizedResult`, so it does not
+move `result.schema_version`; like `source`, it has no version signal of
+its own, and it is additive — a consumer that ignores it keeps working.
 
 ## Sinks
 
