@@ -403,6 +403,10 @@ type intakeRequest struct {
 	// inherits the config; 0..64 enables dedup at that Hamming distance;
 	// -1 disables it for this job.
 	DedupThreshold *int `json:"dedup_threshold,omitempty"`
+	// Metadata is opaque caller JSON echoed back on the result envelope.
+	// vismod never interprets it. Must be a JSON object, at most
+	// queue.MaxMetadataBytes once compacted.
+	Metadata json.RawMessage `json:"metadata,omitempty"`
 }
 
 // validateURLIntake is the intake-side half of url validation. The
@@ -484,6 +488,11 @@ func serveIntake(cfg config.Config, q queue.Queue, bp *observe.Backpressure, sw 
 			http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
 			return
 		}
+		meta, metaErr := queue.ValidateMetadata(req.Metadata)
+		if metaErr != nil {
+			http.Error(w, "bad request: "+metaErr.Error(), http.StatusBadRequest)
+			return
+		}
 		ref := req.Ref
 		if req.Kind == "file" {
 			abs, err := filepath.Abs(req.Ref)
@@ -498,6 +507,7 @@ func serveIntake(cfg config.Config, q queue.Queue, bp *observe.Backpressure, sw 
 			Source:         moderation.Source{Kind: req.Kind, Ref: ref, MediaType: req.MediaType},
 			Workflows:      req.Workflows,
 			DedupThreshold: req.DedupThreshold,
+			Metadata:       meta,
 			SubmittedAt:    time.Now().UTC(),
 		}
 		id, err := q.Enqueue(r.Context(), j)

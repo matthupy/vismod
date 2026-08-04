@@ -194,8 +194,13 @@ outbound authentication on the webhook POST: vismod does not sign or
 authenticate the request, so the receiver cannot verify the sender, and
 anything reachable at the configured URL will be handed result
 envelopes. Envelopes carry verdicts, scores, model identity, the source
-ref, and an error summary — never
-media bytes, provider `Raw`, or secrets — but that is still moderation
+ref, an error summary, and the caller-supplied `metadata` object (if
+any) — never media bytes, provider `Raw`, or secrets. `metadata` is
+caller-controlled free text: vismod validates only that it is a JSON
+object under 4096 bytes, and never redacts, scans, or inspects its
+contents. It rides the same unauthenticated POST as the rest of the
+envelope, so a caller who puts a secret in `metadata` hands it to
+whatever the operator pointed the webhook at. That is still moderation
 metadata leaving the process, and choosing the receiver is the
 operator's whole control.
 
@@ -229,8 +234,9 @@ their own API layer. Revisit if a coarse-output mode is added.
 ### Media handling
 
 - Job payloads (queue, Redis, any ops surface) carry **opaque file
-  refs/IDs, never media bytes**. Secure the Redis instance (auth +
-  network policy) — it is part of the trust boundary.
+  refs/IDs, never media bytes**. They may also carry the caller's
+  `metadata` object, unredacted — one more reason to secure the Redis
+  instance (auth + network policy); it is part of the trust boundary.
 - **A `kind:"url"` job payload carries the URL as submitted**, query
   string included: the fetcher needs the whole thing, and redaction
   happens where results are recorded, not on the queue. If you submit

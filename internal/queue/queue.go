@@ -11,8 +11,11 @@
 package queue
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/vismod/vismod/pkg/moderation"
@@ -48,13 +51,53 @@ type Job struct {
 	// this job: nil inherits the config; 0..64 enables dedup at that
 	// Hamming distance (even when disabled globally); a negative value
 	// disables dedup for this job.
-	DedupThreshold *int      `json:"dedup_threshold,omitempty"`
-	SubmittedAt    time.Time `json:"submitted_at"`
+	DedupThreshold *int `json:"dedup_threshold,omitempty"`
+	// Metadata is opaque caller-supplied JSON, passed through untouched
+	// to the result envelope. vismod never interprets, indexes, or acts
+	// on it, and it can never influence a verdict. It is permitted in
+	// this payload and in result.ResultEnvelope ONLY: never logged,
+	// never rendered in the UI, never recorded in the audit log, so the
+	// audit chain stays free of caller free text.
+	Metadata    json.RawMessage `json:"metadata,omitempty"`
+	SubmittedAt time.Time       `json:"submitted_at"`
 }
 
 // Handler processes one job and reports its Disposition. A non-nil error
 // accompanies Retry/DeadLetter for logging; it never changes the mapping.
 type Handler func(ctx context.Context, j Job) (Disposition, error)
+
+// MaxMetadataBytes caps Job.Metadata after compaction. The cap is small
+// because metadata rides EVERY queue payload (durably, under redisq) and
+// every webhook POST; the intake's 1 MiB body limit is far too loose for
+// a field with that reach.
+const MaxMetadataBytes = 4096
+
+// ValidateMetadata checks caller-supplied metadata and returns it
+// compacted. Empty input is valid and yields nil (the field is omitted).
+//
+// Metadata must be a JSON object: that keeps the envelope field shape
+// stable for consumers and keeps `.metadata.foo` addressable. Compaction
+// happens here so the cap measures content rather than indentation, and
+// so no call site can store an unbounded pretty-printed form. Nesting
+// depth needs no check of ours — encoding/json's scanner already errors
+// past its own maximum depth.
+func ValidateMetadata(m json.RawMessage) (json.RawMessage, error) {
+	if len(m) == 0 {
+		return nil, nil
+	}
+	var buf bytes.Buffer
+	if err := json.Compact(&buf, m); err != nil {
+		return nil, fmt.Errorf("metadata is not valid JSON: %w", err)
+	}
+	c := buf.Bytes()
+	if len(c) == 0 || c[0] != '{' {
+		return nil, errors.New("metadata must be a JSON object")
+	}
+	if len(c) > MaxMetadataBytes {
+		return nil, fmt.Errorf("metadata must be at most %d bytes once compacted, got %d", MaxMetadataBytes, len(c))
+	}
+	return json.RawMessage(c), nil
+}
 
 // Queue is the driver contract. Swapping drivers via config must be
 // behavior-preserving with zero call-site changes.

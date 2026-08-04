@@ -3,6 +3,7 @@ package result
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -105,5 +106,31 @@ func TestFileSourceOmitsRefDigest(t *testing.T) {
 func TestSchemaVersionIsBumped(t *testing.T) {
 	if moderation.SchemaVersion != "1.2.0" {
 		t.Errorf("SchemaVersion = %q, want 1.2.0 after the additive ref_digest field", moderation.SchemaVersion)
+	}
+}
+
+// Metadata rides the envelope to every sink. Absent metadata must be
+// OMITTED, not null: unlike score, absence here carries no signal, and
+// existing consumers must see a byte-identical envelope.
+func TestEnvelopeMetadataSerialization(t *testing.T) {
+	var withMeta bytes.Buffer
+	s := NewJSONLSink(&withMeta)
+	if err := s.Write(context.Background(), ResultEnvelope{
+		JobID:    "m1",
+		Metadata: json.RawMessage(`{"ticket":"T-1"}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(withMeta.String(), `"metadata":{"ticket":"T-1"}`) {
+		t.Errorf("metadata must serialize verbatim, got %s", withMeta.String())
+	}
+
+	var without bytes.Buffer
+	s2 := NewJSONLSink(&without)
+	if err := s2.Write(context.Background(), ResultEnvelope{JobID: "m2"}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(without.String(), "metadata") {
+		t.Errorf("absent metadata must be omitted entirely, got %s", without.String())
 	}
 }

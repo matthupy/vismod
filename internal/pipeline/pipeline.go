@@ -112,6 +112,12 @@ func (p *Pipeline) Process(ctx context.Context, j queue.Job) (queue.Disposition,
 func (p *Pipeline) ProcessJob(ctx context.Context, j queue.Job) (result.ResultEnvelope, queue.Disposition, error) {
 	started := time.Now().UTC()
 
+	// Validated here as well as at intake: with queue.driver: redis a job
+	// can be enqueued without ever passing through POST /jobs. Invalid
+	// metadata is could-not-evaluate, not a silent pass — meta stays nil
+	// so rejected bytes never reach the envelope.
+	meta, metaErr := queue.ValidateMetadata(j.Metadata)
+
 	rs, cleanupSource, resolveErr := p.resolveSource(ctx, j)
 	// Lifecycle contract: deferred immediately, so the download is removed
 	// on every exit path — error, ctx-cancel, panic — before ack.
@@ -129,6 +135,8 @@ func (p *Pipeline) ProcessJob(ctx context.Context, j queue.Job) (result.ResultEn
 	var res moderation.NormalizedResult
 	var procErr error
 	switch {
+	case metaErr != nil:
+		procErr = fmt.Errorf("invalid metadata: %w", metaErr)
 	case resolveErr != nil:
 		procErr = resolveErr
 	case rs.env.MediaType == "video":
@@ -150,7 +158,7 @@ func (p *Pipeline) ProcessJob(ctx context.Context, j queue.Job) (result.ResultEn
 				return result.ResultEnvelope{}, queue.DeadLetter, fmt.Errorf("override audit event failed: %w", err)
 			}
 		}
-		return result.ResultEnvelope{JobID: j.ID, Source: rs.env, ModelID: p.ModelID, StartedAt: started, FinishedAt: time.Now().UTC()}, queue.Ack, nil
+		return result.ResultEnvelope{JobID: j.ID, Source: rs.env, ModelID: p.ModelID, Metadata: meta, StartedAt: started, FinishedAt: time.Now().UTC()}, queue.Ack, nil
 	}
 	if procErr != nil {
 		// Could-not-evaluate before any per-frame evidence existed
@@ -174,6 +182,7 @@ func (p *Pipeline) ProcessJob(ctx context.Context, j queue.Job) (result.ResultEn
 		Source:     rs.env,
 		ModelID:    p.ModelID,
 		Result:     &res,
+		Metadata:   meta,
 		StartedAt:  started,
 		FinishedAt: time.Now().UTC(),
 	}

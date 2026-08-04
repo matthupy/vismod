@@ -8,7 +8,7 @@ nav_order: 20
 Current state of the work. Rewrite this at the end of every iteration.
 Keep it short — it is read cold at the start of the next one.
 
-**Updated:** 2026-08-02
+**Updated:** 2026-08-03
 
 ## Where things stand
 
@@ -260,10 +260,28 @@ URLs are disabled, was wrong on this branch), plus a new
 three AGENTS.md gotchas (two `Source` values per url job, the typed-nil
 `*Fetcher`, allow-list vs deny-list).
 
+Latest: caller pass-through metadata. An optional, opaque JSON object
+now rides a job from intake to result: `queue.Job.Metadata
+json.RawMessage`, validated and compacted by `queue.ValidateMetadata`
+(object-only, ≤ `queue.MaxMetadataBytes` = 4096 bytes post-compaction,
+no depth check) at three independent points — `POST /jobs` (`400` on
+invalid), `scan --metadata` (a setup error before any billed vendor
+call), and again at `pipeline.ProcessJob` execution time, because a job
+can reach Redis without ever passing through HTTP intake. Invalid
+metadata at execution is `verdict:"error"` plus dead-letter, never an
+allow. Valid metadata is stamped onto `ResultEnvelope.Metadata` at both
+envelope construction sites, including the gated empty-video-skip
+override, and is omitted (never `null`) when absent. By design it never
+reaches the audit log, any log line, the operator UI, or a threshold
+decision — it is opaque cargo, not a scoring input. The validator lives
+in `internal/queue`, not `internal/cli`, because `internal/cli` imports
+`internal/pipeline` and a cli-side validator would have created an
+import cycle; noted as a deviation from the design spec.
+
 ## Gate status
 
 `go build ./...`, `go vet ./...`, `go test ./...` all pass locally as of
-2026-08-02. CI on PR #40 is green on all four jobs (build & test, lint,
+2026-08-03. CI on PR #40 is green on all four jobs (build & test, lint,
 vulnerability scan, docker build & smoke) — the only `-race` evidence
 that exists, since that job cannot run on this box.
 

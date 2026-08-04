@@ -32,7 +32,8 @@ return a verdict from `POST /jobs` is wrong about how vismod works.
 
 ```json
 {"kind":"file","ref":"/data/clip.mp4","media_type":"video",
- "workflows":["interval","keyframe"],"dedup_threshold":8}
+ "workflows":["interval","keyframe"],"dedup_threshold":8,
+ "metadata":{"ticket":"T-4417","tenant":"acme"}}
 ```
 
 | Field | Required | Meaning |
@@ -42,11 +43,12 @@ return a verdict from `POST /jobs` is wrong about how vismod works.
 | `media_type` | no | `"image"` or `"video"`. Inferred from the extension when omitted (`.mp4 .mov .mkv .webm .avi .m4v .mpg .mpeg .ts` → video, everything else → image). For a url the extension is read from the **path only**, since a query string can carry an extension that is not the asset's |
 | `workflows` | no | Extraction workflows for video, any number; frames are the **union**. Names must exist in config: `scene-detect`, `keyframe`, `interval` by default. Omitted = `ffmpeg.default_workflow` |
 | `dedup_threshold` | no | Per-job override of `frames.dedup`: `0`–`64` enables at that Hamming distance, `-1` disables, omitted inherits config |
+| `metadata` | no | An opaque JSON **object** echoed back verbatim on the result envelope, for correlating a verdict with your own records. vismod never interprets it, and it can never affect a verdict. Max 4096 bytes once compacted. Not written to the audit log — **do not put secrets in it**. An explicit `"metadata":null` is rejected (`400`) since it is not a JSON object — omit the field entirely to mean "no metadata" |
 
 | Response | When |
 |---|---|
 | `202` + `{"job_id":"job-…"}` | Accepted and queued |
-| `400` | Bad JSON, missing `ref`, unknown `kind`, unknown workflow, out-of-range `dedup_threshold`, or a url that fails validation |
+| `400` | Bad JSON, missing `ref`, unknown `kind`, unknown workflow, out-of-range `dedup_threshold`, a url that fails validation, or metadata that is not a JSON object (including explicit `null`) or exceeds 4096 bytes compacted |
 | `503` + `Retry-After: 30` | Intake paused by backpressure or by the operator, or the queue / dead-letter queue is full. **Retry — this is a signal, not a drop** |
 | `500` | Queue failure |
 

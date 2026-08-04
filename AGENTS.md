@@ -56,7 +56,12 @@ go build ./... && go vet ./... && go test ./...
   changed is updated in the SAME commit.
 - No new module import unless the commit message justifies it.
 - No secret, media byte, provider `Raw`, or free text added to any
-  envelope, log, audit record, queue payload, or UI surface.
+  envelope, log, audit record, queue payload, or UI surface. ONE
+  carve-out: caller-supplied `metadata` (`queue.Job.Metadata` /
+  `ResultEnvelope.Metadata`, validated by `queue.ValidateMetadata`) is
+  opaque JSON permitted in the queue payload and the result envelope
+  ONLY — still forbidden in the audit log, in logs, and in the UI, and it
+  never influences a verdict. Do not widen it further.
 - If the change touched rollup, thresholds, or null handling: the
   existing rollup tests still pass UNMODIFIED. Making them pass by
   weakening them is a failed gate, not a fix.
@@ -275,7 +280,7 @@ README.md, CLAUDE.md, SECURITY.md (workflow trust boundary, SSRF
 posture, audit scope), RESPONSIBLE_USE.md (vendor-scope detection,
 human-in-the-loop), MODEL_LIMITATIONS.md, CONTRIBUTING.md,
 config.example.yaml, docs/custom-ffmpeg-workflows.md,
-docs/rest-api.md (intake contract, url rules), deploy/README.md
-(autoscaling contract), deploy/compose/README.md (per-replica volume
-constraints). If you change behavior they describe, update them in the
-same commit.
+docs/rest-api.md (intake contract, url rules), docs/result-envelope.md
+(envelope field contract), deploy/README.md (autoscaling contract),
+deploy/compose/README.md (per-replica volume constraints). If you
+change behavior they describe, update them in the same commit.

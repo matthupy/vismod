@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -31,12 +32,13 @@ func mediaTypeFor(path string) string {
 var (
 	scanWorkflows      []string
 	scanDedupThreshold int
+	scanMetadata       string
 )
 
 var scanCmd = &cobra.Command{
 	Use:   "scan <file>...",
 	Short: "Moderate one or more local image/video files and print JSONL envelopes",
-	Long: `scan runs each file through the active moderation model and writes one
+	Long: fmt.Sprintf(`scan runs each file through the active moderation model and writes one
 JSON-lines result envelope per file to stdout.
 
 --workflow selects the FFmpeg extraction workflow(s) for video inputs
@@ -47,18 +49,17 @@ selected workflows. Omitted = the configured default workflow.
 near-duplicate removal at that Hamming distance, -1 disables it.
 Omitted = the configured behavior.
 
+--metadata attaches an opaque JSON object to every envelope this
+invocation emits, for correlating verdicts with your own records. vismod
+never interprets it; it must be a JSON object and at most %d bytes once
+compacted. Do not put secrets in it.
+
 Exit codes: 0 = all allow; 1 = at least one flag/block; 2 = at least one
 error verdict or processing failure (fail safe: an error is never allow).`,
+		queue.MaxMetadataBytes),
 	Args: cobra.MinimumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		opts := scanOptions{Workflows: scanWorkflows}
-		// Flag presence, not value: 0 is a meaningful threshold, so an
-		// unset flag has to stay nil ("inherit the config") rather than
-		// read as "dedup at Hamming distance 0".
-		if cmd.Flags().Changed("dedup-threshold") {
-			opts.DedupThreshold = &scanDedupThreshold
-		}
-		code, err := runScan(cmd.Context(), cmd.OutOrStdout(), args, opts)
+		code, err := runScan(cmd.Context(), cmd.OutOrStdout(), args, scanOptionsFrom(cmd))
 		if err != nil {
 			return err
 		}
@@ -77,6 +78,27 @@ error verdict or processing failure (fail safe: an error is never allow).`,
 type scanOptions struct {
 	Workflows      []string
 	DedupThreshold *int
+	// Metadata is opaque caller JSON echoed back on each envelope.
+	Metadata json.RawMessage
+}
+
+// scanOptionsFrom maps the parsed flags onto scanOptions. It is a named
+// function rather than inline in RunE because RunE calls os.Exit and so
+// cannot be exercised in-process: the flag NAMES below are strings, and a
+// mistyped one compiles cleanly while silently dropping the caller's
+// override. This is the seam a test can pin.
+func scanOptionsFrom(cmd *cobra.Command) scanOptions {
+	opts := scanOptions{Workflows: scanWorkflows}
+	// Flag presence, not value: 0 is a meaningful threshold, so an unset
+	// flag has to stay nil ("inherit the config") rather than read as
+	// "dedup at Hamming distance 0".
+	if cmd.Flags().Changed("dedup-threshold") {
+		opts.DedupThreshold = &scanDedupThreshold
+	}
+	if cmd.Flags().Changed("metadata") {
+		opts.Metadata = json.RawMessage(scanMetadata)
+	}
+	return opts
 }
 
 // runScan moderates each input and returns the process exit code:
@@ -103,6 +125,11 @@ func runScan(ctx context.Context, out io.Writer, args []string, opts scanOptions
 	}
 	if err := validateDedupThreshold(opts.DedupThreshold); err != nil {
 		return 0, err
+	}
+
+	meta, metaErr := queue.ValidateMetadata(opts.Metadata)
+	if metaErr != nil {
+		return 0, metaErr
 	}
 
 	mod, err := buildModerator(cfg, log)
@@ -160,6 +187,7 @@ func runScan(ctx context.Context, out io.Writer, args []string, opts scanOptions
 			},
 			Workflows:      opts.Workflows,
 			DedupThreshold: opts.DedupThreshold,
+			Metadata:       meta,
 			SubmittedAt:    time.Now().UTC(),
 		}
 		env, disp, perr := p.ProcessJob(ctx, j)
@@ -175,10 +203,20 @@ func runScan(ctx context.Context, out io.Writer, args []string, opts scanOptions
 	return exit, nil
 }
 
-func init() {
-	scanCmd.Flags().StringSliceVar(&scanWorkflows, "workflow", nil,
+// registerScanFlags binds the scan flags onto cmd. Separated from init so a
+// test can build a command with the SAME registration scanOptionsFrom reads
+// — a test that declared its own flag names would prove nothing about the
+// pairing that actually ships.
+func registerScanFlags(cmd *cobra.Command) {
+	cmd.Flags().StringSliceVar(&scanWorkflows, "workflow", nil,
 		"FFmpeg workflow(s) for video inputs (repeatable or comma-separated); default: configured default_workflow")
-	scanCmd.Flags().IntVar(&scanDedupThreshold, "dedup-threshold", 0,
+	cmd.Flags().IntVar(&scanDedupThreshold, "dedup-threshold", 0,
 		"near-duplicate removal override: 0..64 = Hamming threshold, -1 = disable; default: configured frames.dedup")
+	cmd.Flags().StringVar(&scanMetadata, "metadata", "",
+		"opaque JSON object echoed back on each result envelope; vismod never interprets it")
+}
+
+func init() {
+	registerScanFlags(scanCmd)
 	rootCmd.AddCommand(scanCmd)
 }
