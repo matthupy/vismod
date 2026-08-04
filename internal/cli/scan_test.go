@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/spf13/cobra"
+
 	"github.com/vismod/vismod/internal/config"
 	"github.com/vismod/vismod/internal/moderate"
 	"github.com/vismod/vismod/internal/queue"
@@ -365,4 +367,68 @@ func TestScanRejectsInvalidMetadata(t *testing.T) {
 			}
 		})
 	}
+}
+
+// The flag-to-options mapping is a string-keyed lookup: Changed("metadata")
+// with a mistyped name compiles cleanly and silently drops the caller's
+// metadata. RunE itself calls os.Exit and cannot be run in-process, so this
+// pins the pairing at the seam scanOptionsFrom exposes.
+func TestScanOptionsFromFlags(t *testing.T) {
+	// The flag vars are package-level (cobra binds them at init), so a test
+	// that parses flags must put them back.
+	t.Cleanup(func() {
+		scanWorkflows, scanDedupThreshold, scanMetadata = nil, 0, ""
+	})
+
+	newCmd := func(t *testing.T, args ...string) *cobra.Command {
+		t.Helper()
+		scanWorkflows, scanDedupThreshold, scanMetadata = nil, 0, ""
+		cmd := &cobra.Command{Use: "scan"}
+		registerScanFlags(cmd)
+		if err := cmd.ParseFlags(args); err != nil {
+			t.Fatalf("ParseFlags(%v): %v", args, err)
+		}
+		return cmd
+	}
+
+	t.Run("set flags reach the options", func(t *testing.T) {
+		opts := scanOptionsFrom(newCmd(t,
+			"--metadata", `{"ticket":"T-1"}`,
+			"--dedup-threshold", "8",
+			"--workflow", "keyframe"))
+
+		if string(opts.Metadata) != `{"ticket":"T-1"}` {
+			t.Errorf("--metadata did not reach the options, got %q", opts.Metadata)
+		}
+		if opts.DedupThreshold == nil || *opts.DedupThreshold != 8 {
+			t.Errorf("--dedup-threshold did not reach the options, got %v", opts.DedupThreshold)
+		}
+		if len(opts.Workflows) != 1 || opts.Workflows[0] != "keyframe" {
+			t.Errorf("--workflow did not reach the options, got %v", opts.Workflows)
+		}
+	})
+
+	// Presence, not value: an unset --dedup-threshold must stay nil rather
+	// than read as "dedup at Hamming distance 0", and unset metadata must
+	// stay nil so the envelope omits the field entirely.
+	t.Run("unset flags stay nil", func(t *testing.T) {
+		opts := scanOptionsFrom(newCmd(t))
+
+		if opts.Metadata != nil {
+			t.Errorf("unset --metadata must stay nil, got %q", opts.Metadata)
+		}
+		if opts.DedupThreshold != nil {
+			t.Errorf("unset --dedup-threshold must stay nil, got %d", *opts.DedupThreshold)
+		}
+	})
+
+	// An explicitly empty --metadata is still "the caller passed the flag",
+	// but ValidateMetadata treats empty as absent, so it must not become a
+	// setup error.
+	t.Run("empty --metadata is not an error", func(t *testing.T) {
+		opts := scanOptionsFrom(newCmd(t, "--metadata", ""))
+		if _, err := queue.ValidateMetadata(opts.Metadata); err != nil {
+			t.Errorf("an empty --metadata must validate as absent, got %v", err)
+		}
+	})
 }
