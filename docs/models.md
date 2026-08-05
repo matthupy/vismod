@@ -1,6 +1,6 @@
 ---
 title: Supported models
-nav_order: 3
+nav_order: 4
 ---
 
 # Supported scanning models
