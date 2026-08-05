@@ -89,10 +89,8 @@ the registered adapters — it never falls back.
 
 **`shieldgemma` is the no-vendor option**: you run an inference server
 (vLLM, TGI, or anything with an OpenAI-compatible chat-completions
-endpoint), and vismod speaks HTTP to it. No per-call billing, no media
-leaving your network. It requires `provider_thresholds.mode: override`
-and an explicit `model_version`, and it has never been run against a real
-server.
+endpoint) and vismod speaks HTTP to it — no per-call billing, no media
+leaving your network. It has never been run against a real server.
 
 All four are image-scoring, so video is frame-extracted by vismod and
 each frame scored as an image.
@@ -108,38 +106,13 @@ verification status for each — is in
 package plus golden tests, with zero pipeline changes
 ([CONTRIBUTING.md](CONTRIBUTING.md)).
 
-## Docker
+## Submitting jobs over HTTP
 
-One image, both modes. Bundles `ffmpeg`/`ffprobe`, runs non-root.
-
-```sh
-docker build -t vismod .
-```
-
-A config file is **required** — mount it. There is no usable env-only
-configuration: the `VISMOD_*` overlay only overrides keys the yaml
-already sets, so with no file the adapter name is empty and boot fails
-with `unknown adapter ""`.
-
-```sh
-# one-shot scan
-docker run -e VISMOD_MICROSOFT_API_KEY -v "$PWD:/data" \
-  vismod scan -c /data/config.yaml /data/clip.mp4
-
-# worker — :9090 serves /metrics /healthz /readyz
-docker run -e VISMOD_MICROSOFT_API_KEY -p 9090:9090 -v "$PWD:/data" \
-  vismod serve -c /data/config.yaml
-```
-
-`intake_addr` defaults to `127.0.0.1:8080`, which inside a container is
-reachable only from within it; publishing that port does nothing until
-you set the address to `0.0.0.0:8080`. The dev intake has **no auth** —
-read [SECURITY.md](SECURITY.md) before exposing it.
-
-### `POST /jobs`
-
-The intake takes one job per request, returns `202` + `{"job_id":…}`, and
-puts the verdict in your configured sinks — never in the HTTP response.
+`serve` exposes one endpoint. It takes a job per request, returns `202` +
+`{"job_id":…}`, and puts the verdict in your configured sinks — never in
+the HTTP response. It binds `127.0.0.1` by default and has **no
+authentication** — read [SECURITY.md](SECURITY.md) before moving it off
+localhost.
 
 ```sh
 # a local file
@@ -151,72 +124,35 @@ curl -X POST localhost:8080/jobs -H 'content-type: application/json' \
   -d '{"kind":"url","ref":"https://media.example.com/clip.mp4"}'
 ```
 
-`media_type` is inferred from the extension; `workflows` and
-`dedup_threshold` are optional per-job overrides.
+A `kind:"url"` job is fetched to a job-scoped temp file, scanned, and
+deleted before ack. It needs no configuration to work, but
+`source.url.allow_hosts` is what you set in production to narrow the
+destinations a job can name — private, loopback and metadata addresses
+are denied at connect time either way. The request body, the SSRF rules,
+and worked curl/PowerShell examples are in
+**[docs/rest-api.md](docs/rest-api.md)**.
 
-For `kind:"url"`, `ref` must be an `https` URL. It works with no
-configuration, and **`source.url.allow_hosts` is what you set in
-production** to narrow the destinations a job can name — exact hostnames,
-no wildcards, no suffix matching. Loopback, private, link-local and CGNAT
-addresses are denied at connect time; reaching media you serve yourself
-requires naming that host in `source.url.allow_private_hosts`, and the
-cloud-metadata ranges stay denied even then. vismod downloads the asset
-to a job-scoped temp file, scans it, and deletes it before ack; a
-presigned URL's query string is treated as a credential and never
-recorded.
+## Running it in a container
 
-Worked `curl` and PowerShell examples — image, video with workflows, and
-reading the envelope back — are in **[docs/rest-api.md](docs/rest-api.md)**.
-
-## Docker Compose
-
-The compose stack is the fastest way to see vismod behave like a real
-deployment: two worker replicas against a durable Redis queue, with
-Prometheus and Grafana already wired to the metrics.
+One image, both modes, `ffmpeg` bundled, non-root:
 
 ```sh
-# 1. credentials (env-only, never yaml)
-cp deploy/compose/env.example .env
-$EDITOR .env                      # set VISMOD_MICROSOFT_API_KEY
-
-# 2. config (mounted into both replicas)
-cp deploy/compose/config.compose.example.yaml deploy/compose/config.compose.yaml
-$EDITOR deploy/compose/config.compose.yaml    # set adapter.options.endpoint
-
-# 3. up
-docker compose up --build
+docker build -t vismod .
+docker run -e VISMOD_MICROSOFT_API_KEY -v "$PWD:/data" \
+  vismod scan -c /data/config.yaml /data/clip.mp4
 ```
 
-| Service | Published port | What it is |
-|---|---|---|
-| `vismod-a` | `:8080` intake, `:8081` operator UI | Worker + the only replica publishing ports |
-| `vismod-b` | none | Second worker on the same queue; Prometheus reaches it over the compose network |
-| `prometheus` | `:9090` | Scrapes both replicas. Host `:9090` is Prometheus — the replicas' own metrics port stays internal |
-| `grafana` | `:3000` | Preprovisioned vismod dashboard, anonymous view-only |
-| `redis` | none | Durable at-least-once queue; data survives `down`/`up` |
+A mounted config file is **required** — there is no usable env-only
+configuration, and a container without one fails fast with `unknown
+adapter ""`. That and the `intake_addr` publishing gotcha are in
+**[docs/docker.md](docs/docker.md)**.
 
-Drop a file in `./media/` (mounted read-only at `/data`) and submit it:
-
-```sh
-curl -X POST localhost:8080/jobs \
-  -H 'content-type: application/json' \
-  -d '{"kind":"file","ref":"/data/clip.mp4"}'
-```
-
-`media_type` is inferred from the extension; `workflows` is optional.
-Then watch `vismod_queue_depth` in Grafana drain as the two replicas
-claim work — the queue is the coordination point, so replicas need no
-knowledge of each other.
-
-⚠️ **Do not `docker compose up --scale vismod-b=N`.** It succeeds
-silently, but every scaled replica shares the one `audit-b` volume and
-corrupts the audit hash chain. Each replica needs its own audit volume —
-add a `vismod-c` service with an `audit-c` volume instead.
-
-What this stack exercises, and what it deliberately does not, is written
-up in **[deploy/compose/README.md](deploy/compose/README.md)** — including
-`compose.prod.example.yaml` for a production-shaped variant. For
-Kubernetes, KEDA, and HPA: **[deploy/README.md](deploy/README.md)**.
+To see it behave like a real deployment, `docker compose up --build`
+brings up two workers on a durable Redis queue with Prometheus and
+Grafana already wired to the metrics — setup, what the stack proves, and
+what it deliberately doesn't, in
+**[deploy/compose/README.md](deploy/compose/README.md)**. For Kubernetes,
+KEDA and HPA: **[deploy/README.md](deploy/README.md)**.
 
 Without a real vendor credential every job correctly ends
 `verdict:"error"` — that is the fail-safe design working, not a broken
@@ -232,6 +168,7 @@ Technical detail lives in [docs/](docs/), published at
 | [Architecture](docs/architecture.md) | Pipeline shape, package map, normalization, verdict rollup |
 | [Supported models](docs/models.md) | Per-adapter detail and verification status |
 | [REST intake](docs/rest-api.md) | `POST /jobs`, scanning from a URL, curl/PowerShell examples |
+| [Running in Docker](docs/docker.md) | Building the image, the required config mount, publishing the intake |
 | [Result envelope](docs/result-envelope.md) | Output schema, sinks, idempotency boundaries |
 | [Scaling and observability](docs/scaling.md) | Queue drivers, replica scaling, metrics, backpressure |
 | [Audit log](docs/audit-log.md) | Hash chain, verification, tamper-evident scope |
@@ -256,8 +193,8 @@ go vet ./...
 go test ./...     # no network, no credentials: fakes, httptest, miniredis
 ```
 
-Golden files regenerate with `go test -update ./internal/moderate/...`.
-FFmpeg integration tests skip automatically when ffmpeg is absent.
+Golden files, the adapter extension point, and the rest of the
+contributor rules: [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
