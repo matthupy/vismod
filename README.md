@@ -89,8 +89,7 @@ the registered adapters — it never falls back.
 
 **`shieldgemma` is the no-vendor option**: you run an inference server
 (vLLM, TGI, or anything with an OpenAI-compatible chat-completions
-endpoint) and vismod speaks HTTP to it — no per-call billing, no media
-leaving your network. It has never been run against a real server.
+endpoint).
 
 All four are image-scoring, so video is frame-extracted by vismod and
 each frame scored as an image.
@@ -108,44 +107,23 @@ package plus golden tests, with zero pipeline changes
 
 ## Submitting jobs over HTTP
 
-`serve` exposes one endpoint. It takes a job per request, returns `202` +
-`{"job_id":…}`, and puts the verdict in your configured sinks — never in
-the HTTP response. It binds `127.0.0.1` by default and has **no
-authentication** — read [SECURITY.md](SECURITY.md) before moving it off
-localhost.
+`serve` takes one job per request and puts the verdict in your configured
+sinks — never in the HTTP response:
 
 ```sh
-# a local file
 curl -X POST localhost:8080/jobs -H 'content-type: application/json' \
   -d '{"kind":"file","ref":"/data/clip.mp4"}'
-
-# a remote asset (works out of the box)
-curl -X POST localhost:8080/jobs -H 'content-type: application/json' \
-  -d '{"kind":"url","ref":"https://media.example.com/clip.mp4"}'
 ```
 
-A `kind:"url"` job is fetched to a job-scoped temp file, scanned, and
-deleted before ack. It needs no configuration to work, but
-`source.url.allow_hosts` is what you set in production to narrow the
-destinations a job can name — private, loopback and metadata addresses
-are denied at connect time either way. The request body, the SSRF rules,
-and worked curl/PowerShell examples are in
-**[docs/rest-api.md](docs/rest-api.md)**.
+The full request body, scanning from a URL, and worked curl/PowerShell
+examples are in **[docs/rest-api.md](docs/rest-api.md)**. The intake has
+**no authentication** — read [SECURITY.md](SECURITY.md) before moving it
+off localhost.
 
 ## Running it in a container
 
-One image, both modes, `ffmpeg` bundled, non-root:
-
-```sh
-docker build -t vismod .
-docker run -e VISMOD_MICROSOFT_API_KEY -v "$PWD:/data" \
-  vismod scan -c /data/config.yaml /data/clip.mp4
-```
-
-A mounted config file is **required** — there is no usable env-only
-configuration, and a container without one fails fast with `unknown
-adapter ""`. That and the `intake_addr` publishing gotcha are in
-**[docs/docker.md](docs/docker.md)**.
+The image runs both modes with `ffmpeg` bundled and a required config
+mount — **[docs/docker.md](docs/docker.md)**.
 
 To see it behave like a real deployment, `docker compose up --build`
 brings up two workers on a durable Redis queue with Prometheus and
@@ -192,9 +170,6 @@ go build ./...
 go vet ./...
 go test ./...     # no network, no credentials: fakes, httptest, miniredis
 ```
-
-Golden files, the adapter extension point, and the rest of the
-contributor rules: [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
