@@ -27,6 +27,34 @@ review — never a silent `allow`.
 
 ---
 
+## Why this exists
+
+Trust & safety teams all hit the same wall: more images and video coming
+in than anyone can look at by hand. The classifiers to triage that are
+the easy part — a handful of vendors sell one, and they work well enough.
+Everything around them is the work, and it's the same work every time:
+auth for one more vendor API, retries and rate limits, a way to turn a
+video into something an image classifier will accept, a schema your
+reviewers and your incident log can both live with. vismod is that glue,
+written once and in the open, so getting to a decision on a piece of
+media doesn't start with building a pipeline.
+
+Video is what makes that expensive. A ten-minute clip sampled at one
+frame per second is six hundred API calls, and most of them are the same
+shot from slightly different moments. vismod extracts frames on a
+workflow you control — scene changes, fixed intervals, whatever suits the
+content — then drops perceptual near-duplicates before anything is sent
+to a model. You pay for the frames that actually differ, which on real
+footage is a fraction of what you'd otherwise send.
+
+Normalization started as a convenience and turned into the more useful
+half. Because every vendor's output lands in the same shape, changing
+which model you run is a config edit rather than a rewrite — you can put
+the same media through two of them and compare what comes back. Scores
+still aren't portable across vendors and thresholds have to be retuned
+when you switch, but the plumbing stops being the reason you never
+checked.
+
 ## Quick start
 
 ```sh
