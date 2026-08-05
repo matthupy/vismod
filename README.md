@@ -144,6 +144,7 @@ Technical detail lives in [docs/](docs/), published at
 | Page | What's in it |
 |---|---|
 | [Architecture](docs/architecture.md) | Pipeline shape, package map, normalization, verdict rollup |
+| [Configuration and environment](docs/configuration.md) | Precedence, the `VISMOD_*` overlay, secrets, `.env` |
 | [Supported models](docs/models.md) | Per-adapter detail and verification status |
 | [REST intake](docs/rest-api.md) | `POST /jobs`, scanning from a URL, curl/PowerShell examples |
 | [Running in Docker](docs/docker.md) | Building the image, the required config mount, publishing the intake |
