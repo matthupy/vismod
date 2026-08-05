@@ -18,6 +18,62 @@ config.example.yaml, where they appear in full).
 > into a workflow. The guardrails are the security contract
 > (SECURITY.md).
 
+## What each workflow samples
+
+The diagrams below are **reference sketches, not measurements** — no real
+video was scanned to produce them. They exist to show the *shape* of each
+sampling strategy against one imaginary clip.
+
+The reference clip is 2:00 long. Each column is 2 seconds, and `^` marks
+a shot boundary (eight of them, with scene scores between 0.56 and 0.81):
+
+```
+|      ^          ^^^      ^            ^        ^   ^       |
+0:00                                                      2:00
+```
+
+In the timelines that follow, `F` is a frame that reaches moderation and
+`x` is a frame ffmpeg materialized that the scan cap discarded. The cap
+shown is `max_frames: 50` from config.example.yaml.
+
+**`scene-detect`** — `select='gt(scene,0.55)'`. One frame per shot
+boundary; a static clip yields almost nothing, a fast-cut clip yields a
+burst. Sampling tracks content, so frame count is unpredictable up front:
+
+```
+|      F          FFF      F            F        F   F       |
+0:00                                                      2:00
+```
+
+Note the absence of a frame at 0:00 — the scene score is undefined for
+the first frame, so it is not selected. Add `+eq(n,0)` to the `select`
+expression if you need the opening frame.
+
+**`keyframe`** — `-skip_frame nokey`. Samples I-frames, so the pattern is
+dictated by the *encoder's* GOP structure, not by content. Sketched here
+as a ~10s GOP plus the keyframes an encoder inserts at cuts:
+
+```
+|F    FF   F    F FFFF    FF   F    F   FF    F  F F F  F    |
+0:00                                                      2:00
+```
+
+Cheapest to decode, but a re-encode with different GOP settings changes
+the sample set for the same footage.
+
+**`interval`** — `fps=1/2`. One frame every 2 seconds, regardless of
+content. Predictable and uniform, and on this clip it is the only
+standard workflow that overruns the cap: 60 frames extracted, the last
+10 discarded, so nothing after 1:40 is ever scanned:
+
+```
+|FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFxxxxxxxxxx|
+0:00                                                      2:00
+```
+
+Truncation keeps the earliest frames, which is why the scan cap is a cost
+backstop and the fps value is the tuning lever (see rule 5 below).
+
 ## Anatomy
 
 ```yaml
@@ -123,6 +179,15 @@ hard-cuts:
          "{{.WorkDir}}/frame-%06d.png"]
 ```
 
+Against the reference clip, raising the threshold from 0.55 to 0.6 drops
+the three softest boundaries — the dissolves at 0:34, 0:52 and 1:36 —
+leaving five frames where `scene-detect` took eight:
+
+```
+|      F           FF                   F            F       |
+0:00                                                      2:00
+```
+
 First 30 seconds only (cheap triage of long uploads):
 
 ```yaml
@@ -133,6 +198,19 @@ head-sample:
          "-frames:v","{{.MaxFrames}}",
          "{{.WorkDir}}/frame-%06d.png"]
 ```
+
+`-t 30` sits *before* `-i`, so ffmpeg stops reading the input at 0:30 and
+the remaining 90 seconds are never decoded. At 2 fps that is 4 frames per
+column here, dense enough that the 50-frame scan cap lands at 0:25:
+
+```
+|FFFFFFFFFFFFFxx                                             |
+0:00                                                      2:00
+```
+
+Triage workflows are the easiest way to blow the cap. Either lower the
+fps or raise `max_frames` deliberately — the tail you lose is silent
+apart from a warning.
 
 Things that will (correctly) fail validation:
 
