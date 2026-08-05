@@ -1,6 +1,6 @@
 ---
 title: Running in Docker
-nav_order: 11
+nav_order: 5
 ---
 
 # Running in Docker

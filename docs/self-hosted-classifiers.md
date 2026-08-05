@@ -1,6 +1,6 @@
 ---
 title: Self-hosted classifiers
-nav_order: 9
+nav_order: 12
 ---
 
 # Self-hosted image classifiers as adapter candidates

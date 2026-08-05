@@ -1,6 +1,6 @@
 ---
 title: Configuration and environment
-nav_order: 12
+nav_order: 3
 ---
 
 # Configuration and environment

@@ -1,6 +1,6 @@
 ---
 title: REST intake
-nav_order: 10
+nav_order: 6
 ---
 
 # Submitting jobs over HTTP

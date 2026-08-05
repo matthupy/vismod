@@ -25,8 +25,8 @@ quick start. These pages are the technical detail.
 | [Architecture](architecture.md) | Pipeline shape, package map, normalization rules, verdict rollup |
 | [Configuration and environment](configuration.md) | Layer precedence, the `VISMOD_*` env overlay, the full secret list, `.env` |
 | [Supported models](models.md) | All four adapters: categories, score origins, credentials, limits, verification status |
-| [REST intake](rest-api.md) | `POST /jobs`, scanning from a URL, worked curl/PowerShell examples |
 | [Running in Docker](docker.md) | Building the image, the required config mount, publishing the intake |
+| [REST intake](rest-api.md) | `POST /jobs`, scanning from a URL, worked curl/PowerShell examples |
 | [Result envelope](result-envelope.md) | Output schema, sinks, idempotency boundaries, exit codes |
 | [Scaling and observability](scaling.md) | Queue drivers, replica scaling, metrics, readiness/backpressure |
 | [Audit log](audit-log.md) | Hash chain, verification, tamper-evident scope |
