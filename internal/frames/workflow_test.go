@@ -1,6 +1,8 @@
 package frames
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -67,6 +69,27 @@ func TestGuardrailsRejectHostileWorkflows(t *testing.T) {
 			[]string{"-nostdin", "-i", "{{.Input}}", "-passlogfile", "/var/log/x", out},
 			"absolute paths"},
 		{"empty args", nil, "empty args"},
+
+		// Every guardrail above matches LITERAL text: placeholderRe only
+		// recognizes bare {{.Name}} actions, the second-input check is
+		// arg == "-i", and looksAbsolutePath runs on the UNRENDERED arg. A
+		// template action that is not a bare field is invisible to all
+		// three, and only the rendered output tells the truth.
+		{"printf smuggles a second -i past the literal check",
+			[]string{"-nostdin", "-i", "{{.Input}}", `{{printf "-i"}}`, `{{printf "/etc/%s" "passwd"}}`, out},
+			""},
+		{"printf smuggles an absolute path past looksAbsolutePath",
+			[]string{"-nostdin", "-i", "{{.Input}}", "-passlogfile", `{{printf "/var/log/x"}}`, out},
+			""},
+		{"printf reconstructs a forbidden protocol",
+			[]string{"-nostdin", "-i", "{{.Input}}", `{{printf "htt%s://evil.example/u" "p"}}`, out},
+			""},
+		{"conditional action is not a bare placeholder",
+			[]string{"-nostdin", "-i", "{{.Input}}", `{{if .MaxWidth}}-vf{{end}}`, out},
+			""},
+		{"spaced field reference dodges the -i pairing check",
+			[]string{"-nostdin", "-i", "{{ .Input }}", out},
+			""},
 	}
 	cfg := ffCfg()
 	for _, tc := range tests {
@@ -126,5 +149,154 @@ func TestRenderAddsNostdinWhenMissing(t *testing.T) {
 	}
 	if args[0] != "-nostdin" {
 		t.Errorf("-nostdin must be enforced: %v", args)
+	}
+}
+
+// bareField accepts only {{.Name}}. Everything else in a template pipeline
+// — assignments, chained calls, function calls, multi-part field paths —
+// renders to something the literal guardrails never inspected.
+func TestCheckTemplateShapeRejectsNonBarePipelines(t *testing.T) {
+	for _, arg := range []string{
+		`{{$x := .Input}}`,         // declaration
+		`{{.Input | printf "%s"}}`, // chained command
+		`{{printf "%s" .Input}}`,   // function call
+		`{{.Input.Field}}`,         // multi-part field path
+		`{{if .MaxWidth}}x{{end}}`, // conditional
+		`{{range .Input}}x{{end}}`, // range
+		`{{with .Input}}x{{end}}`,  // with
+		`{{"literal"}}`,            // string constant
+		`{{23}}`,                   // numeric constant
+	} {
+		if err := checkTemplateShape("hostile", 0, arg); err == nil {
+			t.Errorf("checkTemplateShape accepted %q", arg)
+		}
+	}
+}
+
+// The bare forms that workflows legitimately use must keep working,
+// including surrounding text and whitespace inside the action.
+func TestCheckTemplateShapeAcceptsBarePlaceholders(t *testing.T) {
+	for _, arg := range []string{
+		"{{.Input}}",
+		"{{ .WorkDir }}/frame-%06d.png",
+		"scale={{.MaxWidth}}:-1",
+		"-frames:v",
+		`select=gt(scene\,0.4),showinfo`,
+		"{{.MaxFrames}}",
+	} {
+		if err := checkTemplateShape("ok", 0, arg); err != nil {
+			t.Errorf("checkTemplateShape rejected a legitimate arg %q: %v", arg, err)
+		}
+	}
+}
+
+// An arg that is not a parseable template must be refused rather than
+// reaching ffmpeg unvalidated.
+func TestCheckTemplateShapeRejectsUnparseableArgs(t *testing.T) {
+	if err := checkTemplateShape("hostile", 0, "{{.Input"); err == nil {
+		t.Error("an unparseable template arg was accepted")
+	}
+}
+
+// dhashFile must fail rather than guess when the file is not a decodable
+// image — Dedup keeps unhashable frames, so a silent zero hash here would
+// collapse them all instead.
+func TestDhashFileRejectsUndecodableInput(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "not-an-image.png")
+	if err := os.WriteFile(p, []byte("definitely not a png"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dhashFile(p); err == nil {
+		t.Error("dhashFile accepted a non-image")
+	}
+	if _, err := dhashFile(filepath.Join(dir, "missing.png")); err == nil {
+		t.Error("dhashFile accepted a missing file")
+	}
+}
+
+// checkRenderedArgs is the second line of defense: it only fires if a
+// template shape ever slips past checkTemplateShape, so no hostile workflow
+// reaches it today. That is precisely why it is tested directly — an
+// unreachable guard that does not work is the same as no guard, and the
+// next placeholder feature could make it reachable.
+func TestCheckRenderedArgsRejectsSmuggledArgs(t *testing.T) {
+	const in, wd = "/synthetic/input.mp4", "/synthetic/workdir"
+	out := wd + "/frame-%06d.png"
+
+	tests := []struct {
+		name    string
+		args    []string
+		wantErr string
+	}{
+		// A relative second input, so the absolute-path check (which fires
+		// first) cannot mask the one-input rule being tested here.
+		{"second input",
+			[]string{"-nostdin", "-i", in, "-i", "other.mp4", out},
+			"exactly 1"},
+		{"no input at all",
+			[]string{"-nostdin", "-vf", "showinfo", out},
+			"exactly 1"},
+		{"absolute path outside input and workdir",
+			[]string{"-nostdin", "-i", in, "-passlogfile", "/var/log/x", out},
+			"absolute paths"},
+		{"path traversal",
+			[]string{"-nostdin", "-i", in, "-vf", "movie=../../etc/shadow", out},
+			"traversal"},
+		{"forbidden protocol",
+			[]string{"-nostdin", "-i", in, "http://evil.example/u", out},
+			"forbidden protocol"},
+		// Relative for the same reason: an absolute output is caught by the
+		// absolute-path check, so output confinement needs its own case.
+		{"output escapes the workdir",
+			[]string{"-nostdin", "-i", in, "frames/frame-%06d.png"},
+			"escapes the WorkDir"},
+		{"no args at all",
+			nil,
+			"exactly 1"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := checkRenderedArgs("hostile", tc.args, in, wd)
+			if err == nil {
+				t.Fatalf("rendered args must be rejected: %v", tc.args)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("error %q should mention %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// The entitled absolute paths — the bound input and anything under the
+// pipeline-owned WorkDir — must still pass, or every real workflow breaks.
+func TestCheckRenderedArgsAcceptsEntitledPaths(t *testing.T) {
+	const in, wd = "/synthetic/input.mp4", "/synthetic/workdir"
+	args := []string{
+		"-nostdin", "-hide_banner", "-y", "-i", in,
+		"-vf", "fps=1/5,scale=1280:-1,showinfo",
+		"-frames:v", "64",
+		wd + "/frame-%06d.png",
+	}
+	if err := checkRenderedArgs("interval", args, in, wd); err != nil {
+		t.Errorf("a legitimate rendered workflow was rejected: %v", err)
+	}
+}
+
+// Every shipped workflow must survive the rendered checks, not just the
+// literal ones.
+func TestDefaultWorkflowsPassTheRenderedChecks(t *testing.T) {
+	cfg := ffCfg()
+	for name, wf := range config.DefaultWorkflows() {
+		rendered, err := RenderWorkflow(wf, TemplateValues{
+			Input: syntheticInput, WorkDir: syntheticWorkDir,
+			MaxFrames: cfg.MaxFrames, MaxWidth: cfg.MaxWidth,
+		})
+		if err != nil {
+			t.Fatalf("%s: render: %v", name, err)
+		}
+		if err := checkRenderedArgs(name, rendered, syntheticInput, syntheticWorkDir); err != nil {
+			t.Errorf("shipped workflow %q fails the rendered checks: %v", name, err)
+		}
 	}
 }

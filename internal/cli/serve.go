@@ -268,14 +268,7 @@ func (s *server) run(ctx context.Context) error {
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				if d, err := q.QueueDepth(ctx); err == nil {
-					metrics.QueueDepth.Set(float64(d))
-				}
-				if dlq := dlqOf(q); dlq != nil {
-					if d, err := dlq.Depth(ctx); err == nil {
-						metrics.DeadletterDepth.Set(float64(d))
-					}
-				}
+				publishDepthGauges(ctx, q, metrics)
 			}
 		}
 	}()
@@ -353,6 +346,38 @@ func newQueue(cfg config.Config, log *slog.Logger) (queue.Queue, error) {
 		return q, nil
 	default:
 		return nil, fmt.Errorf("unknown queue.driver %q", cfg.Queue.Driver)
+	}
+}
+
+// processingDepther is implemented by drivers that hold claimed-but-unacked
+// work outside the pending queue. Only redisq does: memq's in-flight jobs
+// live in a channel and die with the process.
+type processingDepther interface {
+	ProcessingDepth(ctx context.Context) (int, error)
+}
+
+// publishDepthGauges samples the queue's depths onto the metrics.
+//
+// A failed sample leaves the previous value in place rather than writing a
+// zero: a Redis blip that reported 0 would look identical to an empty queue
+// and could talk the autoscaler into scaling down mid-backlog.
+func publishDepthGauges(ctx context.Context, q queue.Queue, metrics *observe.Metrics) {
+	if d, err := q.QueueDepth(ctx); err == nil {
+		metrics.QueueDepth.Set(float64(d))
+	}
+	// In-flight work is not part of the autoscaling signal, so without its
+	// own gauge a job parked in processing (a failed dead-letter write
+	// leaves one there) is invisible: the depth graph reads zero and the
+	// autoscaler scales down on top of it.
+	if p, ok := q.(processingDepther); ok {
+		if d, err := p.ProcessingDepth(ctx); err == nil {
+			metrics.ProcessingDepth.Set(float64(d))
+		}
+	}
+	if dlq := dlqOf(q); dlq != nil {
+		if d, err := dlq.Depth(ctx); err == nil {
+			metrics.DeadletterDepth.Set(float64(d))
+		}
 	}
 }
 
@@ -484,7 +509,7 @@ func serveIntake(cfg config.Config, q queue.Queue, bp *observe.Backpressure, sw 
 			http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
 			return
 		}
-		if err := validateDedupThreshold(req.DedupThreshold); err != nil {
+		if err := validateDedupThreshold(req.DedupThreshold, cfg.Frames.Dedup.HammingThreshold); err != nil {
 			http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
 			return
 		}

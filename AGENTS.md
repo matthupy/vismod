@@ -118,7 +118,8 @@ internal/frames/       FrameSource, FFmpegSource (multi-workflow union),
 internal/fetch/        kind:"url" media download: parse-time host allow-list,
                        per-dial address deny-list, size cap, transient file
 internal/queue/        Queue iface; memq (dev, non-durable) + redisq
-                       (durable, at-least-once, strict FIFO via Redis LIST)
+                       (durable, at-least-once, strict FIFO via Redis LIST;
+                       PER-REPLICA processing lists + instance heartbeats)
 internal/pipeline/     per-job flow: frames -> dedup -> fan-out -> thresholds
                        -> rollup -> sink -> audit -> ack/DLQ
 internal/result/       ResultEnvelope + Sink implementations (JSONL, file,
@@ -147,8 +148,14 @@ Job flow specifics that trip people up:
   guaranteed. memq is non-durable/single-process — production and
   multi-replica need `queue.driver: redis`.
 - Per-job overrides ride `queue.Job`: `Workflows []string` (union of
-  extractions) and `DedupThreshold *int` (nil inherit / 0..64 enable /
-  negative disable). Validate at intake AND at execution.
+  extractions) and `DedupThreshold *int` (nil inherit / 0..ceiling enable
+  / negative disable). Validate at intake AND at execution. The ceiling
+  is `frames.dedup.hamming_threshold`: a job may TIGHTEN dedup or turn it
+  off, never loosen it. Every pair of 64-bit dHashes is within distance
+  64, so an unbounded override collapses a video into frame 0 and that
+  frame decides the verdict — a fail-open. Intake rejects above the
+  ceiling; the pipeline re-clamps because a job can reach Redis without
+  passing intake.
 - Frame caps are TWO-stage: the extraction budget
   (`max_extract_frames`, default 4×`max_frames`; what `{{.MaxFrames}}`
   renders as) bounds disk during extraction; the `max_frames` scan cap
@@ -268,11 +275,26 @@ import needs justification.
   intentional-by-inertia, not proven correct; treat changing it as a
   design change with its own review, and until then budget the webhook's
   `timeout` and `max_attempts` as documented in `config.example.yaml`.
-- Sink idempotency is **per process**, not durable. Only the audit log
-  replays its file on open (`audit.Open` rebuilds `seen`). A restart
-  resets every sink's dedupe set, so a job redelivered after a restart
-  gets a second file line and a second webhook POST. Consumers dedupe on
-  `job_id`; do not write docs that equate the sinks to the audit log.
+- Sink idempotency is **per process and time-bounded**, not durable. Only
+  the audit log replays its file on open (`audit.Open` rebuilds `seen`).
+  A restart resets every sink's dedupe set, so a job redelivered after a
+  restart gets a second file line and a second webhook POST. Claims also
+  expire after `result.dedupeRetention` (1h) — the map used to grow for
+  the life of the process and OOM-killed long-running pods, and that
+  crash caused the very duplicates the map prevents. The window is far
+  wider than any real redelivery (max_retries 3; Retry-After honored only
+  to 120s). Consumers dedupe on `job_id`; do not write docs that equate
+  the sinks to the audit log.
+- The Redis processing list is **per replica**
+  (`<prefix>:processing:<instance>`) with liveness in
+  `<prefix>:instances`. A replica reclaims only its own list on Start;
+  another replica's work is returned by the reaper once its heartbeat
+  goes stale (~60s). It was one shared key, and every Start drained the
+  whole thing — so any scale-up, rolling deploy, or crashloop re-ran jobs
+  live replicas were processing, double-billing the vendor. Do not
+  "simplify" it back to a shared key, and keep `ProcessingDepth` out of
+  `QueueDepth` (the autoscaling signal) while keeping it exported as
+  `vismod_processing_depth`.
 
 ## Docs that must stay true
 

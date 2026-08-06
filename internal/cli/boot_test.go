@@ -34,21 +34,39 @@ func TestMediaTypeFor(t *testing.T) {
 	}
 }
 
-// TestValidateDedupThreshold bounds the per-job override. A 64-bit dHash
-// cannot differ by more than 64 bits, so anything above that would silently
-// collapse every frame of a video into one.
+// TestValidateDedupThreshold bounds the per-job override against the
+// operator's configured ceiling. A caller may DISABLE dedup (-1) or TIGHTEN
+// it, never loosen it: at the dHash width of 64 bits every pair of frames is
+// within distance 64, so an unbounded override collapses an entire video into
+// its first frame and the verdict is decided by whatever that frame shows.
 func TestValidateDedupThreshold(t *testing.T) {
 	ptr := func(v int) *int { return &v }
+	const ceiling = 8
 
-	for _, v := range []*int{nil, ptr(-1), ptr(0), ptr(1), ptr(32), ptr(64)} {
-		if err := validateDedupThreshold(v); err != nil {
-			t.Errorf("validateDedupThreshold(%v) = %v, want nil", v, err)
+	for _, v := range []*int{nil, ptr(-1), ptr(0), ptr(1), ptr(7), ptr(ceiling)} {
+		if err := validateDedupThreshold(v, ceiling); err != nil {
+			t.Errorf("validateDedupThreshold(%v, %d) = %v, want nil", v, ceiling, err)
 		}
 	}
-	for _, v := range []*int{ptr(-2), ptr(65), ptr(1000)} {
-		if err := validateDedupThreshold(v); err == nil {
-			t.Errorf("validateDedupThreshold(%d) accepted an out-of-range override", *v)
+	// Above the ceiling is a loosening, and the old 0..64 bound let it through.
+	for _, v := range []*int{ptr(-2), ptr(ceiling + 1), ptr(64), ptr(65), ptr(1000)} {
+		if err := validateDedupThreshold(v, ceiling); err == nil {
+			t.Errorf("validateDedupThreshold(%d, %d) accepted a loosening override", *v, ceiling)
 		}
+	}
+}
+
+// TestValidateDedupThresholdMentionsCeiling: the 400 an API caller gets must
+// name the bound they exceeded, or "dedup_threshold rejected" reads as a
+// vismod bug rather than as operator policy.
+func TestValidateDedupThresholdMentionsCeiling(t *testing.T) {
+	v := 40
+	err := validateDedupThreshold(&v, 8)
+	if err == nil {
+		t.Fatal("validateDedupThreshold(40, 8) = nil, want an error")
+	}
+	if !strings.Contains(err.Error(), "8") {
+		t.Errorf("error %q does not name the configured ceiling", err)
 	}
 }
 

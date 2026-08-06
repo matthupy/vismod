@@ -1,6 +1,7 @@
 package moderate
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/vismod/vismod/pkg/moderation"
 )
@@ -423,5 +425,53 @@ func TestMultipartBodyIsRewoundPerAttempt(t *testing.T) {
 	}
 	if sizes[1] != len(content) {
 		t.Errorf("retry uploaded %d bytes, want %d — the body was not rewound", sizes[1], len(content))
+	}
+}
+
+// A hostile or merely verbose error page must not be retained in full. The
+// body is read under a 4 MiB cap but only the first 200 bytes are ever
+// shown, and this runs on the retry path — during a 429/5xx storm the
+// process is already under pressure.
+func TestRetainedErrorBodyIsBounded(t *testing.T) {
+	huge := bytes.Repeat([]byte("A"), 4<<20)
+	got := retainedErrorBody(huge)
+	if len(got) > errorBodyKeep {
+		t.Errorf("retained %d bytes, want <= %d", len(got), errorBodyKeep)
+	}
+	// The head is what the error message shows, so it must survive intact.
+	if !strings.HasPrefix(got, "AAAA") {
+		t.Error("retained body lost its head")
+	}
+}
+
+func TestRetainedErrorBodyKeepsShortBodiesWhole(t *testing.T) {
+	body := []byte(`{"error":{"code":"TooManyRequests"}}`)
+	if got := retainedErrorBody(body); got != string(body) {
+		t.Errorf("retainedErrorBody = %q, want the body unchanged", got)
+	}
+}
+
+// Truncation must not split a multi-byte rune: the retained text goes into
+// logs, and invalid UTF-8 there is a debugging problem of its own.
+func TestRetainedErrorBodyStaysValidUTF8(t *testing.T) {
+	// Fill so that the cut lands mid-rune for at least one offset.
+	for pad := range 4 {
+		body := append(bytes.Repeat([]byte("x"), errorBodyKeep-1+pad), []byte("→ tail")...)
+		got := retainedErrorBody(body)
+		if !utf8.ValidString(got) {
+			t.Errorf("pad=%d: retained body is not valid UTF-8", pad)
+		}
+		if len(got) > errorBodyKeep {
+			t.Errorf("pad=%d: retained %d bytes, want <= %d", pad, len(got), errorBodyKeep)
+		}
+	}
+}
+
+// The error surfaced to the caller still identifies the failure.
+func TestHTTPErrorStillReportsStatusAndBody(t *testing.T) {
+	e := &HTTPError{Status: 429, Code: "TooManyRequests", Body: retainedErrorBody(bytes.Repeat([]byte("B"), 4<<20))}
+	msg := e.Error()
+	if !strings.Contains(msg, "429") || !strings.Contains(msg, "TooManyRequests") {
+		t.Errorf("error message lost its identifying detail: %s", msg)
 	}
 }

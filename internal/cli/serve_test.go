@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -13,6 +14,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/vismod/vismod/internal/config"
 	"github.com/vismod/vismod/internal/observe"
 	"github.com/vismod/vismod/internal/queue"
@@ -30,6 +33,13 @@ func intakeConfig() config.Config {
 		IntakeAddr: "127.0.0.1:0",
 		FFmpeg: config.FFmpegConfig{
 			Workflows: map[string]config.WorkflowConfig{"keyframes": {Description: "test"}},
+		},
+		// Matches config.Defaults(): the per-job dedup ceiling comes from
+		// here, so leaving it zero would test a stricter bound than any
+		// real deployment runs.
+		Frames: config.FramesConfig{
+			Concurrency: 4,
+			Dedup:       config.DedupConfig{Enabled: false, HammingThreshold: 8},
 		},
 	}
 }
@@ -204,6 +214,11 @@ func TestIntakeRejectsBadRequests(t *testing.T) {
 		{"unknown workflow", `{"kind":"file","ref":"a.mp4","workflows":["nope"]}`},
 		{"dedup threshold too high", `{"kind":"file","ref":"a.mp4","dedup_threshold":65}`},
 		{"dedup threshold below -1", `{"kind":"file","ref":"a.mp4","dedup_threshold":-2}`},
+		// Within the dHash width but ABOVE the configured ceiling of 8. At 64
+		// every frame is a near-duplicate of frame 0, so honoring this would
+		// scan one frame and let it decide the whole video's verdict.
+		{"dedup threshold loosens past the config ceiling", `{"kind":"file","ref":"a.mp4","dedup_threshold":64}`},
+		{"dedup threshold one past the config ceiling", `{"kind":"file","ref":"a.mp4","dedup_threshold":9}`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -221,11 +236,13 @@ func TestIntakeRejectsBadRequests(t *testing.T) {
 	}
 }
 
-// TestIntakeAcceptsValidDedupOverrides: -1 (disable) and 0..64 are the
+// TestIntakeAcceptsValidDedupOverrides: -1 (disable) and 0..ceiling are the
 // documented per-job range, and the override must reach the job unchanged —
-// a dropped override silently reverts to the global config.
+// a dropped override silently reverts to the global config. The ceiling is
+// frames.dedup.hamming_threshold (8 in intakeConfig); a job may tighten
+// dedup or switch it off, never loosen it.
 func TestIntakeAcceptsValidDedupOverrides(t *testing.T) {
-	for _, v := range []int{-1, 0, 8, 64} {
+	for _, v := range []int{-1, 0, 4, 8} {
 		q := testMemq(t)
 		h := newIntake(t, intakeConfig(), q, openBackpressure(), &intakeSwitch{})
 
@@ -592,5 +609,84 @@ func TestFetcherBootsFromDefaults(t *testing.T) {
 	}
 	if f == nil {
 		t.Fatal("the default config must still yield a usable fetcher")
+	}
+}
+
+// gaugeValue reads a Prometheus gauge's current value.
+//
+// Uses client_golang's own testutil rather than reaching for client_model
+// directly: that would promote client_model from an indirect dependency to
+// a direct one for the sake of a test assertion.
+func gaugeValue(t *testing.T, g prometheus.Gauge) float64 {
+	t.Helper()
+	return testutil.ToFloat64(g)
+}
+
+// depthQueue is a queue whose depths are scripted, including failures.
+type depthQueue struct {
+	queue.Queue
+	depth, processing int
+	depthErr, procErr error
+}
+
+func (d *depthQueue) QueueDepth(context.Context) (int, error) {
+	return d.depth, d.depthErr
+}
+func (d *depthQueue) ProcessingDepth(context.Context) (int, error) {
+	return d.processing, d.procErr
+}
+
+// Jobs parked in processing are excluded from the autoscaling signal by
+// design, so they need their own gauge — otherwise a payload stranded by a
+// failed dead-letter write is in a queue nothing counts, while queue_depth
+// reads 0 and the autoscaler scales to zero on top of it.
+func TestPublishDepthGaugesReportsProcessingSeparately(t *testing.T) {
+	m := observe.NewMetrics()
+	q := &depthQueue{depth: 7, processing: 3}
+
+	publishDepthGauges(context.Background(), q, m)
+
+	if got := gaugeValue(t, m.QueueDepth); got != 7 {
+		t.Errorf("queue depth gauge = %v, want 7", got)
+	}
+	if got := gaugeValue(t, m.ProcessingDepth); got != 3 {
+		t.Errorf("processing depth gauge = %v, want 3", got)
+	}
+}
+
+// A driver with no in-flight concept (memq) must simply not publish the
+// gauge, rather than publishing a misleading zero.
+func TestPublishDepthGaugesSkipsDriversWithoutProcessing(t *testing.T) {
+	m := observe.NewMetrics()
+	m.ProcessingDepth.Set(42) // a previous sample
+
+	q := testMemq(t)
+	publishDepthGauges(context.Background(), q, m)
+
+	if got := gaugeValue(t, m.ProcessingDepth); got != 42 {
+		t.Errorf("processing gauge = %v, want the previous 42 left untouched", got)
+	}
+}
+
+// A failed sample must leave the last known value alone. Writing 0 on a
+// Redis blip is indistinguishable from an empty queue and can talk the
+// autoscaler into scaling down mid-backlog.
+func TestPublishDepthGaugesLeavesStaleValuesOnError(t *testing.T) {
+	m := observe.NewMetrics()
+	m.QueueDepth.Set(11)
+	m.ProcessingDepth.Set(5)
+
+	q := &depthQueue{
+		depth: 0, processing: 0,
+		depthErr: errors.New("redis is down"),
+		procErr:  errors.New("redis is down"),
+	}
+	publishDepthGauges(context.Background(), q, m)
+
+	if got := gaugeValue(t, m.QueueDepth); got != 11 {
+		t.Errorf("queue depth gauge = %v, want 11 (a failed sample must not write 0)", got)
+	}
+	if got := gaugeValue(t, m.ProcessingDepth); got != 5 {
+		t.Errorf("processing gauge = %v, want 5 (a failed sample must not write 0)", got)
 	}
 }

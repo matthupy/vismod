@@ -353,7 +353,17 @@ func (p *Pipeline) processVideo(ctx context.Context, j queue.Job) (moderation.No
 	enabled, threshold := p.Dedup, p.DedupThreshold
 	if j.DedupThreshold != nil {
 		enabled = *j.DedupThreshold >= 0
-		threshold = *j.DedupThreshold
+		// A job may TIGHTEN dedup or turn it off; it may never loosen it
+		// past the operator's ceiling. Every pair of 64-bit dHashes is
+		// within distance 64, so an honored wide-open override collapses a
+		// whole video into frame 0 and that frame decides the verdict —
+		// fail-open. Intake clamps this too; re-clamped here because a job
+		// can reach the queue without passing intake (SECURITY.md).
+		if threshold = *j.DedupThreshold; threshold > p.DedupThreshold {
+			p.log().Warn("per-job dedup_threshold exceeds the configured ceiling; clamping",
+				"job_id", j.ID, "requested", *j.DedupThreshold, "ceiling", p.DedupThreshold)
+			threshold = p.DedupThreshold
+		}
 	}
 	if enabled {
 		var removed int

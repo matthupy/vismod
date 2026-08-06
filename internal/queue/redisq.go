@@ -2,6 +2,8 @@ package queue
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,10 +27,20 @@ import (
 //
 // Layout (all keys under prefix):
 //
-//	<p>:pending    LIST  — arrival-ordered payloads (FIFO: LPUSH + tail-pop)
-//	<p>:processing LIST  — in-flight payloads (crash recovery source)
-//	<p>:retry      ZSET  — delayed retries, score = ready-at unix ms
-//	<p>:dead       LIST  — dead-letter entries
+//	<p>:pending          LIST  — arrival-ordered payloads (FIFO: LPUSH + tail-pop)
+//	<p>:processing:<id>  LIST  — in-flight payloads for ONE replica
+//	<p>:instances        ZSET  — replica id → last heartbeat unix ms
+//	<p>:retry            ZSET  — delayed retries, score = ready-at unix ms
+//	<p>:dead             LIST  — dead-letter entries
+//
+// The processing list is per-replica because it is a claim, not a queue.
+// When it was one shared key, every Start moved the whole thing back to
+// pending — so any second replica booting (KEDA scale-up, rolling deploy,
+// crashloop) re-queued jobs that live replicas were running at that moment,
+// paying for the vendor call and the webhook POST twice while looking
+// exactly like ordinary at-least-once redelivery. A replica now reclaims
+// only its own key, and work from a replica that has genuinely stopped
+// heartbeating is reclaimed by the reaper.
 //
 // At-least-once ⇒ redelivery is possible (crash between handler and ack;
 // retry-mover races). Sink.Write and the audit append are idempotent per
@@ -37,16 +49,58 @@ import (
 // Payload hygiene: elements carry the Job (opaque file refs), NEVER media
 // bytes. The Redis instance must be access-controlled (§G.2).
 type Redisq struct {
-	cfg    QueueConfig
-	rdb    redis.UniversalClient
-	log    *slog.Logger
-	prefix string
+	cfg      QueueConfig
+	rdb      redis.UniversalClient
+	log      *slog.Logger
+	prefix   string
+	instance string // identifies this replica's processing list
 
 	stop    chan struct{}
 	closed  atomic.Bool
 	started atomic.Bool
 	active  atomic.Int64
 	workers sync.WaitGroup
+}
+
+// Timing for instance liveness. Vars, not consts, so tests can drive the
+// keeper and the reaper without sleeping for real seconds.
+var (
+	// instanceHeartbeat is how often a replica refreshes its liveness.
+	instanceHeartbeat = 10 * time.Second
+	// instanceReclaimAfter is how stale a heartbeat must be before another
+	// replica reclaims that instance's in-flight jobs.
+	//
+	// Liveness is the heartbeat, NOT job duration: a replica keeps
+	// heartbeating while it holds a job, so this does not need to exceed
+	// JobTimeout. It only needs to survive a few missed beats — a GC pause,
+	// a brief Redis blip — because reclaiming too early is what re-runs a
+	// job that is still executing.
+	instanceReclaimAfter = 60 * time.Second
+	// reaperInterval is how often stale instances are swept.
+	reaperInterval = 15 * time.Second
+)
+
+// legacyInstance names the pre-upgrade shared processing key, so payloads
+// left there by an older vismod are reclaimed by the same reaper path
+// instead of being stranded forever.
+const legacyInstance = "legacy"
+
+// newInstanceID identifies this replica. Random rather than hostname-based:
+// two replicas must never share a processing list, and a restarted pod must
+// not inherit a predecessor's claim implicitly — the reaper hands that work
+// back explicitly.
+// randRead is a seam so the entropy-failure fallback can be tested. Two
+// replicas sharing an instance id would share a processing list, which is
+// the exact bug the per-replica key exists to prevent, so the fallback has
+// to actually produce something usable.
+var randRead = rand.Read
+
+func newInstanceID() string {
+	var b [8]byte
+	if _, err := randRead(b[:]); err != nil {
+		return fmt.Sprintf("i-%d", time.Now().UnixNano())
+	}
+	return "i-" + hex.EncodeToString(b[:])
 }
 
 type redisPayload struct {
@@ -64,12 +118,28 @@ func NewRedisq(cfg QueueConfig, rdb redis.UniversalClient, prefix string, log *s
 	if log == nil {
 		log = slog.Default()
 	}
-	q := &Redisq{cfg: cfg, rdb: rdb, prefix: prefix, log: log, stop: make(chan struct{})}
+	q := &Redisq{
+		cfg: cfg, rdb: rdb, prefix: prefix, log: log,
+		instance: newInstanceID(),
+		stop:     make(chan struct{}),
+	}
 	q.cfg.DeadLetter = &redisDLQ{rdb: rdb, key: q.key("dead")}
 	return q
 }
 
 func (q *Redisq) key(s string) string { return q.prefix + ":" + s }
+
+// processingKey is this replica's in-flight list. Only this replica pops
+// from it; only the reaper may reclaim it, and only once this replica has
+// stopped heartbeating.
+func (q *Redisq) processingKey() string { return q.key("processing:" + q.instance) }
+
+func (q *Redisq) instanceProcessingKey(instance string) string {
+	if instance == legacyInstance {
+		return q.key("processing") // the pre-upgrade shared key
+	}
+	return q.key("processing:" + instance)
+}
 
 // Ping validates Redis reachability (boot validation and /readyz — Redis
 // is the SPOF; an outage must flip readiness, never black-hole jobs).
@@ -107,31 +177,158 @@ func (q *Redisq) Start(ctx context.Context, handler Handler) error {
 	if !q.started.CompareAndSwap(false, true) {
 		return fmt.Errorf("redisq: Start called twice")
 	}
-	// Crash recovery: anything still in processing belonged to a dead
-	// replica of this consumer group; move it back to pending
-	// (at-least-once redelivery).
+	// Register before touching anything: an unregistered replica that
+	// starts claiming jobs is invisible to every other replica's reaper.
+	if err := q.heartbeat(ctx); err != nil {
+		return fmt.Errorf("redisq: register instance: %w", err)
+	}
+	// Note what a pre-upgrade vismod may have left in the shared key, so
+	// the reaper can age it out rather than stranding it.
+	if err := q.registerLegacyIfPresent(ctx); err != nil {
+		return fmt.Errorf("redisq: legacy processing scan: %w", err)
+	}
+	// Reclaim only OUR key. A previous process using this instance id is
+	// impossible (ids are random), so this is normally a no-op; it stays
+	// because it is the correct scope, and Start may be reached after a
+	// partial failure.
 	if err := q.recoverOrphans(ctx); err != nil {
 		return fmt.Errorf("redisq: orphan recovery: %w", err)
 	}
-	for i := 0; i < q.cfg.Workers; i++ {
+	// Work stranded by replicas that have stopped heartbeating — including
+	// this pod's own previous life — comes back through the reaper.
+	q.reapDeadInstances(ctx)
+
+	for range q.cfg.Workers {
 		q.workers.Add(1)
 		go q.worker(ctx, handler)
 	}
 	q.workers.Add(1)
 	go q.retryMover(ctx)
+	q.workers.Add(1)
+	go q.instanceKeeper(ctx)
 	return nil
 }
 
+// recoverOrphans requeues anything left in THIS replica's processing list.
 func (q *Redisq) recoverOrphans(ctx context.Context) error {
+	n, err := q.drainProcessing(ctx, q.processingKey())
+	if err != nil {
+		return err
+	}
+	if n > 0 {
+		q.log.Warn("recovered in-flight jobs from this instance's previous run",
+			"instance", q.instance, "jobs", n)
+	}
+	return nil
+}
+
+// drainProcessing moves every payload in key back onto the tail of pending,
+// preserving arrival order.
+func (q *Redisq) drainProcessing(ctx context.Context, key string) (int, error) {
+	var n int
 	for {
-		res, err := q.rdb.LMove(ctx, q.key("processing"), q.key("pending"), "RIGHT", "RIGHT").Result()
+		_, err := q.rdb.LMove(ctx, key, q.key("pending"), "RIGHT", "RIGHT").Result()
 		if errors.Is(err, redis.Nil) {
-			return nil
+			return n, nil
 		}
 		if err != nil {
-			return err
+			return n, err
 		}
-		q.log.Warn("recovered orphaned in-flight job from a previous run", "payload_len", len(res))
+		n++
+	}
+}
+
+// heartbeat refreshes this replica's liveness.
+func (q *Redisq) heartbeat(ctx context.Context) error {
+	return q.rdb.ZAdd(ctx, q.key("instances"), redis.Z{
+		Score: float64(time.Now().UnixMilli()), Member: q.instance,
+	}).Err()
+}
+
+// registerLegacyIfPresent records the pre-upgrade shared processing key as
+// a pseudo-instance the first time it is seen with payloads in it.
+//
+// During a rolling upgrade an old replica may still be writing there, so
+// the entry is dated NOW rather than reclaimed immediately: it ages out
+// like any other instance, by which point the old replicas are gone. That
+// is strictly safer than the old unconditional drain, which requeued live
+// work on every single Start.
+func (q *Redisq) registerLegacyIfPresent(ctx context.Context) error {
+	n, err := q.rdb.LLen(ctx, q.key("processing")).Result()
+	if err != nil || n == 0 {
+		return err
+	}
+	added, err := q.rdb.ZAddNX(ctx, q.key("instances"), redis.Z{
+		Score: float64(time.Now().UnixMilli()), Member: legacyInstance,
+	}).Result()
+	if err != nil {
+		return err
+	}
+	if added > 0 {
+		q.log.Warn("found in-flight jobs in the pre-upgrade shared processing list; they will be reclaimed once stale",
+			"jobs", n, "reclaim_after", instanceReclaimAfter)
+	}
+	return nil
+}
+
+// instanceKeeper refreshes this replica's heartbeat and reaps replicas that
+// have stopped refreshing theirs.
+func (q *Redisq) instanceKeeper(ctx context.Context) {
+	defer q.workers.Done()
+	beat := time.NewTicker(instanceHeartbeat)
+	defer beat.Stop()
+	reap := time.NewTicker(reaperInterval)
+	defer reap.Stop()
+	for {
+		select {
+		case <-q.stop:
+			return
+		case <-ctx.Done():
+			return
+		case <-beat.C:
+			if err := q.heartbeat(ctx); err != nil {
+				// Losing the heartbeat means other replicas will eventually
+				// reclaim jobs this one is still running.
+				q.log.Error("instance heartbeat failed; in-flight jobs may be reclaimed by another replica",
+					"instance", q.instance, "err", err)
+			}
+		case <-reap.C:
+			q.reapDeadInstances(ctx)
+		}
+	}
+}
+
+// reapDeadInstances returns work held by replicas whose heartbeat has gone
+// stale. This is the only path that recovers a crashed replica's jobs, so
+// it must run — a missing reaper strands them permanently.
+func (q *Redisq) reapDeadInstances(ctx context.Context) {
+	cutoff := time.Now().Add(-instanceReclaimAfter).UnixMilli()
+	stale, err := q.rdb.ZRangeByScore(ctx, q.key("instances"), &redis.ZRangeBy{
+		Min: "-inf", Max: fmt.Sprintf("%d", cutoff), Count: 100,
+	}).Result()
+	if err != nil {
+		q.log.Error("scan for dead replicas failed", "err", err)
+		return
+	}
+	for _, instance := range stale {
+		if instance == q.instance {
+			continue // never reap ourselves
+		}
+		n, err := q.drainProcessing(ctx, q.instanceProcessingKey(instance))
+		if err != nil {
+			q.log.Error("reclaiming a dead replica's jobs failed", "instance", instance, "err", err)
+			continue
+		}
+		// Deregister only after the payloads are back on pending: crashing
+		// in between must leave the instance reapable, not forget it.
+		if err := q.rdb.ZRem(ctx, q.key("instances"), instance).Err(); err != nil {
+			q.log.Error("deregistering a dead replica failed", "instance", instance, "err", err)
+			continue
+		}
+		if n > 0 {
+			q.log.Warn("reclaimed in-flight jobs from a replica that stopped heartbeating",
+				"instance", instance, "jobs", n)
+		}
 	}
 }
 
@@ -148,7 +345,7 @@ func (q *Redisq) worker(ctx context.Context, handler Handler) {
 		// FIFO: tail-pop of an LPUSH list = arrival order. LMove (not a
 		// blocking variant) keeps shutdown prompt and works under
 		// miniredis; the short poll interval bounds idle latency.
-		raw, err := q.rdb.LMove(ctx, q.key("pending"), q.key("processing"), "RIGHT", "LEFT").Result()
+		raw, err := q.rdb.LMove(ctx, q.key("pending"), q.processingKey(), "RIGHT", "LEFT").Result()
 		if errors.Is(err, redis.Nil) {
 			sleepOrStop(q.stop, ctx, 100*time.Millisecond)
 			continue
@@ -198,7 +395,7 @@ func (q *Redisq) process(raw string, handler Handler) {
 }
 
 func (q *Redisq) ack(raw string) {
-	if err := q.rdb.LRem(context.Background(), q.key("processing"), 1, raw).Err(); err != nil {
+	if err := q.rdb.LRem(context.Background(), q.processingKey(), 1, raw).Err(); err != nil {
 		q.log.Error("ack (LREM processing) failed; job may redeliver", "err", err)
 	}
 }
@@ -277,6 +474,46 @@ func (q *Redisq) QueueDepth(ctx context.Context) (int, error) {
 		return 0, err
 	}
 	return int(pending + retries), nil
+}
+
+// ProcessingDepth counts payloads claimed by replicas but not yet acked,
+// across all of them.
+//
+// Deliberately NOT part of QueueDepth: that is the autoscaling signal and
+// must stay pending+retry, or scaling would chase its own in-flight work.
+// But jobs can park here — finish() leaves a payload in processing when a
+// dead-letter write fails — and without a gauge of its own that is a queue
+// nothing counts, alerts on, or times out, while the autoscaler reads zero
+// and scales to zero on top of it.
+func (q *Redisq) ProcessingDepth(ctx context.Context) (int, error) {
+	var total int64
+	// SCAN rather than walking the instances ZSET: a key whose owner was
+	// deregistered (or never registered) is exactly the stranded case this
+	// gauge exists to expose, and the ZSET would not list it.
+	var cursor uint64
+	for {
+		keys, next, err := q.rdb.Scan(ctx, cursor, q.key("processing:")+"*", 100).Result()
+		if err != nil {
+			return 0, err
+		}
+		for _, k := range keys {
+			n, err := q.rdb.LLen(ctx, k).Result()
+			if err != nil {
+				return 0, err
+			}
+			total += n
+		}
+		if next == 0 {
+			break
+		}
+		cursor = next
+	}
+	// Plus anything left in the pre-upgrade shared key.
+	legacy, err := q.rdb.LLen(ctx, q.key("processing")).Result()
+	if err != nil {
+		return 0, err
+	}
+	return int(total + legacy), nil
 }
 
 // ActiveWorkers reports jobs currently inside a handler (metrics).

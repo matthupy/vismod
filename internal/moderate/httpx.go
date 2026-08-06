@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strconv"
 	"time"
+	"unicode/utf8"
 
 	"github.com/vismod/vismod/pkg/moderation"
 )
@@ -30,6 +31,29 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n] + "…"
+}
+
+// errorBodyKeep bounds how much of a failed response is retained.
+//
+// The body is read under a 4 MiB LimitReader, but Error() only ever shows
+// the first 200 bytes. Materializing the rest as a string allocated up to
+// 4 MiB per failed attempt — on the retry path, so a 429/5xx storm did it
+// repeatedly per frame, at exactly the moment the process was already
+// under pressure. A kilobyte leaves ample room for the message plus any
+// structured error a provider puts after it.
+const errorBodyKeep = 1 << 10
+
+// retainedErrorBody keeps the head of an error body, on a rune boundary so
+// the retained text is still valid UTF-8 for logs.
+func retainedErrorBody(body []byte) string {
+	if len(body) <= errorBodyKeep {
+		return string(body)
+	}
+	b := body[:errorBodyKeep]
+	for len(b) > 0 && !utf8.Valid(b) {
+		b = b[:len(b)-1] // trim a split multi-byte rune
+	}
+	return string(b)
 }
 
 // DoJSON POSTs body and returns the response body, retrying transient
@@ -64,7 +88,7 @@ func DoJSON(ctx context.Context, client *http.Client, build func() (*http.Reques
 			} else if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 				return body, nil
 			} else {
-				herr := &HTTPError{Status: resp.StatusCode, Body: string(body)}
+				herr := &HTTPError{Status: resp.StatusCode, Body: retainedErrorBody(body)}
 				if errCodeHeader != "" {
 					herr.Code = resp.Header.Get(errCodeHeader)
 				}

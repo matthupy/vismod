@@ -33,7 +33,25 @@ type Memq struct {
 
 	mu     sync.Mutex
 	states map[JobID]string // job states: queued|running|retrying|done|dead
+	// finished is a FIFO of the ids that have reached a terminal state,
+	// oldest first, bounding how many of them states retains.
+	finished []JobID
 }
+
+// maxFinishedStates caps the terminal (done|dead) entries kept in States.
+//
+// Nothing ever deleted from this map, so it held every job id the process
+// had ever seen: memory grew with uptime, and States() copies the whole map
+// under the same mutex every setState takes — so opening the operator
+// dashboard during an incident stalled every worker's state transition, and
+// the stall got worse the longer the process had been up.
+//
+// In-flight jobs (queued|running|retrying) are always retained; only
+// finished ones age out, matching observe.JobTracker's bounded ring of
+// recent outcomes.
+const maxFinishedStates = 500
+
+func isTerminalState(s string) bool { return s == "done" || s == "dead" }
 
 type queuedJob struct {
 	job      Job
@@ -63,8 +81,22 @@ func (q *Memq) DLQ() DeadLetterSink { return q.cfg.DeadLetter }
 
 func (q *Memq) setState(id JobID, s string) {
 	q.mu.Lock()
+	defer q.mu.Unlock()
+	prev, existed := q.states[id]
 	q.states[id] = s
-	q.mu.Unlock()
+	if !isTerminalState(s) || (existed && isTerminalState(prev)) {
+		return // still in flight, or already counted as finished
+	}
+	q.finished = append(q.finished, id)
+	for len(q.finished) > maxFinishedStates {
+		// The oldest finished job ages out. Guard against a redelivered id
+		// that has since gone back in flight.
+		oldest := q.finished[0]
+		q.finished = q.finished[1:]
+		if isTerminalState(q.states[oldest]) {
+			delete(q.states, oldest)
+		}
+	}
 }
 
 // States returns a snapshot of job states (for the UI/tests).

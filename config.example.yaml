@@ -225,8 +225,12 @@ frames:
   # selects multiple workflows with overlapping output). The first
   # occurrence always survives. 0 removes exact perceptual matches only;
   # ~8 removes near-duplicates; higher gets aggressive. Jobs may override
-  # per request: "dedup_threshold": 0..64 enables at that distance, -1
-  # disables (scan: --dedup-threshold).
+  # per request: "dedup_threshold": 0..hamming_threshold enables at that
+  # distance, -1 disables (scan: --dedup-threshold). hamming_threshold is
+  # therefore also a CEILING — a job may tighten dedup or turn it off,
+  # never loosen it. Any two 64-bit dHashes are within distance 64, so an
+  # unbounded override would collapse a video into its first frame and
+  # let that frame decide the verdict.
   dedup:
     enabled: true
     hamming_threshold: 14
@@ -318,8 +322,10 @@ metrics_addr: ":9090"           # /metrics /healthz /readyz
 #   {"kind":"file","ref":"<abs path>","media_type":"image|video",
 #    "workflows":["interval","keyframe"],   # optional, any number; frames are
 #                                           # the union; omitted = default_workflow
-#    "dedup_threshold": 8}                  # optional; 0..64 enables dedup at
-#                                           # that Hamming distance, -1 disables;
+#    "dedup_threshold": 8}                  # optional; 0..hamming_threshold
+#                                           # enables dedup at that Hamming
+#                                           # distance, -1 disables; above the
+#                                           # configured ceiling is a 400;
 #                                           # omitted = frames.dedup config
 # kind:"url" takes an https URL as ref. With source.url.allow_hosts empty
 # any host is accepted; populate it to narrow. See the source: block above.

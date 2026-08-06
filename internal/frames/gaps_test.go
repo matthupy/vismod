@@ -95,7 +95,7 @@ func TestCollectPairsFramesWithShowinfoTimestamps(t *testing.T) {
 	s := NewFFmpegSource(config.FFmpegConfig{}, nil)
 
 	stderr := "n:0 pts_time:0.5 something\nn:1 pts_time:1.25 something\n"
-	got, err := s.collect(dir, stderr)
+	got, err := s.collect(dir, scanStderrText(stderr).Timestamps())
 	if err != nil {
 		t.Fatalf("collect: %v", err)
 	}
@@ -124,7 +124,7 @@ func TestCollectWithNoShowinfoUsesOrdinals(t *testing.T) {
 		t.Fatalf("write frame: %v", err)
 	}
 	s := NewFFmpegSource(config.FFmpegConfig{}, nil)
-	got, err := s.collect(dir, "no timestamps here")
+	got, err := s.collect(dir, scanStderrText("no timestamps here").Timestamps())
 	if err != nil {
 		t.Fatalf("collect: %v", err)
 	}

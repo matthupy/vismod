@@ -209,15 +209,36 @@ operator's whole control.
 The audit log is an append-only hash chain:
 `entry_hash = SHA-256(seq ‖ timestamp ‖ prev_hash ‖ JCS(payload))`.
 
-What it detects: truncation, deletion, reordering, and in-place edits —
-`vismod audit verify` reports the first broken link.
+What it detects: deletion, reordering, and in-place edits — `vismod audit
+verify` reports the first broken link.
 
-What it does NOT detect: a **full-chain rewrite** by an insider with
-write access to the log file, who can recompute every hash. Upgrades to
+Tail truncation is detected by the **head anchor**, not by the chain.
+Deleting the last N records leaves a chain that is internally perfect
+(genesis still links to 1 to 2), so the file alone cannot reveal the
+loss. Each append therefore also updates `<log>.head`, recording the
+`(seq, entry_hash)` of the last record written; verification requires the
+log to still contain that record. `Open` refuses to append to a log its
+anchor outruns, since appending would relink a valid-looking chain over
+the gap. A log written before anchoring existed has no sidecar and still
+verifies as a plain chain.
+
+Anchor scope, stated plainly: the default sidecar sits on the same
+filesystem, so an insider with write access to both can update them
+together. What it buys is that truncation is no longer a SINGLE unlogged
+operation, and that accidental loss (a partial copy, log rotation, a
+truncated restore) is always caught. For real resistance the head must
+live somewhere the writer does not control — pass it to
+`audit.VerifyWith` via `VerifyOptions.Anchor`.
+
+What it does NOT detect: a **full-chain rewrite** by an insider who holds
+both the log and the anchor and recomputes every hash. Upgrades to
 tamper-RESISTANT are the `audit.Signer` seam: HMAC or Ed25519 signing of
 each entry hash with a key the writer does not hold, or periodic
 anchoring of the head hash to an external system (ticketing, a
-transparency log, another machine).
+transparency log, another machine). Note that `Verify` is
+signature-agnostic by design — the verifying process may not hold the
+key — so checking signatures is the explicit
+`audit.VerifyWith(path, VerifyOptions{Verifier: …})` path.
 
 The log stores `SHA-256(Raw)`, the `ModelIdentity`, and the verdict —
 never provider payloads, media bytes, OCR text, or captions.

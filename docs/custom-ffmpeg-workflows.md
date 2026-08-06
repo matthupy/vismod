@@ -106,10 +106,24 @@ quoting tricks, no `$()`, no pipes.
 
 Any other placeholder fails validation.
 
+**Bare placeholders only.** An argument may contain plain text and the
+placeholders above, and nothing else — no template expressions. Function
+calls, pipelines, conditionals, loops, assignments and constants
+(`{{printf "-i"}}`, `{{if .MaxWidth}}…{{end}}`, `{{.Input | printf}}`,
+`{{$x := .Input}}`) are rejected outright.
+
+The reason is that the rules below read the argument as written. A
+template action that is not a bare placeholder renders into something
+none of those checks ever saw: `{{printf "-i"}}` is not the string `-i`
+at validation time and is exactly that when ffmpeg runs, which would
+defeat rule 1. Validation therefore inspects the template's parse tree,
+and re-checks rules 1 and 3 against the RENDERED arguments as well.
+
 ## Rules enforced by `vismod workflows validate`
 
 1. Exactly one `-i` followed by exactly `{{.Input}}`, and `{{.Input}}`
-   appears nowhere else. You cannot add a second input.
+   appears nowhere else. You cannot add a second input. Checked both as
+   written and after rendering.
 2. No remote or indirect protocols anywhere: `http:`, `https:`,
    `rtmp*:`, `concat:`, `pipe:`, `subfile:` (any comma-option form),
    `data:`, `tcp:`, `udp:`, `file:`, chained protocols, or `://`. Only
@@ -155,9 +169,11 @@ all selected workflows.
 Combining workflows often re-extracts the same moments. Enable
 `frames.dedup` to drop near-duplicate frames (dHash Hamming distance ≤
 `hamming_threshold`) before they spend moderation calls. The threshold
-is also configurable per job: `"dedup_threshold": 0..64` in the intake
-body (or `scan --dedup-threshold N`) enables dedup at that distance for
-that job even when it's off globally, and `-1` disables it for the job.
+is also configurable per job: `"dedup_threshold": 0..hamming_threshold`
+in the intake body (or `scan --dedup-threshold N`) enables dedup at that
+distance for that job even when it's off globally, and `-1` disables it
+for the job. The configured `hamming_threshold` is a ceiling — a job may
+tighten dedup, never loosen it.
 
 ## Timestamps
 

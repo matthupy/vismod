@@ -8,6 +8,14 @@
   **`vismod_queue_depth`** Prometheus gauge (pending + delayed retries).
   `QueueDepth` is uniform across drivers, so the signal is identical in
   dev (`memory`) and production (`redis`).
+- **`vismod_processing_depth`** counts jobs claimed by a replica but not
+  yet acked. It is deliberately NOT part of the scaling signal — scaling
+  on it would chase in-flight work — but it must be alerted on: a failed
+  dead-letter write parks a payload in processing, and without this gauge
+  those jobs are in a queue nothing counts, while `vismod_queue_depth`
+  reads 0 and the autoscaler scales to zero on top of them. Alert on
+  `vismod_processing_depth > 0` sustained while `vismod_queue_depth == 0`
+  and `vismod_workers_active == 0`.
 - **Multi-replica REQUIRES `queue.driver=redis`.** The memory driver is
   single-process, non-durable, at-most-once: replicas would each own a
   private queue and a crash loses jobs. `serve` warns at boot and in
@@ -75,6 +83,19 @@ backoff — safe, but wasteful; prefer budgeting.
 
 The container handles `SIGTERM` (Kubernetes default stop signal) by
 stopping intake, finishing in-flight jobs within `queue.drain_timeout`,
-and leaving anything unfinished in the Redis `processing` list, where the
-next replica's orphan recovery requeues it. Set
+and leaving anything unfinished in its own Redis processing list
+(`<prefix>:processing:<instance>`). Set
 `terminationGracePeriodSeconds` > `queue.drain_timeout`.
+
+That list is **per replica**, and it is a claim rather than a queue. A
+replica reclaims only its own list at startup; work left by a replica
+that has stopped heartbeating (`<prefix>:instances`) is returned by the
+reaper on another replica, within about a minute.
+
+This matters for autoscaling: when the processing list was a single
+shared key, every replica start moved the whole thing back to pending, so
+a scale-up, a rolling deploy, or a crashlooping pod re-queued jobs other
+replicas were actively running — paying for the vendor call and the
+webhook POST twice, and looking exactly like ordinary at-least-once
+redelivery. Rolling upgrades from a version that used the shared key are
+handled automatically: leftovers there are reclaimed once they go stale.

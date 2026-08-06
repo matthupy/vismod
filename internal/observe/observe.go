@@ -41,6 +41,7 @@ type Metrics struct {
 	AdapterRequestSeconds  *prometheus.HistogramVec
 	AdapterErrorsTotal     *prometheus.CounterVec
 	QueueDepth             prometheus.Gauge
+	ProcessingDepth        prometheus.Gauge
 	DeadletterDepth        prometheus.Gauge
 	WorkersActive          prometheus.Gauge
 	FramesScannedTotal     prometheus.Counter
@@ -66,6 +67,10 @@ func NewMetrics() *Metrics {
 		}, []string{"adapter", "code"}),
 		QueueDepth: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "vismod_queue_depth", Help: "Pending jobs; the horizontal autoscaling signal.",
+		}),
+		ProcessingDepth: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "vismod_processing_depth",
+			Help: "Jobs claimed by a replica but not yet acked. Deliberately excluded from vismod_queue_depth (the autoscaling signal); alert on this staying non-zero while queue depth is 0, which means jobs are parked in processing.",
 		}),
 		DeadletterDepth: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "vismod_deadletter_depth", Help: "Dead-letter queue depth.",
@@ -102,7 +107,7 @@ func NewMetrics() *Metrics {
 		}, []string{"reason"}),
 	}
 	reg.MustRegister(m.JobsTotal, m.AdapterRequestSeconds, m.AdapterErrorsTotal,
-		m.QueueDepth, m.DeadletterDepth, m.WorkersActive,
+		m.QueueDepth, m.ProcessingDepth, m.DeadletterDepth, m.WorkersActive,
 		m.FramesScannedTotal, m.JobFrames, m.SinkWriteFailuresTotal,
 		m.FetchSeconds, m.FetchBytesTotal, m.FetchFailuresTotal)
 	return m

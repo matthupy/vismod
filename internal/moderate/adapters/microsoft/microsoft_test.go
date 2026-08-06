@@ -1,7 +1,9 @@
 package microsoft
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -253,5 +255,39 @@ func TestMissingEndpointFailFast(t *testing.T) {
 	_, err := New(moderate.AdapterConfig{Options: map[string]any{}, Secret: secretEnv})
 	if err == nil {
 		t.Error("missing endpoint must fail at construction")
+	}
+}
+
+// encodeAnalyzeRequest replaces a json.Marshal of analyzeRequest, so it must
+// produce exactly the bytes that marshal produced — Azure is not going to
+// tell us we got the framing subtly wrong, it will just start failing.
+func TestEncodeAnalyzeRequestMatchesJSONMarshal(t *testing.T) {
+	for _, n := range []int{0, 1, 2, 3, 255, 4096} {
+		raw := make([]byte, n)
+		for i := range raw {
+			raw[i] = byte(i * 7)
+		}
+
+		var req analyzeRequest
+		req.Image.Content = base64.StdEncoding.EncodeToString(raw)
+		req.OutputType = outputTypeFourSeverity
+		want, err := json.Marshal(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		got := encodeAnalyzeRequest(raw)
+		if !bytes.Equal(got, want) {
+			t.Fatalf("n=%d:\n got %s\nwant %s", n, got, want)
+		}
+		// And it must still decode as the request Azure expects.
+		var back analyzeRequest
+		if err := json.Unmarshal(got, &back); err != nil {
+			t.Fatalf("n=%d: body does not decode: %v", n, err)
+		}
+		decoded, err := base64.StdEncoding.DecodeString(back.Image.Content)
+		if err != nil || !bytes.Equal(decoded, raw) {
+			t.Errorf("n=%d: round-trip lost the image bytes", n)
+		}
 	}
 }
