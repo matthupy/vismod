@@ -324,6 +324,42 @@ func TestDedupRemovesDuplicateFramesBeforeModeration(t *testing.T) {
 	}
 }
 
+// A per-job override may TIGHTEN dedup or disable it, never loosen it past
+// the operator's configured ceiling.
+//
+// This is a fail-open guard, not a tuning nicety. Every pair of 64-bit
+// dHashes is within Hamming distance 64, so an honored override of 64 makes
+// frame 1..N all "near-duplicates" of frame 0: one frame reaches the vendor
+// and it decides the verdict for the whole asset. Put a benign frame first
+// and an abusive clip returns allow. Intake clamps this too — the pipeline
+// re-clamps because a job can be pushed straight onto Redis without ever
+// passing intake (see SECURITY.md).
+func TestJobDedupThresholdCannotLoosenPastConfig(t *testing.T) {
+	gradient, checker := testPNGGradient(), testPNGChecker()
+	mod := &fakeModerator{scores: map[string]float64{gradient: 0.1, checker: 0.2}}
+	fs := &fakeFrameSource{contents: []string{gradient, gradient, checker}, dir: t.TempDir()}
+	p, _ := newTestPipeline(t, mod, fs)
+	p.Dedup = true
+	p.DedupThreshold = 0 // operator ceiling: exact duplicates only
+
+	j := videoJob(writeInput(t, "video-bytes"))
+	wideOpen := 64
+	j.DedupThreshold = &wideOpen
+
+	env, disp, err := p.ProcessJob(context.Background(), j)
+	if err != nil || disp != queue.Ack {
+		t.Fatalf("disp=%v err=%v", disp, err)
+	}
+	// Clamped to 0: the duplicate gradient collapses, the checker survives.
+	// Unclamped, the checker collapses too and calls would be 1.
+	if mod.calls != 2 {
+		t.Errorf("override loosened dedup past the config ceiling: adapter calls = %d, want 2", mod.calls)
+	}
+	if len(env.Result.Frames) != 2 {
+		t.Errorf("frames in result = %d, want 2 (a visually distinct frame was dropped)", len(env.Result.Frames))
+	}
+}
+
 // Per-job dedup override: enables dedup when the config has it off, and
 // disables it when the config has it on.
 func TestJobDedupThresholdOverride(t *testing.T) {

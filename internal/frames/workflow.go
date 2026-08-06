@@ -4,7 +4,9 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"sync"
 	"text/template"
+	"text/template/parse"
 
 	"github.com/vismod/vismod/internal/config"
 )
@@ -37,8 +39,8 @@ type TemplateValues struct {
 }
 
 var (
-	placeholderRe = regexp.MustCompile(`{{\s*\.?([A-Za-z0-9_.]*)\s*}}`)
-
+	// The allow-list is enforced by checkTemplateShape over the parse tree,
+	// not by matching {{...}} as text — see the comment there for why.
 	allowedPlaceholders = map[string]bool{
 		"Input": true, "WorkDir": true, "MaxFrames": true, "MaxWidth": true,
 	}
@@ -59,11 +61,13 @@ func ValidateWorkflow(name string, wf config.WorkflowConfig, cfg config.FFmpegCo
 
 	inputCount, dashICount := 0, 0
 	for i, arg := range wf.Args {
-		// Placeholder allow-list.
-		for _, m := range placeholderRe.FindAllStringSubmatch(arg, -1) {
-			if !allowedPlaceholders[m[1]] {
-				return fmt.Errorf("workflow %q: arg %d uses unknown placeholder {{.%s}} (allowed: Input, WorkDir, MaxFrames, MaxWidth)", name, i, m[1])
-			}
+		// Placeholder allow-list, enforced over the template PARSE TREE.
+		// Text matching is not sufficient here: every other check in this
+		// function reads the literal arg, so any action that is not a bare
+		// field ({{printf "-i"}}, {{if}}, {{range}}) is invisible to all of
+		// them and only appears after rendering.
+		if err := checkTemplateShape(name, i, arg); err != nil {
+			return err
 		}
 		if strings.Contains(arg, "{{.Input}}") {
 			inputCount++
@@ -115,6 +119,11 @@ func ValidateWorkflow(name string, wf config.WorkflowConfig, cfg config.FFmpegCo
 	if err != nil {
 		return fmt.Errorf("workflow %q: dry-render: %w", name, err)
 	}
+	// The literal-arg checks above ran on what the author typed; these run
+	// on what ffmpeg would actually receive. Index-independent on purpose:
+	// RenderWorkflow may prepend -nostdin, so rendered positions do not
+	// line up with wf.Args.
+	renderedDashI := 0
 	for i, arg := range rendered {
 		if err := checkForbidden(name, i, arg); err != nil {
 			return err
@@ -122,11 +131,78 @@ func ValidateWorkflow(name string, wf config.WorkflowConfig, cfg config.FFmpegCo
 		if strings.Contains(arg, "..") {
 			return fmt.Errorf("workflow %q: rendered arg %d (%q) contains path traversal", name, i, arg)
 		}
+		if arg == "-i" {
+			renderedDashI++
+		}
+		// The two absolute paths a workflow is entitled to are the bound
+		// input and anything under the pipeline-owned WorkDir.
+		if arg == "/synthetic/input.mp4" || strings.HasPrefix(arg, "/synthetic/workdir") {
+			continue
+		}
+		if looksAbsolutePath(arg) {
+			return fmt.Errorf("workflow %q: rendered arg %d (%q): absolute paths other than {{.Input}}/{{.WorkDir}} are forbidden", name, i, arg)
+		}
+	}
+	if renderedDashI != 1 {
+		return fmt.Errorf("workflow %q: rendered args contain %d \"-i\" (want exactly 1); users cannot inject a second input", name, renderedDashI)
 	}
 	if !strings.HasPrefix(rendered[len(rendered)-1], "/synthetic/workdir") {
 		return fmt.Errorf("workflow %q: rendered output escapes the WorkDir", name)
 	}
 	return nil
+}
+
+// checkTemplateShape restricts an arg to plain text plus BARE, allow-listed
+// field references — {{.Input}}, {{ .MaxWidth }} and nothing else.
+//
+// The rest of the guardrails (the -i pairing, looksAbsolutePath, output
+// confinement) read the literal arg, so they only see what the template
+// author typed. A function call, conditional, or range renders into
+// something none of them ever inspected: `{{printf "-i"}}` is not the
+// string "-i" at validation time but is exactly that at exec time, which
+// defeats "users cannot inject a second input". Walking the parse tree is
+// what makes the literal checks trustworthy — reject the shapes rather
+// than trying to predict what they render to.
+func checkTemplateShape(name string, i int, arg string) error {
+	t, err := template.New("arg").Option("missingkey=error").Parse(arg)
+	if err != nil {
+		return fmt.Errorf("workflow %q: arg %d (%q): %w", name, i, arg, err)
+	}
+	for _, n := range t.Root.Nodes {
+		switch n := n.(type) {
+		case *parse.TextNode:
+			continue
+		case *parse.ActionNode:
+			field, ok := bareField(n.Pipe)
+			if !ok {
+				return fmt.Errorf("workflow %q: arg %d (%q): only bare placeholders are allowed, not template expressions like %q (allowed: Input, WorkDir, MaxFrames, MaxWidth)", name, i, arg, n.String())
+			}
+			if !allowedPlaceholders[field] {
+				return fmt.Errorf("workflow %q: arg %d uses unknown placeholder {{.%s}} (allowed: Input, WorkDir, MaxFrames, MaxWidth)", name, i, field)
+			}
+		default:
+			return fmt.Errorf("workflow %q: arg %d (%q): template control structures are not allowed (%q)", name, i, arg, n.String())
+		}
+	}
+	return nil
+}
+
+// bareField reports the single field name in a pipeline of the exact form
+// {{.Name}} — one command, one argument, one identifier, no assignment and
+// no chained calls.
+func bareField(pipe *parse.PipeNode) (string, bool) {
+	if pipe == nil || len(pipe.Decl) != 0 || len(pipe.Cmds) != 1 {
+		return "", false
+	}
+	cmd := pipe.Cmds[0]
+	if len(cmd.Args) != 1 {
+		return "", false
+	}
+	f, ok := cmd.Args[0].(*parse.FieldNode)
+	if !ok || len(f.Ident) != 1 {
+		return "", false
+	}
+	return f.Ident[0], true
 }
 
 // forbiddenProtoNames complements forbiddenProtoRe for FFmpeg protocols
@@ -199,12 +275,41 @@ func workflowNames(cfg config.FFmpegConfig) []string {
 	return names
 }
 
+// argTemplates caches compiled templates by arg text. Workflow args come
+// from config: they are fixed at boot, already validated, and few. Parsing
+// them per arg per workflow per job rebuilt the same parse trees for the
+// life of the process.
+//
+// Keyed by the arg string rather than by workflow name so that renaming or
+// reloading a workflow cannot serve a stale tree. Bounded by the number of
+// distinct arg strings in config, so it cannot grow with traffic.
+var argTemplates sync.Map // map[string]*template.Template
+
+func argTemplate(arg string) (*template.Template, error) {
+	if t, ok := argTemplates.Load(arg); ok {
+		return t.(*template.Template), nil
+	}
+	t, err := template.New("arg").Option("missingkey=error").Parse(arg)
+	if err != nil {
+		return nil, err
+	}
+	actual, _ := argTemplates.LoadOrStore(arg, t)
+	return actual.(*template.Template), nil
+}
+
 // RenderWorkflow renders each arg through text/template with typed
 // substitution. missingkey=error double-guards the placeholder allow-list.
 func RenderWorkflow(wf config.WorkflowConfig, v TemplateValues) ([]string, error) {
 	out := make([]string, 0, len(wf.Args))
 	for i, arg := range wf.Args {
-		t, err := template.New(fmt.Sprintf("arg%d", i)).Option("missingkey=error").Parse(arg)
+		// Most args are literals ("-vf", "-nostdin", "showinfo"). Skipping
+		// the template machinery for them avoids driving reflection over
+		// TemplateValues to produce a string that was already the answer.
+		if !strings.Contains(arg, "{{") {
+			out = append(out, arg)
+			continue
+		}
+		t, err := argTemplate(arg)
 		if err != nil {
 			return nil, fmt.Errorf("arg %d (%q): %w", i, arg, err)
 		}

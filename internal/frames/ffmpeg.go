@@ -1,7 +1,6 @@
 package frames
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"log/slog"
@@ -173,34 +172,35 @@ func (s *FFmpegSource) runWorkflow(ctx context.Context, name, input, jobDir stri
 	tctx, cancel := context.WithTimeout(ctx, s.timeout())
 	defer cancel()
 	cmd := exec.CommandContext(tctx, s.cfg.FFmpegPath, args...) // arg slice, never a shell
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
+	// Bounded: showinfo logs a line per decoded frame, so the raw stream
+	// scales with the input while what we need from it does not.
+	stderr := &stderrScanner{}
+	cmd.Stderr = stderr
 	cmd.Stdout = nil
-	if err := cmd.Run(); err != nil {
+	err = cmd.Run()
+	stderr.Flush()
+	if err != nil {
 		return nil, fmt.Errorf("ffmpeg workflow %q failed: %w (stderr tail: %s)",
-			name, err, tail(stderr.String(), 400))
+			name, err, tail(stderr.Tail(), 400))
 	}
-	return s.collect(subDir, stderr.String())
+	return s.collect(subDir, stderr.Timestamps())
 }
 
 // collect lists the materialized PNGs (sorted by sequence number) and
 // attaches showinfo pts_time timestamps when available (frame index
 // otherwise).
-func (s *FFmpegSource) collect(workDir, stderr string) ([]Frame, error) {
+func (s *FFmpegSource) collect(workDir string, ts []float64) ([]Frame, error) {
 	entries, err := filepath.Glob(filepath.Join(workDir, "*.png"))
 	if err != nil {
 		return nil, err
 	}
 	sort.Strings(entries) // frame-%06d ordering == numeric ordering
 
-	ts := showinfoRe.FindAllStringSubmatch(stderr, -1)
 	frames := make([]Frame, len(entries))
 	for i, p := range entries {
 		t := float64(i) // ordinal fallback when showinfo isn't in the graph
 		if i < len(ts) {
-			if v, err := strconv.ParseFloat(ts[i][1], 64); err == nil {
-				t = v
-			}
+			t = ts[i]
 		}
 		frames[i] = Frame{Index: i, TimestampSec: t, Path: p}
 	}

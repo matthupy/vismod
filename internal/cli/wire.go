@@ -111,15 +111,21 @@ func buildPipeline(cfg config.Config, mod moderation.Moderator, sink result.Sink
 	return p
 }
 
-// validateDedupThreshold bounds a per-job dedup override: nil inherits
-// the config; -1 disables; 0..64 enables at that Hamming distance (a
-// 64-bit dHash cannot differ by more than 64 bits).
-func validateDedupThreshold(v *int) error {
+// validateDedupThreshold bounds a per-job dedup override against the
+// operator's configured ceiling: nil inherits the config; -1 disables;
+// 0..ceiling enables at that Hamming distance.
+//
+// The upper bound is the CONFIGURED threshold, not the dHash width. A
+// caller may tighten dedup or switch it off, never loosen it: any pair of
+// 64-bit dHashes is within distance 64, so a wide-open override would
+// collapse an entire video into its first frame and let that one frame
+// decide the verdict. The pipeline re-clamps at execution.
+func validateDedupThreshold(v *int, ceiling int) error {
 	if v == nil {
 		return nil
 	}
-	if *v < -1 || *v > 64 {
-		return fmt.Errorf("dedup_threshold must be -1 (disable) or 0..64, got %d", *v)
+	if *v < -1 || *v > ceiling {
+		return fmt.Errorf("dedup_threshold must be -1 (disable) or 0..%d (frames.dedup.hamming_threshold), got %d", ceiling, *v)
 	}
 	return nil
 }

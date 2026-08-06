@@ -186,3 +186,58 @@ func TestMemqDrainReportsUnstartedJobs(t *testing.T) {
 		t.Errorf("depth after drain = %d, want 0", d)
 	}
 }
+
+// States must not grow with uptime. Nothing was ever deleted, so a
+// long-running memq held every job id it had ever seen — and States()
+// copies the whole map under the mutex that every state transition takes,
+// so the dashboard opened to diagnose a stall was making it worse.
+func TestMemqBoundsFinishedStates(t *testing.T) {
+	q := NewMemq(QueueConfig{Buffer: 4, Workers: 1}, nil)
+
+	for i := range maxFinishedStates * 3 {
+		id := JobID(fmt.Sprintf("job-%d", i))
+		q.setState(id, "queued")
+		q.setState(id, "running")
+		q.setState(id, "done")
+	}
+
+	got := len(q.States())
+	if got > maxFinishedStates {
+		t.Errorf("states retained = %d, want <= %d", got, maxFinishedStates)
+	}
+	if got < maxFinishedStates {
+		t.Errorf("states retained = %d, want the full window of %d recent outcomes", got, maxFinishedStates)
+	}
+}
+
+// Aging out must never drop a job that is still in flight: the UI would
+// show it as vanished and the operator would have no way to see it running.
+func TestMemqNeverEvictsInFlightStates(t *testing.T) {
+	q := NewMemq(QueueConfig{Buffer: 4, Workers: 1}, nil)
+
+	q.setState("long-runner", "running")
+	for i := range maxFinishedStates * 2 {
+		id := JobID(fmt.Sprintf("job-%d", i))
+		q.setState(id, "done")
+	}
+
+	states := q.States()
+	if s, ok := states["long-runner"]; !ok || s != "running" {
+		t.Errorf("in-flight job evicted: state = %q, present = %v", s, ok)
+	}
+}
+
+// A terminal state set twice for the same id must not consume two slots in
+// the window, or the retained history silently shrinks.
+func TestMemqTerminalStateIsCountedOnce(t *testing.T) {
+	q := NewMemq(QueueConfig{Buffer: 4, Workers: 1}, nil)
+	for range 10 {
+		q.setState("job-1", "done")
+	}
+	if got := len(q.finished); got != 1 {
+		t.Errorf("finished entries = %d, want 1", got)
+	}
+	if got := len(q.States()); got != 1 {
+		t.Errorf("states = %d, want 1", got)
+	}
+}

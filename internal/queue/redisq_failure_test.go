@@ -6,6 +6,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 )
 
 // failingDLQ stands in for a Redis dead-letter write that fails. Swapped in
@@ -18,11 +20,13 @@ func (f failingDLQ) Write(context.Context, DeadLetterEntry) error {
 }
 func (f failingDLQ) Depth(context.Context) (int, error) { return f.depth, nil }
 
-func llen(t *testing.T, q *Redisq, list string) int {
+// processingLen counts this replica's in-flight payloads. The processing
+// list is per-replica, so there is no single shared key to count.
+func processingLen(t *testing.T, q *Redisq) int {
 	t.Helper()
-	n, err := q.rdb.LLen(context.Background(), q.key(list)).Result()
+	n, err := q.rdb.LLen(context.Background(), q.processingKey()).Result()
 	if err != nil {
-		t.Fatalf("LLEN %s: %v", list, err)
+		t.Fatalf("LLEN %s: %v", q.processingKey(), err)
 	}
 	return int(n)
 }
@@ -138,7 +142,7 @@ func TestRedisqPoisonPayloadIsDeadLettered(t *testing.T) {
 	}, "poison payload dead-lettered")
 	_ = q.Close(context.Background())
 
-	if n := llen(t, q, "processing"); n != 0 {
+	if n := processingLen(t, q); n != 0 {
 		t.Errorf("processing holds %d payloads after dead-lettering, want 0 (it was acked)", n)
 	}
 }
@@ -159,7 +163,7 @@ func TestRedisqFailedDeadLetterWriteLeavesJobInProcessing(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	waitFor(t, 3*time.Second, func() bool { return llen(t, q, "processing") == 1 }, "undeliverable dead letter stays in processing")
+	waitFor(t, 3*time.Second, func() bool { return processingLen(t, q) == 1 }, "undeliverable dead letter stays in processing")
 	_ = q.Close(context.Background())
 }
 
@@ -194,7 +198,7 @@ func TestRedisqRetryScheduleFailureLeavesJobInProcessing(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 	mr.SetError("") // recover so the assertions below can read Redis
 
-	if n := llen(t, q, "processing"); n != 1 {
+	if n := processingLen(t, q); n != 1 {
 		t.Errorf("processing holds %d payloads, want 1 (an unschedulable retry must not be acked)", n)
 	}
 	_ = q.Close(context.Background())
@@ -284,4 +288,125 @@ func TestRedisqCloseHonorsCallerCancellation(t *testing.T) {
 		t.Error("Close with a cancelled context must report the aborted drain")
 	}
 	close(release)
+}
+
+// The reaper is the only path that returns a crashed replica's work, so a
+// Redis failure during the sweep must be survivable and must not deregister
+// an instance whose payloads were never moved — that would strand them
+// permanently.
+func TestRedisqReaperSurvivesRedisFailure(t *testing.T) {
+	rdb, mr := newMini(t)
+	ctx := context.Background()
+
+	q := NewRedisq(QueueConfig{Workers: 1}, rdb, "vismod-test", nil)
+	mr.Close() // Redis goes away mid-sweep
+	q.reapDeadInstances(ctx)
+	// The assertion is that this returned rather than panicking or hanging.
+}
+
+// A replica must never reclaim its own in-flight jobs from under itself,
+// even if its own heartbeat is stale (a long GC pause, a Redis blip).
+func TestRedisqReaperSkipsItself(t *testing.T) {
+	rdb, _ := newMini(t)
+	ctx := context.Background()
+
+	q := NewRedisq(QueueConfig{Workers: 1}, rdb, "vismod-test", nil)
+	if _, err := q.Enqueue(ctx, job("mine")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rdb.LMove(ctx, "vismod-test:pending", q.processingKey(), "RIGHT", "LEFT").Result(); err != nil {
+		t.Fatal(err)
+	}
+	// Our own heartbeat is stale.
+	if err := rdb.ZAdd(ctx, "vismod-test:instances", redis.Z{
+		Score: float64(time.Now().Add(-10 * instanceReclaimAfter).UnixMilli()), Member: q.instance,
+	}).Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	q.reapDeadInstances(ctx)
+
+	n, err := rdb.LLen(ctx, q.processingKey()).Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Errorf("in-flight payloads = %d, want 1: the replica reaped its own running job", n)
+	}
+}
+
+// registerLegacyIfPresent must be a no-op when there is nothing in the
+// pre-upgrade key, or every fresh deployment registers a phantom instance.
+func TestRedisqDoesNotRegisterAnEmptyLegacyKey(t *testing.T) {
+	rdb, _ := newMini(t)
+	ctx := context.Background()
+
+	q := NewRedisq(QueueConfig{Workers: 1}, rdb, "vismod-test", nil)
+	if err := q.registerLegacyIfPresent(ctx); err != nil {
+		t.Fatal(err)
+	}
+	members, err := rdb.ZRange(ctx, "vismod-test:instances", 0, -1).Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range members {
+		if m == legacyInstance {
+			t.Error("registered a legacy instance with no payloads behind it")
+		}
+	}
+}
+
+// Start must fail loudly when Redis is unreachable: a replica that cannot
+// register is invisible to every other replica's reaper, so its jobs would
+// never be reclaimed if it died.
+func TestRedisqStartFailsWhenItCannotRegister(t *testing.T) {
+	rdb, mr := newMini(t)
+	q := NewRedisq(QueueConfig{Workers: 1}, rdb, "vismod-test", nil)
+	mr.Close()
+
+	err := q.Start(context.Background(), func(context.Context, Job) (Disposition, error) {
+		return Ack, nil
+	})
+	if err == nil {
+		t.Fatal("Start must fail when the instance cannot be registered")
+	}
+}
+
+// ProcessingDepth is a diagnostic; a Redis failure must surface as an error
+// rather than a plausible-looking zero.
+func TestRedisqProcessingDepthReportsRedisFailure(t *testing.T) {
+	rdb, mr := newMini(t)
+	q := NewRedisq(QueueConfig{Workers: 1}, rdb, "vismod-test", nil)
+	mr.Close()
+
+	if _, err := q.ProcessingDepth(context.Background()); err == nil {
+		t.Error("ProcessingDepth returned success with Redis down; a zero here reads as 'nothing stranded'")
+	}
+}
+
+// recoverOrphans logs and requeues whatever this instance left behind.
+func TestRedisqRecoverOrphansRequeuesOwnPayloads(t *testing.T) {
+	rdb, _ := newMini(t)
+	ctx := context.Background()
+
+	q := NewRedisq(QueueConfig{Workers: 1}, rdb, "vismod-test", nil)
+	for _, id := range []string{"a", "b"} {
+		if _, err := q.Enqueue(ctx, job(id)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := rdb.LMove(ctx, "vismod-test:pending", q.processingKey(), "RIGHT", "LEFT").Result(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := q.recoverOrphans(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n := processingLen(t, q); n != 0 {
+		t.Errorf("processing holds %d payloads after recovery, want 0", n)
+	}
+	depth, err := q.QueueDepth(ctx)
+	if err != nil || depth != 2 {
+		t.Errorf("depth = %d (%v), want 2: recovered jobs must be back on pending", depth, err)
+	}
 }

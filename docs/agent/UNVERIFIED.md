@@ -157,3 +157,75 @@ the only gate on that.
 whose query string must not appear in the envelope, audit record, logs,
 or metric labels), plus a rebinding test using a resolver that returns a
 public address then the metadata address, plus a green `-race` run in CI.
+
+## Per-replica Redis processing lists have never run on real Redis
+
+**Claimed:** a booting replica no longer re-queues jobs that other live
+replicas are processing, work from a replica that stops heartbeating is
+reclaimed within ~60s, and payloads left in the pre-upgrade shared
+`<prefix>:processing` key are reclaimed after a rolling upgrade.
+
+**Actually tested:** miniredis only, in-process, with time simulated by
+writing stale scores directly into the `<prefix>:instances` ZSET.
+`TestRedisqStartDoesNotStealLiveReplicasWork` was confirmed to FAIL
+against the old shared-key behavior (the job was handled twice) and to
+pass after the change, so the test does discriminate. But miniredis is
+not Redis: `SCAN` semantics under concurrent writes, `LMOVE` behavior
+against a real server, and the heartbeat's behavior across an actual
+network partition are all unexercised. No test runs two real processes.
+
+The reaper is now load-bearing in a way orphan recovery never was:
+instance ids are random, so a crashed replica's jobs are reclaimed ONLY
+by another replica's reaper. If the reaper is broken in production,
+those jobs are stranded silently rather than redelivered — the failure
+mode moved, it did not disappear. `vismod_processing_depth` exists to
+make that visible; nothing alerts on it automatically.
+
+`instanceReclaimAfter` (60s) is a guess. It must exceed the worst
+heartbeat gap under GC pause plus Redis latency, and it has not been
+measured under load.
+
+**Proves it:** two real `vismod serve` processes against a real Redis —
+one holding a long job while the other boots (no duplicate handling),
+then SIGKILL one and confirm its in-flight jobs are redelivered within
+the reclaim window and its instance is deregistered; plus a rolling
+upgrade from the previous version with payloads in the shared key.
+
+## The 2026-08-05 review changes have not been run under -race
+
+**Claimed:** the new concurrent state — `frames.argTemplates`
+(`sync.Map`), the time-based sweep in `result.dedupe`, the bounded
+`finished` slice in `memq.setState`, and redisq's heartbeat/reaper
+goroutines — is race-free.
+
+**Actually tested:** `go test ./...` without `-race` (this dev box has no
+C compiler). `TestDedupeConcurrentClaimYieldsExactlyOneWinner` exercises
+`dedupe` under concurrency but proves mutual exclusion, not the absence
+of a data race.
+
+**Proves it:** a green `go test -race ./...` in CI.
+
+## dHash values changed for images larger than 8px per grid cell
+
+**Claimed:** bounded per-cell sampling does not meaningfully change which
+frames dedup collapses.
+
+**Actually tested:** the typed `lumaSampler` fast paths are proven
+bit-identical to the interface path
+(`TestLumaSamplerFastPathsMatchTheGenericPath`), and `step` is proven to
+stay 1 for small cells, so every existing dedup test hashes exactly as
+before. The SAMPLING change is different: for a frame larger than
+72x64px the cell average is now computed from at most 8x8 samples per
+cell rather than every pixel, so a hash bit CAN flip where a cell average
+sat on a boundary. No before/after comparison was run over real video
+frames.
+
+The blast radius is bounded — a flipped bit changes Hamming distance by
+1, so it can only matter for frame pairs sitting exactly on the
+threshold, and dedup never empties a non-empty set — but "the same frames
+are dropped" is not proven.
+
+**Proves it:** hashing a corpus of real extracted frames with the old and
+new samplers and reporting the distribution of Hamming-distance deltas,
+plus the count of pairs whose keep/drop decision changes at the shipped
+threshold.

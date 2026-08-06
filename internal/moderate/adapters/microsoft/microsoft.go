@@ -136,6 +136,30 @@ type analyzeRequest struct {
 	OutputType string `json:"outputType"`
 }
 
+const outputTypeFourSeverity = "FourSeverityLevels"
+
+// encodeAnalyzeRequest writes the analyze body in one pass.
+//
+// The obvious spelling — base64 into a string, then json.Marshal the struct
+// — holds three copies of the frame at once: the raw bytes, the base64
+// string, and marshal's output. At frames.concurrency in-flight frames of
+// up to maxImageBytes that is the largest resident allocation in the
+// process, and it is all avoidable: the base64 alphabet contains no
+// character JSON escapes, and the encoded length is known exactly, so the
+// body can be built into a single right-sized buffer.
+//
+// It must stay byte-identical to the json.Marshal form; the test asserts
+// that against marshal itself rather than against a hand-written literal.
+func encodeAnalyzeRequest(raw []byte) []byte {
+	const prefix = `{"image":{"content":"`
+	const suffix = `"},"outputType":"` + outputTypeFourSeverity + `"}`
+
+	buf := make([]byte, 0, len(prefix)+base64.StdEncoding.EncodedLen(len(raw))+len(suffix))
+	buf = append(buf, prefix...)
+	buf = base64.StdEncoding.AppendEncode(buf, raw)
+	return append(buf, suffix...)
+}
+
 type analyzeResponse struct {
 	CategoriesAnalysis []struct {
 		Category string `json:"category"`
@@ -157,13 +181,7 @@ func (m *Moderator) AnalyzeImage(ctx context.Context, img moderation.Image) (mod
 		return moderation.NormalizedResult{}, fmt.Errorf("microsoft: image %d bytes exceeds 4 MB limit (terminal)", len(img.Bytes))
 	}
 
-	var req analyzeRequest
-	req.Image.Content = base64.StdEncoding.EncodeToString(img.Bytes)
-	req.OutputType = "FourSeverityLevels"
-	body, err := json.Marshal(req)
-	if err != nil {
-		return moderation.NormalizedResult{}, err
-	}
+	body := encodeAnalyzeRequest(img.Bytes)
 
 	url := fmt.Sprintf("%s/contentsafety/image:analyze?api-version=%s", m.opts.Endpoint, m.opts.APIVersion)
 	respBody, err := moderate.DoJSON(ctx, m.client, func() (*http.Request, error) {

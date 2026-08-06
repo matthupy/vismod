@@ -40,11 +40,19 @@ audit record.
 
 The log is **tamper-evident, not tamper-proof.**
 
-Anyone with write access to the file can truncate it, or rewrite it from
-some point forward and recompute every subsequent hash — the chain will
-verify clean. What the chain actually catches is *modification in place*
-without rehashing, which is the accidental and casual case, not the
-determined one.
+Anyone with write access to the file can rewrite it from some point
+forward and recompute every subsequent hash — the chain will verify
+clean. What the chain actually catches is *modification in place* without
+rehashing, which is the accidental and casual case, not the determined
+one.
+
+Truncating the tail is caught separately, by the head anchor written
+alongside the log (`<log>.head`): it records the last `(seq,
+entry_hash)`, and verification requires that record to still be present.
+Because the default anchor lives next to the log, an insider can update
+both — but truncation is then two coordinated writes rather than one, and
+accidental loss is always caught. Hold the anchor elsewhere and pass it
+to `audit.VerifyWith` to close that gap.
 
 If you need tamper-*proof*, the chain head has to be published somewhere
 you don't control (a timestamping service, a second system's log, an

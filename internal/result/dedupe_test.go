@@ -1,8 +1,10 @@
 package result
 
 import (
+	"fmt"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/vismod/vismod/internal/queue"
 )
@@ -56,5 +58,65 @@ func TestDedupeConcurrentClaimYieldsExactlyOneWinner(t *testing.T) {
 	wg.Wait()
 	if wins != 1 {
 		t.Errorf("exactly one goroutine must win the claim, got %d", wins)
+	}
+}
+
+// The claim map must not grow with uptime. Left unbounded it OOM-killed
+// long-running serve pods, and the restart reset idempotency — so the leak
+// caused the duplicate writes the map exists to prevent.
+func TestDedupeExpiresOldClaims(t *testing.T) {
+	now := time.Now()
+	d := dedupe{
+		now:    func() time.Time { return now },
+		retain: 10 * time.Minute,
+	}
+
+	for i := range 1000 {
+		if !d.Claim(queue.JobID(fmt.Sprintf("job-%d", i))) {
+			t.Fatalf("claim %d must succeed", i)
+		}
+	}
+	if got := len(d.written); got != 1000 {
+		t.Fatalf("claims held = %d, want 1000", got)
+	}
+
+	// Past the retention window, a sweep must drop them.
+	now = now.Add(11 * time.Minute)
+	d.Claim("trigger-sweep")
+	if got := len(d.written); got != 1 {
+		t.Errorf("claims held after expiry = %d, want 1 (only the trigger)", got)
+	}
+}
+
+// Expiry must not be so eager that it breaks idempotency: within the
+// window a redelivery is still recognized as a duplicate.
+func TestDedupeStillDedupesWithinTheWindow(t *testing.T) {
+	now := time.Now()
+	d := dedupe{
+		now:    func() time.Time { return now },
+		retain: time.Hour,
+	}
+	if !d.Claim("job-1") {
+		t.Fatal("first claim must succeed")
+	}
+	// Well past the sweep interval but inside the retention window: this
+	// is the ordinary queue-retry case.
+	now = now.Add(5 * time.Minute)
+	if d.Claim("job-1") {
+		t.Error("a redelivery inside the retention window must not re-claim")
+	}
+}
+
+// The sweep is O(n) under the lock, so it must be rate-limited rather than
+// running on every write.
+func TestDedupeSweepIsRateLimited(t *testing.T) {
+	now := time.Now()
+	d := dedupe{now: func() time.Time { return now }, retain: time.Nanosecond}
+
+	d.Claim("job-1")
+	now = now.Add(time.Second) // past retention, but under the sweep interval
+	d.Claim("job-2")
+	if len(d.written) != 2 {
+		t.Errorf("claims held = %d, want 2: the sweep ran before its interval elapsed", len(d.written))
 	}
 }

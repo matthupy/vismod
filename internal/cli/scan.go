@@ -45,9 +45,13 @@ JSON-lines result envelope per file to stdout.
 (repeatable, or comma-separated); frames are the union across the
 selected workflows. Omitted = the configured default workflow.
 
---dedup-threshold overrides frames.dedup for this scan: 0..64 enables
-near-duplicate removal at that Hamming distance, -1 disables it.
-Omitted = the configured behavior.
+--dedup-threshold overrides frames.dedup for this scan: 0 up to the
+configured frames.dedup.hamming_threshold enables near-duplicate removal
+at that Hamming distance, -1 disables it. Omitted = the configured
+behavior. The configured threshold is a ceiling — a scan may tighten
+dedup or turn it off, never loosen it, because a wide-open threshold
+makes every frame a duplicate of the first and lets that one frame decide
+the verdict.
 
 --metadata attaches an opaque JSON object to every envelope this
 invocation emits, for correlating verdicts with your own records. vismod
@@ -123,7 +127,7 @@ func runScan(ctx context.Context, out io.Writer, args []string, opts scanOptions
 	if err := validateWorkflowSelection(cfg, opts.Workflows); err != nil {
 		return 0, err
 	}
-	if err := validateDedupThreshold(opts.DedupThreshold); err != nil {
+	if err := validateDedupThreshold(opts.DedupThreshold, cfg.Frames.Dedup.HammingThreshold); err != nil {
 		return 0, err
 	}
 
@@ -211,7 +215,7 @@ func registerScanFlags(cmd *cobra.Command) {
 	cmd.Flags().StringSliceVar(&scanWorkflows, "workflow", nil,
 		"FFmpeg workflow(s) for video inputs (repeatable or comma-separated); default: configured default_workflow")
 	cmd.Flags().IntVar(&scanDedupThreshold, "dedup-threshold", 0,
-		"near-duplicate removal override: 0..64 = Hamming threshold, -1 = disable; default: configured frames.dedup")
+		"near-duplicate removal override: 0..frames.dedup.hamming_threshold = Hamming threshold, -1 = disable; default: configured frames.dedup")
 	cmd.Flags().StringVar(&scanMetadata, "metadata", "",
 		"opaque JSON object echoed back on each result envelope; vismod never interprets it")
 }

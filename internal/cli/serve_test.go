@@ -31,6 +31,13 @@ func intakeConfig() config.Config {
 		FFmpeg: config.FFmpegConfig{
 			Workflows: map[string]config.WorkflowConfig{"keyframes": {Description: "test"}},
 		},
+		// Matches config.Defaults(): the per-job dedup ceiling comes from
+		// here, so leaving it zero would test a stricter bound than any
+		// real deployment runs.
+		Frames: config.FramesConfig{
+			Concurrency: 4,
+			Dedup:       config.DedupConfig{Enabled: false, HammingThreshold: 8},
+		},
 	}
 }
 
@@ -204,6 +211,11 @@ func TestIntakeRejectsBadRequests(t *testing.T) {
 		{"unknown workflow", `{"kind":"file","ref":"a.mp4","workflows":["nope"]}`},
 		{"dedup threshold too high", `{"kind":"file","ref":"a.mp4","dedup_threshold":65}`},
 		{"dedup threshold below -1", `{"kind":"file","ref":"a.mp4","dedup_threshold":-2}`},
+		// Within the dHash width but ABOVE the configured ceiling of 8. At 64
+		// every frame is a near-duplicate of frame 0, so honoring this would
+		// scan one frame and let it decide the whole video's verdict.
+		{"dedup threshold loosens past the config ceiling", `{"kind":"file","ref":"a.mp4","dedup_threshold":64}`},
+		{"dedup threshold one past the config ceiling", `{"kind":"file","ref":"a.mp4","dedup_threshold":9}`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -221,11 +233,13 @@ func TestIntakeRejectsBadRequests(t *testing.T) {
 	}
 }
 
-// TestIntakeAcceptsValidDedupOverrides: -1 (disable) and 0..64 are the
+// TestIntakeAcceptsValidDedupOverrides: -1 (disable) and 0..ceiling are the
 // documented per-job range, and the override must reach the job unchanged —
-// a dropped override silently reverts to the global config.
+// a dropped override silently reverts to the global config. The ceiling is
+// frames.dedup.hamming_threshold (8 in intakeConfig); a job may tighten
+// dedup or switch it off, never loosen it.
 func TestIntakeAcceptsValidDedupOverrides(t *testing.T) {
-	for _, v := range []int{-1, 0, 8, 64} {
+	for _, v := range []int{-1, 0, 4, 8} {
 		q := testMemq(t)
 		h := newIntake(t, intakeConfig(), q, openBackpressure(), &intakeSwitch{})
 

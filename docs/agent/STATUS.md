@@ -278,12 +278,52 @@ in `internal/queue`, not `internal/cli`, because `internal/cli` imports
 `internal/pipeline` and a cli-side validator would have created an
 import cycle; noted as a deviation from the design spec.
 
+Latest: a full-repo review pass (2026-08-05) landed four fail-safe
+fixes, four hot-path optimizations, and per-replica Redis processing
+lists.
+
+Fail-safe: the per-job `dedup_threshold` is now capped at
+`frames.dedup.hamming_threshold` — it accepted 0..64, and 64 makes every
+frame a near-duplicate of frame 0, so a caller could reduce a whole video
+to one benign frame and get `allow` (clamped at intake AND in the
+pipeline). Workflow guardrails now validate the template PARSE TREE and
+re-check the `-i` count and absolute paths against RENDERED args; the
+old text matching saw only bare `{{.X}}`, so `{{printf "-i"}}` plus
+`{{printf "/etc/%s" "passwd"}}` passed every check and injected a second
+input. The audit log gained a head anchor (`<log>.head`) so TAIL
+truncation is detectable — deleting the last N records left a chain that
+verified perfectly, contradicting SECURITY.md — and `Open` refuses to
+append to a truncated log. `audit.VerifyWith` is the new opt-in seam for
+checking signatures (`Verify` stays signature-agnostic by design).
+
+Performance, measured: dHash 68ms -> 23ms per 1080p RGBA frame with
+allocations 2,073,629 -> 28 (bounded per-cell sampling plus typed
+`lumaSampler` fast paths that are bit-identical to the interface path);
+workflow render 14.6us -> 2.4us (compiled-template cache plus a literal
+fast path); the microsoft adapter builds its body in one right-sized
+buffer instead of holding raw + base64 string + marshal copy; ffmpeg
+stderr is bounded by a streaming scanner that extracts pts_time as it
+arrives instead of buffering one showinfo line per frame.
+
+Leaks: sink claim maps now expire (1h window) and memq keeps a bounded
+window of finished job states; both grew for the life of the process.
+
+Redis: the processing list is per-replica with instance heartbeats and a
+reaper. It was one shared key that every Start drained, so a scale-up,
+rolling deploy, or crashloop re-ran jobs live replicas were processing —
+double-billing the vendor. `vismod_processing_depth` is exported so
+parked jobs are visible without polluting the autoscaling signal.
+
 ## Gate status
 
 `go build ./...`, `go vet ./...`, `go test ./...` all pass locally as of
-2026-08-03. CI on PR #40 is green on all four jobs (build & test, lint,
+2026-08-05. Total coverage 93.0%; coverage of the code changed in the
+2026-08-05 review pass is 93.2% (492/528 statements).
+
+CI on PR #40 is green on all four jobs (build & test, lint,
 vulnerability scan, docker build & smoke) — the only `-race` evidence
-that exists, since that job cannot run on this box.
+that exists, since that job cannot run on this box. The 2026-08-05
+changes have NOT had a `-race` run (see UNVERIFIED.md).
 
 ## In flight
 

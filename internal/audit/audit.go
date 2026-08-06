@@ -34,6 +34,42 @@ type Signer interface {
 	Sign(entryHash []byte) ([]byte, error)
 }
 
+// Verifier is the read side of Signer. Verify (and `vismod audit verify`)
+// stay signature-agnostic by design — checking a signature requires the key,
+// which the verifying process may not hold. Pass a Verifier to VerifyWith
+// when it does; without one, a signed log is still only chain-verified and
+// the signature is decoration.
+type Verifier interface {
+	VerifySignature(entryHash, signature []byte) error
+}
+
+// Head is the anchor: the (seq, entry_hash) of the last record known to
+// have been written. It is what makes TAIL truncation detectable.
+//
+// Dropping the final N records leaves a chain that is internally perfect —
+// genesis still links to 1 to 2 — so nothing inside the file can reveal the
+// loss. Verify compares the file against this anchor instead.
+//
+// Honest scope, consistent with the package doc: the default anchor is a
+// sidecar on the same filesystem, so an insider with write access to both
+// can update them together. What it buys is that truncation is no longer a
+// SINGLE unlogged operation, and that accidental loss (partial copy, log
+// rotation, truncated restore) is always caught. Real resistance needs the
+// head shipped off-box — pass VerifyOptions.Anchor from wherever that is.
+type Head struct {
+	Seq       uint64 `json:"seq"`
+	EntryHash string `json:"entry_hash"`
+}
+
+// VerifyOptions configures VerifyWith. The zero value equals Verify.
+type VerifyOptions struct {
+	// Anchor is the expected head. Nil reads the sidecar next to the log;
+	// pass one explicitly to check against an externally-held head.
+	Anchor *Head
+	// Verifier checks each record's signature. Nil skips signatures.
+	Verifier Verifier
+}
+
 // Record is one audit log line.
 type Record struct {
 	Seq       uint64            `json:"seq"`
@@ -54,6 +90,7 @@ var genesisPrev = make([]byte, 32)
 type Log struct {
 	mu     sync.Mutex
 	f      *os.File
+	path   string
 	seq    uint64
 	prev   []byte
 	seen   map[string]bool
@@ -69,7 +106,7 @@ func Open(path string, signer Signer) (*Log, error) {
 	if err != nil {
 		return nil, fmt.Errorf("audit: replay %s: %w", path, err)
 	}
-	l := &Log{seen: map[string]bool{}, prev: genesisPrev, signer: signer}
+	l := &Log{seen: map[string]bool{}, prev: genesisPrev, signer: signer, path: path}
 	for i, r := range existing {
 		if err := verifyRecord(r, uint64(i+1), l.prev); err != nil {
 			return nil, fmt.Errorf("audit: existing chain is broken at seq %d: %w (refusing to append to a tampered log)", r.Seq, err)
@@ -79,6 +116,12 @@ func Open(path string, signer Signer) (*Log, error) {
 		if id := r.Payload["job_id"]; id != "" {
 			l.seen[id] = true
 		}
+	}
+	// Refuse a truncated log for the same reason a broken chain is fatal:
+	// appending would relink a valid-looking chain over the gap, which
+	// destroys the only evidence that records went missing.
+	if err := checkAnchor(path, existing, nil); err != nil {
+		return nil, fmt.Errorf("%w (refusing to append to a truncated log)", err)
 	}
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
@@ -138,6 +181,13 @@ func (l *Log) appendLocked(payload map[string]string) error {
 	}
 	if _, err := l.f.Write(append(line, '\n')); err != nil {
 		return fmt.Errorf("audit: append: %w", err)
+	}
+	// Advance the anchor after the record is on disk, never before: an
+	// anchor ahead of the log is indistinguishable from truncation and
+	// would fail every later verification. Lagging by one after a crash is
+	// the safe direction and checkAnchor tolerates it.
+	if err := writeHead(l.path, Head{Seq: seq, EntryHash: rec.EntryHash}); err != nil {
+		return fmt.Errorf("audit: write head anchor: %w", err)
 	}
 	l.seq = seq
 	l.prev = entry
@@ -247,8 +297,15 @@ func writeJCSString(buf *bytes.Buffer, s string) error {
 }
 
 // Verify recomputes the whole chain at path and returns the number of
-// valid records, reporting the FIRST broken link it finds.
+// valid records, reporting the FIRST broken link it finds. It also checks
+// the log against its head anchor, which is what detects tail truncation.
+// Signatures are not checked; see Verifier and VerifyWith.
 func Verify(path string) (int, error) {
+	return VerifyWith(path, VerifyOptions{})
+}
+
+// VerifyWith is Verify with an explicit anchor and/or signature verifier.
+func VerifyWith(path string, opts VerifyOptions) (int, error) {
 	records, err := readRecords(path)
 	if err != nil {
 		return 0, err
@@ -258,9 +315,111 @@ func Verify(path string) (int, error) {
 		if err := verifyRecord(r, uint64(i+1), prev); err != nil {
 			return i, fmt.Errorf("audit: chain broken at seq %d (record %d): %w", r.Seq, i+1, err)
 		}
+		if opts.Verifier != nil {
+			if err := verifySignature(opts.Verifier, r); err != nil {
+				return i, fmt.Errorf("audit: signature invalid at seq %d (record %d): %w", r.Seq, i+1, err)
+			}
+		}
+		prev, _ = hex.DecodeString(r.EntryHash)
+	}
+	if err := checkAnchor(path, records, opts.Anchor); err != nil {
+		return len(records), err
+	}
+	return len(records), nil
+}
+
+// checkAnchor reports whether the log still contains the record the anchor
+// names. A chain LONGER than the anchor is normal — a crash between the
+// append and the anchor update leaves the anchor one behind, and refusing
+// that would make ordinary recovery look like an attack.
+func checkAnchor(path string, records []Record, anchor *Head) error {
+	if anchor == nil {
+		h, ok, err := readHead(path)
+		if err != nil {
+			return fmt.Errorf("audit: read head anchor: %w", err)
+		}
+		if !ok {
+			return nil // logs written before anchoring: chain-only
+		}
+		anchor = &h
+	}
+	if anchor.Seq == 0 {
+		return nil
+	}
+	if uint64(len(records)) < anchor.Seq {
+		return fmt.Errorf("audit: log is truncated: head anchor names seq %d but the log ends at seq %d (%d record(s) missing)",
+			anchor.Seq, len(records), anchor.Seq-uint64(len(records)))
+	}
+	if got := records[anchor.Seq-1].EntryHash; got != anchor.EntryHash {
+		return fmt.Errorf("audit: record at seq %d does not match the head anchor (rewritten history)", anchor.Seq)
+	}
+	return nil
+}
+
+func verifySignature(v Verifier, r Record) error {
+	if r.Signature == "" {
+		return fmt.Errorf("record is unsigned")
+	}
+	sig, err := hex.DecodeString(r.Signature)
+	if err != nil {
+		return fmt.Errorf("malformed signature: %w", err)
+	}
+	entry, err := hex.DecodeString(r.EntryHash)
+	if err != nil {
+		return fmt.Errorf("malformed entry_hash: %w", err)
+	}
+	return v.VerifySignature(entry, sig)
+}
+
+// verifyChainOnly is the pre-anchor behavior, kept for tests that need to
+// show a truncated chain is self-consistent.
+func verifyChainOnly(path string) (int, error) {
+	records, err := readRecords(path)
+	if err != nil {
+		return 0, err
+	}
+	prev := genesisPrev
+	for i, r := range records {
+		if err := verifyRecord(r, uint64(i+1), prev); err != nil {
+			return i, err
+		}
 		prev, _ = hex.DecodeString(r.EntryHash)
 	}
 	return len(records), nil
+}
+
+// headPath is the anchor sidecar for a log at path.
+func headPath(path string) string { return path + ".head" }
+
+// writeHead replaces the anchor atomically: a torn anchor would fail every
+// subsequent verification and look exactly like tampering.
+func writeHead(path string, h Head) error {
+	b, err := json.Marshal(h)
+	if err != nil {
+		return err
+	}
+	tmp := headPath(path) + ".tmp"
+	if err := os.WriteFile(tmp, append(b, '\n'), 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, headPath(path))
+}
+
+// readHead loads the anchor. A missing sidecar is not an error: logs
+// written before anchoring existed must stay verifiable.
+func readHead(path string) (Head, bool, error) {
+	b, err := os.ReadFile(headPath(path))
+	if os.IsNotExist(err) {
+		return Head{}, false, nil
+	}
+	if err != nil {
+		return Head{}, false, err
+	}
+	var h Head
+	if err := json.Unmarshal(bytes.TrimSpace(b), &h); err != nil {
+		return Head{}, false, fmt.Errorf("malformed head anchor %s: %w", headPath(path), err)
+	}
+	return h, true, nil
 }
 
 func verifyRecord(r Record, wantSeq uint64, prev []byte) error {
