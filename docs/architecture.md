@@ -36,7 +36,7 @@ configured sinks, recorded in the audit log, and only then acked.
 | `internal/config/` | Viper loader, thresholds, workflows, `ConfigHash` |
 | `internal/moderate/` | Adapter registry, rate limiter, retrying HTTP; `adapters/*` |
 | `internal/frames/` | ffmpeg extraction, workflow guardrails, dHash dedup |
-| `internal/queue/` | `memq` (dev) and `redisq` (durable, at-least-once) |
+| `internal/queue/` | `memq` (dev) and `redisq` (durable, at-least-once, per-replica claims) |
 | `internal/pipeline/` | frames → dedup → fan-out → thresholds → rollup → sink |
 | `internal/result/` | Result envelope + `Sink` implementations |
 | `internal/audit/` | Append-only hash-chained decision log |
@@ -70,7 +70,12 @@ intake API); the extracted frame set is their **union**, capped by
 
 An optional `frames.dedup` stage drops near-duplicate frames by dHash
 Hamming distance before they spend moderation calls — worth a lot on
-static-camera or slideshow content, worth little on fast cuts.
+static-camera or slideshow content, worth little on fast cuts. The hash
+is computed from a bounded sample per grid cell rather than every pixel,
+so cost does not grow with frame size; for frames above roughly 72x64 a
+hash bit can differ from a full scan, and no before/after comparison over
+real footage has been run
+([UNVERIFIED.md](agent/UNVERIFIED.md)).
 
 An adapter whose vendor scores video natively can implement
 `VideoModerator` and skip extraction entirely.

@@ -314,6 +314,27 @@ rolling deploy, or crashloop re-ran jobs live replicas were processing —
 double-billing the vendor. `vismod_processing_depth` is exported so
 parked jobs are visible without polluting the autoscaling signal.
 
+User docs were brought in line with that pass on 2026-08-06 (docs-only).
+`docs/scaling.md` gained a per-replica claim/heartbeat/reaper section and
+a metrics table with a **Consumer** column, so exactly one metric is
+marked an autoscaler input and `vismod_processing_depth` cannot be
+mistaken for one; a joint depth-gauge reading table names the silent
+stranding case. `docs/audit-log.md` states verification as three outcomes
+— verified, failed, and **unanchored**, the last being a clean exit with
+no `<log>.head`, which the CLI does not distinguish — plus an ordered
+restore procedure with a halt condition. `docs/production-checklist.md`
+gained the `processing_depth` alert item and the `<log>.head` backup item.
+New `docs/upgrading.md` carries the rolling-upgrade window and an explicit
+retirement condition tied to the `legacyInstance` constant.
+
+One handoff premise was wrong and is corrected there: payloads in the
+pre-upgrade shared `<prefix>:processing` key are **not** stranded —
+`registerLegacyIfPresent` adopts the key as a `legacy` pseudo-instance at
+`Start` so the reaper ages it out. The real edges are that adoption only
+happens at `Start`, the `legacy` entry is never refreshed (so it becomes
+reapable ~60s later, possibly while old replicas still hold the work), and
+a mid-flight rollback leaves per-instance keys an old binary cannot see.
+
 ## Gate status
 
 `go build ./...`, `go vet ./...`, `go test ./...` all pass locally as of

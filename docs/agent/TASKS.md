@@ -42,3 +42,38 @@ Acceptance criteria:
 Files likely touched: `internal/pipeline/pipeline.go`,
 `internal/pipeline/pipeline_test.go`, `AGENTS.md` (the sink gotcha
 paragraph), `config.example.yaml` (the webhook budget warning).
+
+---
+
+## 1. `vismod audit verify` must say when there is no head anchor
+
+`checkAnchor` returns `nil` when `<log>.head` is absent, so a log with no
+anchor verifies with the same `audit chain OK: N records verified` line
+and the same exit 0 as a fully anchored one. The two states are not
+equivalent: without the anchor, tail truncation is undetectable, which is
+the exact gap the anchor was added to close.
+
+This matters most where it is least visible — a restore that dropped the
+sidecar, or a backup tool that never captured it. The operator has no
+signal; `docs/audit-log.md` currently has to tell them to check for the
+file by hand, which is documentation standing in for a missing feature.
+
+The tolerant read path is correct and must stay: pre-anchor logs have to
+remain verifiable. The gap is only that the CLI does not report which of
+the two it did.
+
+Acceptance criteria:
+- `vismod audit verify` over a log with no `<log>.head` still exits 0 but
+  its output states that no head anchor was present and that tail
+  truncation was therefore not checked.
+- `vismod audit verify` over an anchored log states that the anchor was
+  checked, and names the anchored seq.
+- `audit.VerifyWith` reports the same distinction to callers without
+  turning a missing anchor into an error.
+- An explicitly-passed `VerifyOptions.Anchor` is reported as checked even
+  when no sidecar exists on disk.
+- Existing audit tests pass unmodified.
+
+Files likely touched: `internal/audit/audit.go`,
+`internal/audit/audit_test.go`, `internal/cli/audit.go`,
+`docs/audit-log.md` (the three-state table's observation column).

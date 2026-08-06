@@ -28,6 +28,56 @@ Recomputes the chain and reports the **first broken link** — the earliest
 record whose stored hash doesn't match a recomputation over its
 predecessor. Everything after that point is suspect.
 
+## What verification can tell you
+
+There are three outcomes, not two, and the command distinguishes only two
+of them. The third is the one to watch for.
+
+| State | How you observe it | What it proves | What it does **not** prove |
+|---|---|---|---|
+| **Verified** | Exit 0, `audit chain OK: N records verified`, **and `<log>.head` exists** | No in-place edit, and no records removed from the tail past the anchored seq | That a write-capable insider didn't rewrite the log *and* the anchor together |
+| **Failed** | Non-zero exit, with the error naming truncation, a head-anchor mismatch, or a broken link | Records were lost or altered. Treat as an incident | Which of accident or attack caused it |
+| **Unanchored** | Exit 0, the **same** `audit chain OK` line, but **no `<log>.head` on disk** | Only that the chain is self-consistent | Nothing at all about tail truncation — dropping the last N records leaves a chain that still verifies clean |
+
+`vismod audit verify` does not warn you about the unanchored case: a
+missing anchor is not an error, because logs written before anchoring
+existed must stay verifiable. **Check for the file yourself.** A restore
+that silently dropped `<log>.head` looks exactly like a healthy log.
+
+Two failure texts mean different things. *"log is truncated: head anchor
+names seq N but the log ends at seq M"* means records went missing from
+the end. *"does not match the head anchor (rewritten history)"* means the
+anchored record itself changed. A malformed anchor is a third case —
+corrupt storage, not evidence of tampering.
+
+One non-failure worth recognizing: an anchor **behind** the chain is
+normal. The anchor is written after the record lands, so a crash in
+between leaves it one seq short, and verification tolerates that. The
+guarantee it buys is bounded accordingly — everything up to the anchored
+seq is covered, anything after it is chain-only.
+
+## Restoring a log
+
+Order matters here, and there is a point at which you must stop.
+
+1. Restore `<log>` **and** `<log>.head` from the same backup generation.
+   If your backup tool captures them separately, capture the log first and
+   the anchor second — an anchor newer than its log is precisely the
+   truncation signature.
+2. Run `vismod audit verify <path>` **before** starting the service.
+3. Confirm `<log>.head` is actually present. A clean result without it is
+   the unanchored state above, not a pass.
+4. If verification reports truncation or a rewritten history, **halt and
+   escalate.** Do not start the service against that log.
+
+`audit.Open` will refuse to append to a broken or truncated log anyway, so
+the failure surfaces at boot if it is not caught here. Do not resolve that
+by deleting `<log>.head` to make the process start: that converts a
+detected, evidenced loss into a permanently unanchored log.
+
+This is the detail behind the head-anchor line in the
+[production checklist](production-checklist.md).
+
 ## Restart behavior
 
 `audit.Open` replays the existing file and rebuilds the seen-`job_id` set

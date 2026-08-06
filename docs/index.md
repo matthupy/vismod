@@ -33,6 +33,7 @@ quick start. These pages are the technical detail.
 | [Production checklist](production-checklist.md) | The list to walk before going live |
 | [Custom ffmpeg workflows](custom-ffmpeg-workflows.md) | Writing and validating extraction workflows |
 | [Self-hosted classifiers](self-hosted-classifiers.md) | Which open-weight model to run, and why ShieldGemma |
+| [Upgrading](upgrading.md) | Crossing the 2026-08 per-replica processing change |
 
 ## Policy and posture
 
