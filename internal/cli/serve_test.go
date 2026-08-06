@@ -15,7 +15,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
-	dto "github.com/prometheus/client_model/go"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/vismod/vismod/internal/config"
 	"github.com/vismod/vismod/internal/observe"
 	"github.com/vismod/vismod/internal/queue"
@@ -613,13 +613,13 @@ func TestFetcherBootsFromDefaults(t *testing.T) {
 }
 
 // gaugeValue reads a Prometheus gauge's current value.
+//
+// Uses client_golang's own testutil rather than reaching for client_model
+// directly: that would promote client_model from an indirect dependency to
+// a direct one for the sake of a test assertion.
 func gaugeValue(t *testing.T, g prometheus.Gauge) float64 {
 	t.Helper()
-	var m dto.Metric
-	if err := g.Write(&m); err != nil {
-		t.Fatalf("read gauge: %v", err)
-	}
-	return m.GetGauge().GetValue()
+	return testutil.ToFloat64(g)
 }
 
 // depthQueue is a queue whose depths are scripted, including failures.
