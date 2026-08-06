@@ -62,7 +62,9 @@ type Redisq struct {
 	workers sync.WaitGroup
 }
 
-const (
+// Timing for instance liveness. Vars, not consts, so tests can drive the
+// keeper and the reaper without sleeping for real seconds.
+var (
 	// instanceHeartbeat is how often a replica refreshes its liveness.
 	instanceHeartbeat = 10 * time.Second
 	// instanceReclaimAfter is how stale a heartbeat must be before another
@@ -76,19 +78,26 @@ const (
 	instanceReclaimAfter = 60 * time.Second
 	// reaperInterval is how often stale instances are swept.
 	reaperInterval = 15 * time.Second
-	// legacyInstance names the pre-upgrade shared processing key, so
-	// payloads left there by an older vismod are reclaimed by the same
-	// reaper path instead of being stranded forever.
-	legacyInstance = "legacy"
 )
+
+// legacyInstance names the pre-upgrade shared processing key, so payloads
+// left there by an older vismod are reclaimed by the same reaper path
+// instead of being stranded forever.
+const legacyInstance = "legacy"
 
 // newInstanceID identifies this replica. Random rather than hostname-based:
 // two replicas must never share a processing list, and a restarted pod must
 // not inherit a predecessor's claim implicitly — the reaper hands that work
 // back explicitly.
+// randRead is a seam so the entropy-failure fallback can be tested. Two
+// replicas sharing an instance id would share a processing list, which is
+// the exact bug the per-replica key exists to prevent, so the fallback has
+// to actually produce something usable.
+var randRead = rand.Read
+
 func newInstanceID() string {
 	var b [8]byte
-	if _, err := rand.Read(b[:]); err != nil {
+	if _, err := randRead(b[:]); err != nil {
 		return fmt.Sprintf("i-%d", time.Now().UnixNano())
 	}
 	return "i-" + hex.EncodeToString(b[:])

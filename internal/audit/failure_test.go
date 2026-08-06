@@ -467,3 +467,75 @@ func TestAppendFailsWhenTheAnchorCannotBeWritten(t *testing.T) {
 		t.Fatal("an unwritable head anchor must fail the append")
 	}
 }
+
+// An anchor at seq 0 means "no records anchored yet" and must not be read as
+// a truncation claim against an empty log.
+func TestCheckAnchorIgnoresAZeroSeqAnchor(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.log")
+	if err := writeHead(path, Head{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Verify(path); err != nil {
+		t.Errorf("Verify with a zero anchor = %v, want nil", err)
+	}
+}
+
+// writeHead must report a failure rather than leaving the anchor silently
+// behind the log — an anchor that stops advancing eventually reads as
+// truncation on every verification.
+func TestWriteHeadSurfacesFailure(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "audit.log")
+	// A directory where the temp anchor file needs to go.
+	if err := os.Mkdir(headPath(path)+".tmp", 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeHead(path, Head{Seq: 1, EntryHash: "aa"}); err == nil {
+		t.Error("writeHead reported success though the anchor could not be written")
+	}
+}
+
+// An unreadable anchor is not the same as an absent one: absent means a
+// pre-anchor log, unreadable means something is wrong and must be reported.
+func TestReadHeadSurfacesReadFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.log")
+	if err := os.Mkdir(headPath(path), 0o700); err != nil { // a directory, not a file
+		t.Fatal(err)
+	}
+	if _, _, err := readHead(path); err == nil {
+		t.Error("readHead reported success on an unreadable anchor")
+	}
+}
+
+// verifyChainOnly backs the "the chain itself is intact" assertions, so its
+// own failure modes must be real.
+func TestVerifyChainOnlyReportsFailures(t *testing.T) {
+	if _, err := verifyChainOnly(filepath.Join(t.TempDir(), "nope.log")); err != nil {
+		t.Errorf("a missing log is empty, not an error: %v", err)
+	}
+
+	path := writeLog(t, `{"seq":9,"timestamp":"t","prev_hash":"00","payload":{},"entry_hash":"ff"}`)
+	if _, err := verifyChainOnly(path); err == nil {
+		t.Error("verifyChainOnly accepted an out-of-order chain")
+	}
+
+	bad := filepath.Join(t.TempDir(), "audit.log")
+	if err := os.WriteFile(bad, []byte("{not json\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := verifyChainOnly(bad); err == nil {
+		t.Error("verifyChainOnly accepted an undecodable log")
+	}
+}
+
+// verifySignature must reject a record whose entry_hash is not decodable
+// rather than passing it to the Verifier as garbage.
+func TestVerifySignatureRejectsMalformedEntryHash(t *testing.T) {
+	err := verifySignature(staticSigner{}, Record{
+		EntryHash: "zzzz-not-hex",
+		Signature: "6162",
+	})
+	if err == nil {
+		t.Error("verifySignature accepted a record with a non-hex entry_hash")
+	}
+}

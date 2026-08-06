@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -13,6 +14,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/vismod/vismod/internal/config"
 	"github.com/vismod/vismod/internal/observe"
 	"github.com/vismod/vismod/internal/queue"
@@ -606,5 +609,84 @@ func TestFetcherBootsFromDefaults(t *testing.T) {
 	}
 	if f == nil {
 		t.Fatal("the default config must still yield a usable fetcher")
+	}
+}
+
+// gaugeValue reads a Prometheus gauge's current value.
+func gaugeValue(t *testing.T, g prometheus.Gauge) float64 {
+	t.Helper()
+	var m dto.Metric
+	if err := g.Write(&m); err != nil {
+		t.Fatalf("read gauge: %v", err)
+	}
+	return m.GetGauge().GetValue()
+}
+
+// depthQueue is a queue whose depths are scripted, including failures.
+type depthQueue struct {
+	queue.Queue
+	depth, processing int
+	depthErr, procErr error
+}
+
+func (d *depthQueue) QueueDepth(context.Context) (int, error) {
+	return d.depth, d.depthErr
+}
+func (d *depthQueue) ProcessingDepth(context.Context) (int, error) {
+	return d.processing, d.procErr
+}
+
+// Jobs parked in processing are excluded from the autoscaling signal by
+// design, so they need their own gauge — otherwise a payload stranded by a
+// failed dead-letter write is in a queue nothing counts, while queue_depth
+// reads 0 and the autoscaler scales to zero on top of it.
+func TestPublishDepthGaugesReportsProcessingSeparately(t *testing.T) {
+	m := observe.NewMetrics()
+	q := &depthQueue{depth: 7, processing: 3}
+
+	publishDepthGauges(context.Background(), q, m)
+
+	if got := gaugeValue(t, m.QueueDepth); got != 7 {
+		t.Errorf("queue depth gauge = %v, want 7", got)
+	}
+	if got := gaugeValue(t, m.ProcessingDepth); got != 3 {
+		t.Errorf("processing depth gauge = %v, want 3", got)
+	}
+}
+
+// A driver with no in-flight concept (memq) must simply not publish the
+// gauge, rather than publishing a misleading zero.
+func TestPublishDepthGaugesSkipsDriversWithoutProcessing(t *testing.T) {
+	m := observe.NewMetrics()
+	m.ProcessingDepth.Set(42) // a previous sample
+
+	q := testMemq(t)
+	publishDepthGauges(context.Background(), q, m)
+
+	if got := gaugeValue(t, m.ProcessingDepth); got != 42 {
+		t.Errorf("processing gauge = %v, want the previous 42 left untouched", got)
+	}
+}
+
+// A failed sample must leave the last known value alone. Writing 0 on a
+// Redis blip is indistinguishable from an empty queue and can talk the
+// autoscaler into scaling down mid-backlog.
+func TestPublishDepthGaugesLeavesStaleValuesOnError(t *testing.T) {
+	m := observe.NewMetrics()
+	m.QueueDepth.Set(11)
+	m.ProcessingDepth.Set(5)
+
+	q := &depthQueue{
+		depth: 0, processing: 0,
+		depthErr: errors.New("redis is down"),
+		procErr:  errors.New("redis is down"),
+	}
+	publishDepthGauges(context.Background(), q, m)
+
+	if got := gaugeValue(t, m.QueueDepth); got != 11 {
+		t.Errorf("queue depth gauge = %v, want 11 (a failed sample must not write 0)", got)
+	}
+	if got := gaugeValue(t, m.ProcessingDepth); got != 5 {
+		t.Errorf("processing gauge = %v, want 5 (a failed sample must not write 0)", got)
 	}
 }

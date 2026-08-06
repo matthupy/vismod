@@ -214,3 +214,89 @@ func TestDhashFileRejectsUndecodableInput(t *testing.T) {
 		t.Error("dhashFile accepted a missing file")
 	}
 }
+
+// checkRenderedArgs is the second line of defense: it only fires if a
+// template shape ever slips past checkTemplateShape, so no hostile workflow
+// reaches it today. That is precisely why it is tested directly — an
+// unreachable guard that does not work is the same as no guard, and the
+// next placeholder feature could make it reachable.
+func TestCheckRenderedArgsRejectsSmuggledArgs(t *testing.T) {
+	const in, wd = "/synthetic/input.mp4", "/synthetic/workdir"
+	out := wd + "/frame-%06d.png"
+
+	tests := []struct {
+		name    string
+		args    []string
+		wantErr string
+	}{
+		// A relative second input, so the absolute-path check (which fires
+		// first) cannot mask the one-input rule being tested here.
+		{"second input",
+			[]string{"-nostdin", "-i", in, "-i", "other.mp4", out},
+			"exactly 1"},
+		{"no input at all",
+			[]string{"-nostdin", "-vf", "showinfo", out},
+			"exactly 1"},
+		{"absolute path outside input and workdir",
+			[]string{"-nostdin", "-i", in, "-passlogfile", "/var/log/x", out},
+			"absolute paths"},
+		{"path traversal",
+			[]string{"-nostdin", "-i", in, "-vf", "movie=../../etc/shadow", out},
+			"traversal"},
+		{"forbidden protocol",
+			[]string{"-nostdin", "-i", in, "http://evil.example/u", out},
+			"forbidden protocol"},
+		// Relative for the same reason: an absolute output is caught by the
+		// absolute-path check, so output confinement needs its own case.
+		{"output escapes the workdir",
+			[]string{"-nostdin", "-i", in, "frames/frame-%06d.png"},
+			"escapes the WorkDir"},
+		{"no args at all",
+			nil,
+			"exactly 1"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := checkRenderedArgs("hostile", tc.args, in, wd)
+			if err == nil {
+				t.Fatalf("rendered args must be rejected: %v", tc.args)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("error %q should mention %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// The entitled absolute paths — the bound input and anything under the
+// pipeline-owned WorkDir — must still pass, or every real workflow breaks.
+func TestCheckRenderedArgsAcceptsEntitledPaths(t *testing.T) {
+	const in, wd = "/synthetic/input.mp4", "/synthetic/workdir"
+	args := []string{
+		"-nostdin", "-hide_banner", "-y", "-i", in,
+		"-vf", "fps=1/5,scale=1280:-1,showinfo",
+		"-frames:v", "64",
+		wd + "/frame-%06d.png",
+	}
+	if err := checkRenderedArgs("interval", args, in, wd); err != nil {
+		t.Errorf("a legitimate rendered workflow was rejected: %v", err)
+	}
+}
+
+// Every shipped workflow must survive the rendered checks, not just the
+// literal ones.
+func TestDefaultWorkflowsPassTheRenderedChecks(t *testing.T) {
+	cfg := ffCfg()
+	for name, wf := range config.DefaultWorkflows() {
+		rendered, err := RenderWorkflow(wf, TemplateValues{
+			Input: syntheticInput, WorkDir: syntheticWorkDir,
+			MaxFrames: cfg.MaxFrames, MaxWidth: cfg.MaxWidth,
+		})
+		if err != nil {
+			t.Fatalf("%s: render: %v", name, err)
+		}
+		if err := checkRenderedArgs(name, rendered, syntheticInput, syntheticWorkDir); err != nil {
+			t.Errorf("shipped workflow %q fails the rendered checks: %v", name, err)
+		}
+	}
+}

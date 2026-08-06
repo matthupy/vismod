@@ -3,6 +3,7 @@ package queue
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -408,5 +409,331 @@ func TestRedisqRecoverOrphansRequeuesOwnPayloads(t *testing.T) {
 	depth, err := q.QueueDepth(ctx)
 	if err != nil || depth != 2 {
 		t.Errorf("depth = %d (%v), want 2: recovered jobs must be back on pending", depth, err)
+	}
+}
+
+// withFastInstanceTiming shortens the liveness timers so the keeper and the
+// reaper can be observed without sleeping for real seconds.
+func withFastInstanceTiming(t *testing.T, beat, reclaim, reap time.Duration) {
+	t.Helper()
+	ob, orc, orp := instanceHeartbeat, instanceReclaimAfter, reaperInterval
+	instanceHeartbeat, instanceReclaimAfter, reaperInterval = beat, reclaim, reap
+	t.Cleanup(func() {
+		instanceHeartbeat, instanceReclaimAfter, reaperInterval = ob, orc, orp
+	})
+}
+
+// The heartbeat is what keeps a live replica's in-flight jobs from being
+// reclaimed out from under it, so it has to actually keep ticking for the
+// life of the process — not just fire once at Start.
+func TestRedisqHeartbeatKeepsRefreshing(t *testing.T) {
+	withFastInstanceTiming(t, 20*time.Millisecond, time.Hour, time.Hour)
+	rdb, _ := newMini(t)
+	ctx := context.Background()
+
+	q := NewRedisq(QueueConfig{Workers: 1, DrainTimeout: time.Second}, rdb, "vismod-test", nil)
+	if err := q.Start(ctx, func(context.Context, Job) (Disposition, error) {
+		return Ack, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = q.Close(ctx) }()
+
+	first, err := rdb.ZScore(ctx, "vismod-test:instances", q.instance).Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 3*time.Second, func() bool {
+		s, err := rdb.ZScore(ctx, "vismod-test:instances", q.instance).Result()
+		return err == nil && s > first
+	}, "heartbeat score advances")
+}
+
+// The reaper must keep running on its interval, not only at Start: a
+// replica that dies later is only recovered by a periodic sweep.
+func TestRedisqReaperRunsPeriodically(t *testing.T) {
+	withFastInstanceTiming(t, time.Hour, time.Millisecond, 20*time.Millisecond)
+	rdb, _ := newMini(t)
+	ctx := context.Background()
+
+	q := NewRedisq(QueueConfig{Workers: 1, DrainTimeout: time.Second}, rdb, "vismod-test", nil)
+	if err := q.Start(ctx, func(context.Context, Job) (Disposition, error) {
+		return Ack, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = q.Close(ctx) }()
+
+	// A replica dies AFTER we started: payload in its list, stale heartbeat.
+	dead := NewRedisq(QueueConfig{Workers: 1}, rdb, "vismod-test", nil)
+	if err := rdb.LPush(ctx, dead.processingKey(), `{"job":{"id":"late"},"attempts":0}`).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := rdb.ZAdd(ctx, "vismod-test:instances", redis.Z{
+		Score: float64(time.Now().Add(-time.Hour).UnixMilli()), Member: dead.instance,
+	}).Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	waitFor(t, 3*time.Second, func() bool {
+		n, err := rdb.LLen(ctx, dead.processingKey()).Result()
+		return err == nil && n == 0
+	}, "periodic reaper reclaims a replica that died after startup")
+}
+
+// instanceKeeper must exit on context cancellation, or Close hangs for the
+// full drain timeout on every shutdown.
+func TestRedisqInstanceKeeperStopsOnContextCancel(t *testing.T) {
+	withFastInstanceTiming(t, 10*time.Millisecond, time.Hour, 10*time.Millisecond)
+	rdb, _ := newMini(t)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	q := NewRedisq(QueueConfig{Workers: 1, DrainTimeout: 2 * time.Second}, rdb, "vismod-test", nil)
+	if err := q.Start(ctx, func(context.Context, Job) (Disposition, error) {
+		return Ack, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- q.Close(context.Background()) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("Close after cancel = %v, want nil", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Close hung: a keeper goroutine did not exit on context cancel")
+	}
+}
+
+// A heartbeat that cannot reach Redis must be survivable — the keeper logs
+// and keeps going rather than dying, since the process is still holding
+// jobs it needs to finish.
+func TestRedisqHeartbeatFailureDoesNotKillTheKeeper(t *testing.T) {
+	withFastInstanceTiming(t, 10*time.Millisecond, time.Hour, time.Hour)
+	rdb, mr := newMini(t)
+	ctx := context.Background()
+
+	q := NewRedisq(QueueConfig{Workers: 1, DrainTimeout: 2 * time.Second}, rdb, "vismod-test", nil)
+	if err := q.Start(ctx, func(context.Context, Job) (Disposition, error) {
+		return Ack, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	mr.SetError("redis is down")
+	time.Sleep(80 * time.Millisecond) // several failed beats
+
+	mr.SetError("")
+	waitFor(t, 3*time.Second, func() bool {
+		_, err := rdb.ZScore(ctx, "vismod-test:instances", q.instance).Result()
+		return err == nil
+	}, "keeper resumes heartbeating after Redis recovers")
+	_ = q.Close(ctx)
+}
+
+// drainProcessing must surface a Redis failure rather than reporting that it
+// moved everything: a silent partial drain strands jobs.
+func TestRedisqDrainProcessingSurfacesRedisFailure(t *testing.T) {
+	rdb, mr := newMini(t)
+	q := NewRedisq(QueueConfig{Workers: 1}, rdb, "vismod-test", nil)
+	mr.SetError("redis is down")
+
+	if _, err := q.drainProcessing(context.Background(), q.processingKey()); err == nil {
+		t.Error("drainProcessing reported success with Redis down")
+	}
+	if err := q.recoverOrphans(context.Background()); err == nil {
+		t.Error("recoverOrphans reported success with Redis down")
+	}
+}
+
+// registerLegacyIfPresent must surface a Redis failure at Start rather than
+// leaving pre-upgrade payloads silently unreclaimable.
+func TestRedisqRegisterLegacySurfacesRedisFailure(t *testing.T) {
+	rdb, mr := newMini(t)
+	q := NewRedisq(QueueConfig{Workers: 1}, rdb, "vismod-test", nil)
+	mr.SetError("redis is down")
+
+	if err := q.registerLegacyIfPresent(context.Background()); err == nil {
+		t.Error("registerLegacyIfPresent reported success with Redis down")
+	}
+}
+
+// The legacy pseudo-instance is registered once, and re-registering must not
+// refresh its timestamp — otherwise every restart pushes the reclaim
+// deadline out and the pre-upgrade payloads are never recovered.
+func TestRedisqLegacyRegistrationIsNotRefreshed(t *testing.T) {
+	rdb, _ := newMini(t)
+	ctx := context.Background()
+	q := NewRedisq(QueueConfig{Workers: 1}, rdb, "vismod-test", nil)
+
+	if err := rdb.LPush(ctx, q.key("processing"), `{"job":{"id":"old"},"attempts":0}`).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.registerLegacyIfPresent(ctx); err != nil {
+		t.Fatal(err)
+	}
+	first, err := rdb.ZScore(ctx, "vismod-test:instances", legacyInstance).Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(5 * time.Millisecond)
+	if err := q.registerLegacyIfPresent(ctx); err != nil {
+		t.Fatal(err)
+	}
+	again, err := rdb.ZScore(ctx, "vismod-test:instances", legacyInstance).Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again != first {
+		t.Errorf("legacy registration was refreshed (%v -> %v); the reclaim deadline would never arrive", first, again)
+	}
+}
+
+// A reaper that cannot deregister an instance must NOT report the jobs as
+// reclaimed and move on — leaving it registered is what makes the next sweep
+// try again.
+func TestRedisqReaperLeavesInstanceRegisteredWhenDrainFails(t *testing.T) {
+	rdb, mr := newMini(t)
+	ctx := context.Background()
+
+	q := NewRedisq(QueueConfig{Workers: 1}, rdb, "vismod-test", nil)
+	dead := NewRedisq(QueueConfig{Workers: 1}, rdb, "vismod-test", nil)
+	if err := rdb.ZAdd(ctx, "vismod-test:instances", redis.Z{
+		Score: float64(time.Now().Add(-10 * instanceReclaimAfter).UnixMilli()), Member: dead.instance,
+	}).Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	mr.SetError("redis is down")
+	q.reapDeadInstances(ctx) // must not panic
+	mr.SetError("")
+
+	// Still registered, so a later sweep can retry it.
+	n, err := rdb.ZScore(ctx, "vismod-test:instances", dead.instance).Result()
+	if err != nil {
+		t.Fatalf("dead instance was deregistered despite a failed sweep: %v", err)
+	}
+	_ = n
+}
+
+// If the system entropy source fails, the fallback still has to produce a
+// usable, non-empty id: two replicas sharing an id share a processing list,
+// which is exactly the bug per-replica keys exist to prevent.
+func TestNewInstanceIDFallsBackWhenEntropyFails(t *testing.T) {
+	orig := randRead
+	randRead = func([]byte) (int, error) { return 0, errors.New("no entropy") }
+	t.Cleanup(func() { randRead = orig })
+
+	id := newInstanceID()
+	if id == "" || id == "i-" {
+		t.Fatalf("fallback instance id = %q, want a usable id", id)
+	}
+	if !strings.HasPrefix(id, "i-") {
+		t.Errorf("fallback instance id = %q, want the i- prefix", id)
+	}
+}
+
+// vismod shares a Redis with whatever else the operator runs there. A key
+// collision with the wrong TYPE (someone SETs a string where we expect a
+// list) must fail loudly at Start rather than silently skipping recovery and
+// stranding in-flight jobs.
+func TestRedisqStartFailsOnLegacyKeyTypeCollision(t *testing.T) {
+	rdb, _ := newMini(t)
+	ctx := context.Background()
+	q := NewRedisq(QueueConfig{Workers: 1, DrainTimeout: time.Second}, rdb, "vismod-test", nil)
+
+	if err := rdb.Set(ctx, q.key("processing"), "not-a-list", 0).Err(); err != nil {
+		t.Fatal(err)
+	}
+	err := q.Start(ctx, func(context.Context, Job) (Disposition, error) { return Ack, nil })
+	if err == nil {
+		_ = q.Close(ctx)
+		t.Fatal("Start succeeded despite an unreadable legacy processing key")
+	}
+	if !strings.Contains(err.Error(), "legacy processing scan") {
+		t.Errorf("error %q should name the legacy scan", err)
+	}
+}
+
+func TestRedisqStartFailsWhenOwnProcessingKeyIsUnreadable(t *testing.T) {
+	rdb, _ := newMini(t)
+	ctx := context.Background()
+	q := NewRedisq(QueueConfig{Workers: 1, DrainTimeout: time.Second}, rdb, "vismod-test", nil)
+
+	if err := rdb.Set(ctx, q.processingKey(), "not-a-list", 0).Err(); err != nil {
+		t.Fatal(err)
+	}
+	err := q.Start(ctx, func(context.Context, Job) (Disposition, error) { return Ack, nil })
+	if err == nil {
+		_ = q.Close(ctx)
+		t.Fatal("Start succeeded despite an unreadable processing key")
+	}
+	if !strings.Contains(err.Error(), "orphan recovery") {
+		t.Errorf("error %q should name orphan recovery", err)
+	}
+}
+
+// A dead replica whose list cannot be drained must stay REGISTERED, so the
+// next sweep retries it. Deregistering on failure would strand its jobs
+// permanently — nothing else ever looks at that key.
+func TestRedisqReaperKeepsInstanceWhenItsListIsUnreadable(t *testing.T) {
+	rdb, _ := newMini(t)
+	ctx := context.Background()
+
+	q := NewRedisq(QueueConfig{Workers: 1}, rdb, "vismod-test", nil)
+	dead := NewRedisq(QueueConfig{Workers: 1}, rdb, "vismod-test", nil)
+	if err := rdb.Set(ctx, dead.processingKey(), "not-a-list", 0).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := rdb.ZAdd(ctx, "vismod-test:instances", redis.Z{
+		Score: float64(time.Now().Add(-10 * instanceReclaimAfter).UnixMilli()), Member: dead.instance,
+	}).Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	q.reapDeadInstances(ctx)
+
+	if _, err := rdb.ZScore(ctx, "vismod-test:instances", dead.instance).Result(); err != nil {
+		t.Errorf("dead instance was deregistered despite an unreadable list: %v", err)
+	}
+}
+
+// ProcessingDepth must report a failure rather than a plausible zero when a
+// processing key cannot be counted — a zero here reads as "nothing stranded".
+func TestRedisqProcessingDepthFailsOnKeyTypeCollision(t *testing.T) {
+	rdb, _ := newMini(t)
+	ctx := context.Background()
+	q := NewRedisq(QueueConfig{Workers: 1}, rdb, "vismod-test", nil)
+
+	if err := rdb.Set(ctx, q.processingKey(), "not-a-list", 0).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := q.ProcessingDepth(ctx); err == nil {
+		t.Error("ProcessingDepth returned success over an uncountable key")
+	}
+}
+
+// The legacy key is counted too, so a stranded pre-upgrade payload shows up
+// on the gauge instead of being invisible.
+func TestRedisqProcessingDepthCountsLegacyKey(t *testing.T) {
+	rdb, _ := newMini(t)
+	ctx := context.Background()
+	q := NewRedisq(QueueConfig{Workers: 1}, rdb, "vismod-test", nil)
+
+	if err := rdb.LPush(ctx, q.key("processing"), `{"job":{"id":"old"},"attempts":0}`).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := rdb.LPush(ctx, q.processingKey(), `{"job":{"id":"mine"},"attempts":0}`).Err(); err != nil {
+		t.Fatal(err)
+	}
+	d, err := q.ProcessingDepth(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d != 2 {
+		t.Errorf("ProcessingDepth = %d, want 2 (own + legacy)", d)
 	}
 }

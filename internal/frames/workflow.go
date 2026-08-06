@@ -111,19 +111,40 @@ func ValidateWorkflow(name string, wf config.WorkflowConfig, cfg config.FFmpegCo
 	// Dry-render against synthetic values proves the template renders and
 	// its output stays inside the WorkDir.
 	rendered, err := RenderWorkflow(wf, TemplateValues{
-		Input:     "/synthetic/input.mp4",
-		WorkDir:   "/synthetic/workdir",
+		Input:     syntheticInput,
+		WorkDir:   syntheticWorkDir,
 		MaxFrames: cfg.MaxFrames,
 		MaxWidth:  cfg.MaxWidth,
 	})
 	if err != nil {
 		return fmt.Errorf("workflow %q: dry-render: %w", name, err)
 	}
-	// The literal-arg checks above ran on what the author typed; these run
-	// on what ffmpeg would actually receive. Index-independent on purpose:
-	// RenderWorkflow may prepend -nostdin, so rendered positions do not
-	// line up with wf.Args.
-	renderedDashI := 0
+	return checkRenderedArgs(name, rendered, syntheticInput, syntheticWorkDir)
+}
+
+// Synthetic values the dry-render binds, so the rendered checks can tell an
+// entitled absolute path from a smuggled one.
+const (
+	syntheticInput   = "/synthetic/input.mp4"
+	syntheticWorkDir = "/synthetic/workdir"
+)
+
+// checkRenderedArgs re-runs the guardrails against what ffmpeg would
+// ACTUALLY receive.
+//
+// The literal-arg checks in ValidateWorkflow read what the author typed;
+// checkTemplateShape is what makes that trustworthy by rejecting any action
+// that is not a bare placeholder. This is the second line of defense: if a
+// shape ever slips through, the rendered form still has to survive the
+// protocol deny-list, the traversal check, the one-input rule, and output
+// confinement. Kept separate from ValidateWorkflow so it can be tested on
+// its own — reachable only through a hole in checkTemplateShape, which is
+// exactly why it must not be assumed to work.
+//
+// Index-independent on purpose: RenderWorkflow may prepend -nostdin, so
+// rendered positions do not line up with wf.Args.
+func checkRenderedArgs(name string, rendered []string, input, workDir string) error {
+	dashI := 0
 	for i, arg := range rendered {
 		if err := checkForbidden(name, i, arg); err != nil {
 			return err
@@ -132,21 +153,21 @@ func ValidateWorkflow(name string, wf config.WorkflowConfig, cfg config.FFmpegCo
 			return fmt.Errorf("workflow %q: rendered arg %d (%q) contains path traversal", name, i, arg)
 		}
 		if arg == "-i" {
-			renderedDashI++
+			dashI++
 		}
 		// The two absolute paths a workflow is entitled to are the bound
 		// input and anything under the pipeline-owned WorkDir.
-		if arg == "/synthetic/input.mp4" || strings.HasPrefix(arg, "/synthetic/workdir") {
+		if arg == input || strings.HasPrefix(arg, workDir) {
 			continue
 		}
 		if looksAbsolutePath(arg) {
 			return fmt.Errorf("workflow %q: rendered arg %d (%q): absolute paths other than {{.Input}}/{{.WorkDir}} are forbidden", name, i, arg)
 		}
 	}
-	if renderedDashI != 1 {
-		return fmt.Errorf("workflow %q: rendered args contain %d \"-i\" (want exactly 1); users cannot inject a second input", name, renderedDashI)
+	if dashI != 1 {
+		return fmt.Errorf("workflow %q: rendered args contain %d \"-i\" (want exactly 1); users cannot inject a second input", name, dashI)
 	}
-	if !strings.HasPrefix(rendered[len(rendered)-1], "/synthetic/workdir") {
+	if len(rendered) == 0 || !strings.HasPrefix(rendered[len(rendered)-1], workDir) {
 		return fmt.Errorf("workflow %q: rendered output escapes the WorkDir", name)
 	}
 	return nil
