@@ -97,5 +97,7 @@ shared key, every replica start moved the whole thing back to pending, so
 a scale-up, a rolling deploy, or a crashlooping pod re-queued jobs other
 replicas were actively running — paying for the vendor call and the
 webhook POST twice, and looking exactly like ordinary at-least-once
-redelivery. Rolling upgrades from a version that used the shared key are
-handled automatically: leftovers there are reclaimed once they go stale.
+redelivery. Upgrading from a version that used the shared key: leftovers
+there are registered at startup and reclaimed once they go stale, but the
+adoption has timing edges and has never run against a real Redis — read
+[docs/upgrading.md](../docs/upgrading.md) before a rolling upgrade.

@@ -30,6 +30,12 @@ Short list. Each item links to the detail.
       paths interleave and break the audit chain.
       → [Audit log](audit-log.md#per-replica-chains)
 
+- [ ] **`<log>.head` is backed up and restored with the audit log.** The
+      head anchor is what makes tail truncation detectable. Restore the
+      log without it and `vismod audit verify` still reports success —
+      it has silently degraded to chain-only.
+      → [Audit log](audit-log.md#restoring-a-log)
+
 - [ ] **The dev intake is not exposed.** `intake_addr` defaults to
       `127.0.0.1:8080` and has **no authentication**. Put it behind
       something, or don't publish the port.
@@ -46,6 +52,14 @@ Short list. Each item links to the detail.
       become `error` verdicts and pile up for humans — that only works if
       someone is told.
       → [Observability](scaling.md#observability)
+
+- [ ] **Alerting on `vismod_processing_depth` staying non-zero while
+      `vismod_queue_depth` is 0.** A crashed replica's in-flight jobs come
+      back only through another replica's reaper. If that path fails they
+      are stranded silently, and this gauge is the only signal. Read it
+      with `max`, not `sum` — every replica reports the same cluster-wide
+      number.
+      → [Reading the two depth gauges together](scaling.md#reading-the-two-depth-gauges-together)
 
 - [ ] **A human actually reviews the `error` and `flag` queues.** vismod
       is designed to hand work to people. If nothing consumes that
