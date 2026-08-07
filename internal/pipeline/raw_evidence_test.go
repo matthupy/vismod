@@ -1,11 +1,13 @@
 package pipeline
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -288,6 +290,95 @@ func TestAuditRecordCarriesTheComputedDigest(t *testing.T) {
 	}
 	if n, err := audit.Verify(path); err != nil {
 		t.Fatalf("Verify after %d records: %v", n, err)
+	}
+}
+
+// brokenRawModerator scores normally but returns a Raw that is not valid
+// JSON — an adapter bug, or a vendor payload that survived unmarshaling
+// and did not survive re-marshaling.
+type brokenRawModerator struct{ score float64 }
+
+func (m *brokenRawModerator) Name() string { return "broken" }
+func (m *brokenRawModerator) Capabilities() moderation.Caps {
+	return moderation.Caps{MaxImageBytes: 1 << 20}
+}
+func (m *brokenRawModerator) Close() error { return nil }
+
+func (m *brokenRawModerator) AnalyzeImage(context.Context, moderation.Image) (moderation.NormalizedResult, error) {
+	score := m.score
+	return moderation.NormalizedResult{
+		Provider: "broken",
+		Frames: []moderation.FrameResult{{
+			Categories: []moderation.CategoryResult{{
+				Category:    moderation.CategorySexual,
+				Score:       &score,
+				ScoreOrigin: moderation.OriginProbability,
+			}},
+		}},
+		Raw: json.RawMessage(`{not valid json`),
+	}, nil
+}
+
+// Losing the evidence binding must not change the decision. Failing the
+// job closed here would dead-letter a legitimate allow over a digest,
+// which is a new outage, not caution — so the verdict stands, the record
+// lands with an empty raw_sha256, and an ERROR line explains why.
+func TestUnhashableEvidenceCostsTheDigestAndNothingElse(t *testing.T) {
+	dir := t.TempDir()
+	fs := &fakeFrameSource{dir: dir, contents: []string{"f0", "f1"}}
+	p, _ := newTestPipeline(t, &brokenRawModerator{score: 0.05}, fs)
+	var logged bytes.Buffer
+	p.Log = slog.New(slog.NewTextHandler(&logged, &slog.HandlerOptions{Level: slog.LevelError}))
+
+	env, disp, err := p.ProcessJob(context.Background(), videoJob(filepath.Join(dir, "v.mp4")))
+
+	if env.RawSHA256 != "" {
+		t.Errorf("RawSHA256 = %q, want empty when the evidence could not be assembled", env.RawSHA256)
+	}
+	if env.Result.Overall.Verdict != moderation.VerdictAllow {
+		t.Errorf("verdict = %s, want allow: a digest failure must not change the decision", env.Result.Overall.Verdict)
+	}
+	if disp != queue.Ack || err != nil {
+		t.Errorf("disp = %v, err = %v; want Ack and no error", disp, err)
+	}
+	if len(env.Result.Frames) != 2 {
+		t.Errorf("frames = %d, want 2: the frames themselves are unaffected", len(env.Result.Frames))
+	}
+	if !strings.Contains(logged.String(), "raw_sha256 will be empty") {
+		t.Errorf("no ERROR line explaining the empty digest:\n%s", logged.String())
+	}
+}
+
+// emptyResultModerator returns success with no frame result at all.
+type emptyResultModerator struct{}
+
+func (m *emptyResultModerator) Name() string { return "empty" }
+func (m *emptyResultModerator) Capabilities() moderation.Caps {
+	return moderation.Caps{MaxImageBytes: 1 << 20}
+}
+func (m *emptyResultModerator) Close() error { return nil }
+func (m *emptyResultModerator) AnalyzeImage(context.Context, moderation.Image) (moderation.NormalizedResult, error) {
+	return moderation.NormalizedResult{Provider: "empty"}, nil
+}
+
+// An adapter returning no frame result is could-not-evaluate, not a pass
+// — and it leaves no evidence, so there is nothing to bind.
+func TestAdapterWithNoFrameResultIsAnErrorWithNoDigest(t *testing.T) {
+	p, _ := newTestPipeline(t, &emptyResultModerator{}, nil)
+
+	env, disp, _ := p.ProcessJob(context.Background(), imageJob(writeInput(t, "benign")))
+
+	if env.RawSHA256 != "" {
+		t.Errorf("RawSHA256 = %q, want empty", env.RawSHA256)
+	}
+	if env.Result.Overall.Verdict != moderation.VerdictError {
+		t.Errorf("verdict = %s, want error (never allow on a missing result)", env.Result.Overall.Verdict)
+	}
+	if disp != queue.DeadLetter {
+		t.Errorf("disp = %v, want dead-letter", disp)
+	}
+	if !strings.Contains(env.Error, "returned no frame result") {
+		t.Errorf("env.Error = %q, want it to name the missing frame result", env.Error)
 	}
 }
 
