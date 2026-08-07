@@ -33,9 +33,16 @@ type ResultEnvelope struct {
 	// influences a verdict. Omitted when the caller supplied none.
 	// Present in sink output ONLY — never in the audit log, log lines,
 	// or the operator UI.
-	Metadata   json.RawMessage `json:"metadata,omitempty"`
-	StartedAt  time.Time       `json:"started_at"`
-	FinishedAt time.Time       `json:"finished_at"`
+	Metadata json.RawMessage `json:"metadata,omitempty"`
+	// RawSHA256 is the hex SHA-256 of the provider response(s) behind this
+	// verdict, carried for the audit log alone. It is DELIBERATELY not
+	// serialized: it travels out of band precisely so the pipeline can
+	// bind a decision to its inputs without the raw response — or a
+	// derived field no consumer asked for — entering a sink envelope.
+	// The audit record is where it surfaces, as raw_sha256.
+	RawSHA256  string    `json:"-"`
+	StartedAt  time.Time `json:"started_at"`
+	FinishedAt time.Time `json:"finished_at"`
 }
 
 // Sink receives result envelopes. Write MUST be idempotent per JobID:

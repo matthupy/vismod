@@ -77,3 +77,44 @@ Acceptance criteria:
 Files likely touched: `internal/audit/audit.go`,
 `internal/audit/audit_test.go`, `internal/cli/audit.go`,
 `docs/audit-log.md` (the three-state table's observation column).
+
+---
+
+## 2. `top_category` is decided by adapter emission order when scores tie
+
+`Rollup` (`internal/pipeline/rollup.go:55-61`) keeps the first strictly
+greater score, so among equal scores the winner is whichever category the
+adapter happened to emit first. The tie that matters most is the common
+one: a fully benign image where every category scores `0`.
+
+Confirmed against a **live Azure Content Safety run** on 2026-08-07. A
+benign image produced `max_score: 0` and `top_category: "HATE"` — an
+operator-visible field naming a category the content had nothing to do
+with, on the most frequent verdict vismod emits. It reads as a weak
+signal about the content when it is in fact an artifact of map order.
+
+`STATUS.md` already records this as one of two rollup defects blocking a
+label-only adapter (Llama Guard 4, whose 1.0 labels would tie constantly).
+This entry covers the tie-break alone; `Confidence` being a copy of
+`MaxScore` is the other and is not in scope here.
+
+The fix is a decision, not just code: `null` when the top score is tied
+(nothing outranks anything), `null` when `max_score` is `0` (nothing was
+detected), or a deterministic canonical ordering. Prefer whichever a
+reader of the envelope can be told in one sentence. Note that
+`top_category` is nullable already, so `null` costs no schema change.
+
+Acceptance criteria:
+- A result whose highest score is shared by two or more categories
+  produces the same `top_category` regardless of the order the adapter
+  emitted them in. A test that shuffles emission order asserts it.
+- An all-zero-score benign result does not name an arbitrary category.
+- Verdict, `flagged`, `max_score`, and `confidence` are unchanged by this
+  — only `top_category` moves.
+- Existing rollup tests pass UNMODIFIED (per the done gate: weakening
+  them to pass is a failed gate).
+- `docs/result-envelope.md` states the tie-break rule.
+
+Files likely touched: `internal/pipeline/rollup.go`,
+`internal/pipeline/rollup_test.go`, `docs/result-envelope.md`,
+`docs/agent/STATUS.md` (the label-only-adapter blocker note).

@@ -219,12 +219,20 @@ func payloadFor(env result.ResultEnvelope) map[string]string {
 	if env.Result != nil {
 		p["asset_id"] = env.Result.AssetID
 		p["verdict"] = string(env.Result.Overall.Verdict)
-		if len(env.Result.Raw) > 0 {
-			sum := sha256.Sum256(env.Result.Raw)
-			p["raw_sha256"] = hex.EncodeToString(sum[:])
-		}
 	} else if env.Error != "" {
 		p["verdict"] = string(moderation.VerdictError)
+	}
+	// The pipeline hashes the provider evidence itself and carries the
+	// digest out of band, because Raw must never reach an envelope. The
+	// fallback below hashes an envelope that does carry Raw — envelopes
+	// built outside the pipeline, in tests and in-process callers — so
+	// this function binds by hash wherever the evidence turns up.
+	switch {
+	case env.RawSHA256 != "":
+		p["raw_sha256"] = env.RawSHA256
+	case env.Result != nil && len(env.Result.Raw) > 0:
+		sum := sha256.Sum256(env.Result.Raw)
+		p["raw_sha256"] = hex.EncodeToString(sum[:])
 	}
 	return p
 }

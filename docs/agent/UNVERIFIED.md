@@ -229,3 +229,34 @@ are dropped" is not proven.
 new samplers and reporting the distribution of Hamming-distance deltas,
 plus the count of pairs whose keep/drop decision changes at the shipped
 threshold.
+
+## `raw_sha256` against a live vendor response
+
+The evidence binding is proven only against the fake adapter. Every test
+in `internal/pipeline/raw_evidence_test.go` computes its expected digest
+from `fakeRawBody`, so what is actually verified is that the pipeline
+hashes whatever `NormalizedResult.Raw` an adapter returns, in the right
+order, without desynchronizing it from the frames.
+
+What that does NOT prove is the property an auditor would rely on: that a
+digest recomputed from a response captured out of band — from the
+vendor's own logs, or a proxy — matches the one in the record. Each
+adapter builds `Raw` by re-marshaling its parsed response
+(`microsoft.go:232`, and the same shape in google/hive/shieldgemma), so
+the digest covers vismod's *re-serialization*, not the bytes the vendor
+put on the wire. Key order, whitespace, and any field the adapter's
+structs do not model all differ. That is a deliberate consequence of
+`Raw` being sanitized, but it means "hash the vendor's response and
+compare" does not work, and nobody has confirmed what a holder of the
+original response can actually check.
+
+**Proves it:** one live scan (the compose stack against Azure Content
+Safety reaches this) that captures the adapter's `Raw` at the boundary,
+recomputes SHA-256 over it, and shows the value equal to `raw_sha256` in
+the resulting audit record — for an image and for a multi-frame video.
+Then a line in `docs/audit-log.md` stating precisely which bytes an
+auditor must hold to reproduce the digest.
+
+The pre-fix state is settled and needs no further proof: the empty
+`raw_sha256` was observed on live Azure records dated 2026-08-03 and
+2026-08-07 in the `audit-b` volume.

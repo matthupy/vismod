@@ -13,6 +13,9 @@ package pipeline
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -133,6 +136,10 @@ func (p *Pipeline) ProcessJob(ctx context.Context, j queue.Job) (result.ResultEn
 		"workflows", workflowsLabel(j.Workflows))
 
 	var res moderation.NormalizedResult
+	// rawEvidence is the provider response(s) behind this decision. It is
+	// hashed into the audit record and then dropped — it never reaches an
+	// envelope, a log line, or the UI (AGENTS.md invariant 3).
+	var rawEvidence json.RawMessage
 	var procErr error
 	switch {
 	case metaErr != nil:
@@ -140,9 +147,9 @@ func (p *Pipeline) ProcessJob(ctx context.Context, j queue.Job) (result.ResultEn
 	case resolveErr != nil:
 		procErr = resolveErr
 	case rs.env.MediaType == "video":
-		res, procErr = p.processVideo(ctx, j)
+		res, rawEvidence, procErr = p.processVideo(ctx, j)
 	default:
-		res, procErr = p.processImage(ctx, j)
+		res, rawEvidence, procErr = p.processImage(ctx, j)
 	}
 	if errors.Is(procErr, errEmptyVideoSkipped) {
 		// Gated §F.5 override: ack with no verdict, prominent audit event.
@@ -178,10 +185,16 @@ func (p *Pipeline) ProcessJob(ctx context.Context, j queue.Job) (result.ResultEn
 	res.Overall = Rollup(res.Frames, p.Thresholds)
 
 	env := result.ResultEnvelope{
-		JobID:      j.ID,
-		Source:     rs.env,
-		ModelID:    p.ModelID,
-		Result:     &res,
+		JobID:   j.ID,
+		Source:  rs.env,
+		ModelID: p.ModelID,
+		Result:  &res,
+		// Binds the verdict to the provider response that produced it.
+		// The digest rides out of band (RawSHA256 is json:"-") because Raw
+		// itself may not be serialized, and because env.Result is a
+		// pointer the sink already holds by the time audit runs — so
+		// "populate then clear" would be a mutation race, not a boundary.
+		RawSHA256:  rawDigest(rawEvidence),
 		Metadata:   meta,
 		StartedAt:  started,
 		FinishedAt: time.Now().UTC(),
@@ -293,42 +306,50 @@ func (p *Pipeline) recordFetch(start time.Time, path string, err error) {
 }
 
 // processImage handles a still image: one FrameResult, TimestampSec nil.
-func (p *Pipeline) processImage(ctx context.Context, j queue.Job) (moderation.NormalizedResult, error) {
-	fr, err := p.evaluateFrame(ctx, j.Source.Ref, nil)
+// The second return is the provider's raw response, for the audit digest.
+func (p *Pipeline) processImage(ctx context.Context, j queue.Job) (moderation.NormalizedResult, json.RawMessage, error) {
+	fr, raw, err := p.evaluateFrame(ctx, j.Source.Ref, nil)
 	if err != nil {
-		return moderation.NormalizedResult{}, err
+		return moderation.NormalizedResult{}, nil, err
 	}
 	return moderation.NormalizedResult{
 		Provider:     p.Moderator.Name(),
 		ModelVersion: p.ModelID.ModelVersion,
 		MediaType:    "image",
 		Frames:       []moderation.FrameResult{fr},
-	}, nil
+	}, raw, nil
 }
 
 // processVideo prefers a video-native adapter; otherwise extracts frames
-// and moderates each as an image.
-func (p *Pipeline) processVideo(ctx context.Context, j queue.Job) (moderation.NormalizedResult, error) {
+// and moderates each as an image. The second return is the raw provider
+// evidence for the audit digest: the response itself for a video-native
+// adapter, or a JSON array with one entry per scanned frame otherwise.
+func (p *Pipeline) processVideo(ctx context.Context, j queue.Job) (moderation.NormalizedResult, json.RawMessage, error) {
 	if vm, ok := p.Moderator.(moderation.VideoModerator); ok && p.Moderator.Capabilities().SupportsVideo {
 		res, err := vm.AnalyzeVideo(ctx, j.Source)
 		if err != nil {
-			return moderation.NormalizedResult{}, fmt.Errorf("video-native analyze: %w", err)
+			return moderation.NormalizedResult{}, nil, fmt.Errorf("video-native analyze: %w", err)
 		}
 		for i := range res.Frames {
 			res.Frames[i].Categories = ApplyThresholds(res.Frames[i].Categories, p.Thresholds)
 		}
-		return res, nil
+		// This is the ONE path that used to hand the adapter's result back
+		// intact, Raw included. Lift Raw out as evidence and clear it: the
+		// pipeline is the boundary where a provider's raw response stops.
+		raw := res.Raw
+		res.Raw = nil
+		return res, raw, nil
 	}
 
 	if p.FrameSource == nil {
-		return moderation.NormalizedResult{}, fmt.Errorf("no frame source configured for video input")
+		return moderation.NormalizedResult{}, nil, fmt.Errorf("no frame source configured for video input")
 	}
 	fs, cleanup, err := p.FrameSource.Frames(ctx, j.Source.Ref, j.Workflows)
 	if err != nil {
 		if cleanup != nil {
 			p.runCleanup(j.ID, cleanup)
 		}
-		return moderation.NormalizedResult{}, fmt.Errorf("frame extraction: %w", err)
+		return moderation.NormalizedResult{}, nil, fmt.Errorf("frame extraction: %w", err)
 	}
 	// Lifecycle contract: cleanup is deferred BEFORE any fan-out so the
 	// WorkDir is deleted on every exit path (error, ctx-cancel, panic).
@@ -340,9 +361,9 @@ func (p *Pipeline) processVideo(ctx context.Context, j queue.Job) (moderation.No
 		// Only the gated, audited operator override downgrades this to an
 		// operational skip (job acked, NO verdict emitted).
 		if p.AllowEmptyVideoSkip {
-			return moderation.NormalizedResult{}, errEmptyVideoSkipped
+			return moderation.NormalizedResult{}, nil, errEmptyVideoSkipped
 		}
-		return moderation.NormalizedResult{}, fmt.Errorf("frame extraction produced zero frames")
+		return moderation.NormalizedResult{}, nil, fmt.Errorf("frame extraction produced zero frames")
 	}
 
 	// Optional post-processing: drop visually near-duplicate frames
@@ -385,7 +406,7 @@ func (p *Pipeline) processVideo(ctx context.Context, j queue.Job) (moderation.No
 		fs = fs[:p.MaxScanFrames]
 	}
 
-	results := make([]moderation.FrameResult, len(fs))
+	outcomes := make([]frameOutcome, len(fs))
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(p.concurrency())
 	for i, f := range fs {
@@ -397,16 +418,16 @@ func (p *Pipeline) processVideo(ctx context.Context, j queue.Job) (moderation.No
 			defer func() {
 				if r := recover(); r != nil {
 					ts := f.TimestampSec
-					results[i] = moderation.FrameResult{
+					outcomes[i] = frameOutcome{res: moderation.FrameResult{
 						TimestampSec: &ts,
 						Status:       moderation.FrameError,
 						Error:        fmt.Sprintf("frame task panic: %v", r),
 						Categories:   []moderation.CategoryResult{},
-					}
+					}}
 				}
 			}()
 			ts := f.TimestampSec
-			fr, err := p.evaluateFrame(gctx, f.Path, &ts)
+			fr, raw, err := p.evaluateFrame(gctx, f.Path, &ts)
 			if err != nil {
 				fr = moderation.FrameResult{
 					TimestampSec: &ts,
@@ -414,58 +435,138 @@ func (p *Pipeline) processVideo(ctx context.Context, j queue.Job) (moderation.No
 					Error:        err.Error(),
 					Categories:   []moderation.CategoryResult{},
 				}
+				raw = nil // no provider response stands behind a failed frame
 			}
-			results[i] = fr
+			outcomes[i] = frameOutcome{res: fr, raw: raw}
 			return nil
 		})
 	}
-	_ = g.Wait() // tasks always return nil; outcomes are in results
+	_ = g.Wait() // tasks always return nil; each captured its own outcome
 
-	sort.SliceStable(results, func(a, b int) bool {
-		ta, tb := results[a].TimestampSec, results[b].TimestampSec
+	// Sorting the PAIRS is what keeps each raw response attached to the
+	// frame it describes. See the frameOutcome doc comment.
+	sort.SliceStable(outcomes, func(a, b int) bool {
+		ta, tb := outcomes[a].res.TimestampSec, outcomes[b].res.TimestampSec
 		if ta == nil || tb == nil {
 			return ta != nil
 		}
 		return *ta < *tb
 	})
 
+	results := make([]moderation.FrameResult, len(outcomes))
+	for i, o := range outcomes {
+		results[i] = o.res
+	}
+	raw, err := buildRawEvidence(outcomes)
+	if err != nil {
+		// Fail SAFE, not closed: an unhashable raw response costs the
+		// evidence binding for this record, but it must not change the
+		// verdict — turning a legitimate allow into a dead-lettered error
+		// because a digest could not be built is a different bug. The
+		// audit record still lands, with raw_sha256 empty, and this line
+		// is the trail explaining why.
+		p.log().Error("audit raw evidence could not be assembled; raw_sha256 will be empty",
+			"job_id", j.ID, "frames", len(outcomes), "err", err)
+		raw = nil
+	}
+
 	return moderation.NormalizedResult{
 		Provider:     p.Moderator.Name(),
 		ModelVersion: p.ModelID.ModelVersion,
 		MediaType:    "video",
 		Frames:       results,
-	}, nil
+	}, raw, nil
+}
+
+// frameOutcome pairs a frame's result with the provider response behind
+// it so the two cannot drift apart.
+//
+// They used to be one slice; the raw responses arrived with this change.
+// A second, independently-sorted slice would silently misattribute every
+// response — the fan-out writes by extraction index and the sort reorders
+// by timestamp, so a desync produces a hash that is both wrong and
+// unstable across runs of identical input. Keeping them in one struct
+// makes that failure unrepresentable rather than merely tested against.
+type frameOutcome struct {
+	res moderation.FrameResult
+	raw json.RawMessage
+}
+
+// buildRawEvidence marshals a video's per-frame provider responses into a
+// single JSON array, index-aligned with the sorted frames.
+//
+// A frame with no response — provider error, or a panicked task — is
+// emitted as JSON null rather than skipped, so position i in the array
+// always names the same frame as position i in Frames. Omitting failures
+// instead would shift every later entry and silently misattribute the
+// responses that did arrive; an auditor correlating the two should not
+// have to reconstruct the mapping.
+//
+// When NO frame produced a response the result is nil, not an array of
+// nulls: a record with no evidence behind it must report raw_sha256 as
+// empty rather than as a digest that attests to nothing.
+func buildRawEvidence(outcomes []frameOutcome) (json.RawMessage, error) {
+	raws := make([]json.RawMessage, len(outcomes))
+	haveEvidence := false
+	for i, o := range outcomes {
+		raws[i] = o.raw // a nil entry marshals as JSON null
+		if len(o.raw) > 0 {
+			haveEvidence = true
+		}
+	}
+	if !haveEvidence {
+		return nil, nil
+	}
+	return json.Marshal(raws)
+}
+
+// rawDigest is the audit binding: SHA-256 over the provider evidence,
+// hex-encoded. Empty evidence yields an empty digest — never a hash of
+// nothing, which would read as evidence that does not exist.
+func rawDigest(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:])
 }
 
 // evaluateFrame runs one image (a still or one extracted frame) through
 // pre-flight, the Moderator, and threshold application.
-func (p *Pipeline) evaluateFrame(ctx context.Context, path string, ts *float64) (moderation.FrameResult, error) {
-	raw, err := os.ReadFile(path)
+//
+// It returns the adapter's sanitized Raw alongside the frame result. This
+// is the only place that value survives: every caller hashes it into the
+// audit record and drops it, because the normalization step below keeps
+// res.Frames[0] and discards the rest of the adapter's result — which is
+// exactly how the audit log's raw_sha256 came to be empty on every record
+// a shipped adapter ever produced.
+func (p *Pipeline) evaluateFrame(ctx context.Context, path string, ts *float64) (moderation.FrameResult, json.RawMessage, error) {
+	b, err := os.ReadFile(path)
 	if err != nil {
-		return moderation.FrameResult{}, fmt.Errorf("read %s: %w", path, err)
+		return moderation.FrameResult{}, nil, fmt.Errorf("read %s: %w", path, err)
 	}
-	img := moderation.Image{Bytes: raw, MIME: sniffMIME(raw)}
+	img := moderation.Image{Bytes: b, MIME: sniffMIME(b)}
 
 	// Pre-flight oversize images before the adapter (and before its rate
 	// limiter spends a token).
 	caps := p.Moderator.Capabilities()
-	if caps.MaxImageBytes > 0 && int64(len(raw)) > caps.MaxImageBytes {
-		return moderation.FrameResult{}, fmt.Errorf("image is %d bytes, adapter %s max is %d (terminal)",
-			len(raw), p.Moderator.Name(), caps.MaxImageBytes)
+	if caps.MaxImageBytes > 0 && int64(len(b)) > caps.MaxImageBytes {
+		return moderation.FrameResult{}, nil, fmt.Errorf("image is %d bytes, adapter %s max is %d (terminal)",
+			len(b), p.Moderator.Name(), caps.MaxImageBytes)
 	}
 
 	res, err := p.Moderator.AnalyzeImage(ctx, img)
 	if err != nil {
-		return moderation.FrameResult{}, fmt.Errorf("analyze: %w", err)
+		return moderation.FrameResult{}, nil, fmt.Errorf("analyze: %w", err)
 	}
 	if len(res.Frames) == 0 {
-		return moderation.FrameResult{}, fmt.Errorf("adapter %s returned no frame result", p.Moderator.Name())
+		return moderation.FrameResult{}, nil, fmt.Errorf("adapter %s returned no frame result", p.Moderator.Name())
 	}
 	fr := res.Frames[0]
 	fr.TimestampSec = ts
 	fr.Status = moderation.FrameOK
 	fr.Categories = ApplyThresholds(fr.Categories, p.Thresholds)
-	return fr, nil
+	return fr, res.Raw, nil
 }
 
 // logScanComplete emits the INFO summary (overall rollup) and, at DEBUG,
