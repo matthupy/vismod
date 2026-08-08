@@ -18,6 +18,35 @@ it is not a copy of the content and cannot be used to reconstruct it.
 This is deliberate: an audit trail for moderation decisions must not
 itself become a store of the material being moderated.
 
+### What `raw_sha256` covers
+
+For an **image**, the digest is over the provider's sanitized response to
+that one image.
+
+For a **video**, it is over a JSON array holding one entry per *scanned*
+frame, in timestamp order — the same order as `frames` in the result
+envelope, so position *i* in the array is the response behind frame *i*.
+A frame the provider did not score (a failed call) appears as `null`
+rather than being skipped, so a failure never shifts the frames after it.
+Scanned means after dedup and after the `max_frames` cap: frames that
+never reached the provider are not in `frames` and are not in the digest.
+
+The field is the **empty string** when no provider response stands behind
+the record at all — an extraction failure, or a video where every frame
+errored. An empty digest means "no evidence", not "evidence of nothing";
+these records still carry a verdict (always `error` — vismod never allows
+on failure) and still chain normally.
+
+Records written before this binding existed also carry `raw_sha256: ""`.
+They verify, and they must not be rewritten to add it: the log is
+append-only, and a chain is only evidence for as long as nobody edits its
+history to improve it.
+
+Reproducing a digest requires the provider's response, which vismod
+deliberately does not keep. The field is for the case where you *have* a
+response — from the vendor's own logs, or a captured payload — and need to
+prove it is the one that produced a given verdict.
+
 ## Verifying
 
 ```sh

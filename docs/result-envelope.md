@@ -63,6 +63,16 @@ A job submitted as `kind:"url"` ([REST intake](rest-api.md)) carries a
   never logged and never shown in the operator UI. Do not put secrets in
   it — it reaches every configured sink, including your webhook receiver.
 
+- **`result.raw` is never emitted.** The `NormalizedResult` type carries
+  an optional `raw` field for the provider's sanitized response, but it is
+  the adapter's handoff to the pipeline and stops there — no sink envelope
+  has ever contained it, and none will. What the raw response is used for
+  is the audit log's `raw_sha256`, which binds a verdict to the response
+  that produced it by hash; see [the audit log](audit-log.md). The digest
+  is not in the envelope either: the audit log is where evidence binding
+  lives, and adding it here would put a field on every sink and webhook
+  receiver that nothing downstream asked for.
+
 `result.schema_version` is **`1.2.0`** as of the `ref_digest` addition
 (`1.1.0` added four categories). Both bumps are additive: no field was
 removed, renamed, or given a new meaning, so a `1.1.0` consumer keeps

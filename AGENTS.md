@@ -275,6 +275,28 @@ import needs justification.
   intentional-by-inertia, not proven correct; treat changing it as a
   design change with its own review, and until then budget the webhook's
   `timeout` and `max_attempts` as documented in `config.example.yaml`.
+- **The audit digest travels out of band, and that is not an
+  optimization.** `evaluateFrame` returns the adapter's `Raw` alongside
+  the frame result; `processImage`/`processVideo` hand it up as evidence;
+  `ProcessJob` hashes it into `ResultEnvelope.RawSHA256` (`json:"-"`) and
+  drops it. `Raw` is never written onto the `NormalizedResult` the
+  envelope carries. Two reasons, both load-bearing: invariant 3 forbids
+  `Raw` in an envelope, and `env.Result` is a POINTER the sink already
+  holds by the time `p.Audit.Record` runs — so "populate, then clear
+  after the sink" is a mutation race, not a boundary. `payloadFor` keeps a
+  fallback that hashes `env.Result.Raw` for envelopes built outside the
+  pipeline; that is a safety net, not a second supported path. This field
+  was the empty string on every record a shipped adapter ever produced
+  until it was fixed, because `evaluateFrame` kept `res.Frames[0]` and
+  discarded the rest.
+- **Video raw evidence is sorted in lockstep with its frames.** The
+  fan-out writes by extraction index; `sort.SliceStable` reorders by
+  timestamp afterwards. `frameOutcome` holds the result and its raw
+  response in ONE struct so the sort moves both — a second slice sorted
+  separately (or not at all) misattributes every response and yields a
+  digest that is wrong and unstable across runs of identical input, with
+  no visible symptom. `TestRawEvidenceStaysPairedWithItsFrameAfterTheSort`
+  fails on exactly that. Do not split them back apart.
 - Sink idempotency is **per process and time-bounded**, not durable. Only
   the audit log replays its file on open (`audit.Open` rebuilds `seen`).
   A restart resets every sink's dedupe set, so a job redelivered after a

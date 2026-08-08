@@ -8,7 +8,35 @@ nav_order: 20
 Current state of the work. Rewrite this at the end of every iteration.
 Keep it short — it is read cold at the start of the next one.
 
-**Updated:** 2026-08-03
+**Updated:** 2026-08-07
+
+## Most recent iteration: `raw_sha256` is real
+
+The audit record claims to bind a verdict to its inputs by hash. It did
+not: `raw_sha256` was the empty string on every record any shipped
+adapter ever produced, because `evaluateFrame` kept `res.Frames[0]` and
+dropped the rest of the adapter's `NormalizedResult`, `Raw` included. The
+one construction site that preserved `Raw` was the video-native path, and
+no shipped adapter is video-native. Found by reading a **live Azure
+Content Safety** audit log from the compose stack (three records, two
+sessions, two media kinds, two verdicts — all empty), not a fixture.
+
+The evidence now travels as its own value: `evaluateFrame` returns it,
+`processImage`/`processVideo` hand it up, `ProcessJob` hashes it into
+`ResultEnvelope.RawSHA256` and drops it. `Raw` never lands on the
+`NormalizedResult` an envelope carries — invariant 3 forbids it in an
+envelope, and `env.Result` is a pointer the sink holds before audit runs,
+so clearing it after the sink write would have been a race rather than a
+boundary. The video-native path now lifts and clears `Raw` too, closing
+that latent leak before anyone ships a video-native adapter.
+
+Decisions recorded: video hashes a JSON array with one entry per scanned
+frame in timestamp order; a failed frame holds its index as `null`; no
+provider response at all means an empty digest, not a hash of nothing; no
+schema bump, because envelope serialization is byte-identical. Frames and
+their raw responses are held in one `frameOutcome` struct so the
+post-fan-out timestamp sort moves both — desync is unrepresentable, and
+tested for anyway.
 
 ## Where things stand
 

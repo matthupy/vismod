@@ -53,6 +53,13 @@ func (m *fakeModerator) AnalyzeImage(_ context.Context, img moderation.Image) (m
 		return moderation.NormalizedResult{}, err
 	}
 	score := m.scores[key]
+	// A distinct, deterministic Raw per image, so tests can assert which
+	// response was bound to which frame. Real adapters marshal their own
+	// sanitized response here; fakeRawFor recomputes this independently.
+	raw, err := json.Marshal(fakeRawBody{Frame: key, Score: score})
+	if err != nil {
+		return moderation.NormalizedResult{}, err
+	}
 	return moderation.NormalizedResult{
 		Provider: "fake",
 		Frames: []moderation.FrameResult{{
@@ -63,17 +70,28 @@ func (m *fakeModerator) AnalyzeImage(_ context.Context, img moderation.Image) (m
 				ScoreOrigin:   moderation.OriginProbability,
 			}},
 		}},
+		Raw: raw,
 	}, nil
+}
+
+// fakeRawBody is the fake adapter's sanitized raw response.
+type fakeRawBody struct {
+	Frame string  `json:"frame"`
+	Score float64 `json:"score"`
 }
 
 // fakeFrameSource materializes frame files from given contents.
 type fakeFrameSource struct {
-	contents  []string
-	err       error
-	cleaned   int
-	dir       string
-	zeroClean bool     // return frames == nil but a cleanup
-	gotWFs    []string // workflows requested by the pipeline
+	contents []string
+	// timestamps, when set, overrides the default TimestampSec of
+	// float64(i) — the way to produce frames whose extraction order and
+	// timestamp order disagree.
+	timestamps []float64
+	err        error
+	cleaned    int
+	dir        string
+	zeroClean  bool     // return frames == nil but a cleanup
+	gotWFs     []string // workflows requested by the pipeline
 }
 
 func (f *fakeFrameSource) Frames(_ context.Context, _ string, workflows []string) ([]frames.Frame, func() error, error) {
@@ -91,7 +109,11 @@ func (f *fakeFrameSource) Frames(_ context.Context, _ string, workflows []string
 		if err := os.WriteFile(p, []byte(c), 0o600); err != nil {
 			return nil, cleanup, err
 		}
-		out = append(out, frames.Frame{Index: i, TimestampSec: float64(i), Path: p})
+		ts := float64(i)
+		if i < len(f.timestamps) {
+			ts = f.timestamps[i]
+		}
+		out = append(out, frames.Frame{Index: i, TimestampSec: ts, Path: p})
 	}
 	return out, cleanup, nil
 }
