@@ -3,8 +3,10 @@ package moderate
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"mime/multipart"
 	"net/http"
 	"strconv"
@@ -56,35 +58,134 @@ func retainedErrorBody(body []byte) string {
 	return string(b)
 }
 
+// ErrAttemptsExhausted marks the error returned when the retry budget ran
+// out, as opposed to a terminal status that was never retried.
+//
+// The two need different operator responses — one means "the destination
+// is down or throttling", the other means "the request itself is wrong and
+// will never succeed" — so callers must be able to tell them apart with
+// errors.Is rather than by reading a message.
+var ErrAttemptsExhausted = errors.New("attempts exhausted")
+
+// Bounded reasons for a retry. These reach log fields and metric labels,
+// so they are a closed set: an error string here would be unbounded
+// cardinality, and could carry a URL (i.e. a credential — see
+// WithRetryLog).
+const (
+	retryReasonStatus  = "status"
+	retryReasonNetwork = "network"
+	retryReasonBody    = "read_body"
+)
+
+type doOpts struct {
+	log     *slog.Logger
+	target  string
+	onRetry func()
+}
+
+// DoOption configures DoJSON. It is variadic so every existing adapter
+// call site keeps compiling unchanged.
+type DoOption func(*doOpts)
+
+// WithRetryLog emits one warn-level record before each backoff sleep, so
+// a worker that stalls for seconds inside a retry budget says why.
+//
+// WHAT "target" MEANS — read this before passing anything.
+//
+// target is an OPERATOR-FACING LABEL that answers "which configured thing
+// was being called", NOT an address. It is emitted verbatim as the
+// `target` log field. The name is a frequent source of confusion because
+// it reads like a destination URL, which is the one thing it must never
+// be.
+//
+//	CORRECT:   "webhook[1]"      the sink's position in output.sinks
+//	CORRECT:   "adapter:hive"    the configured adapter
+//	FORBIDDEN: "https://discord.com/api/webhooks/123/abc"
+//	FORBIDDEN: anything derived from the request URL, including
+//	           url.Redacted() — it strips userinfo and leaves the PATH
+//	           intact, and a Discord webhook's token lives in the path.
+//
+// A URL here publishes a credential to stderr on every 429, i.e. exactly
+// when a throttled destination is generating the most log volume.
+// TestDoJSONRetryLogNeverCarriesTheURL fails on any regression.
+//
+// The value must also be LOW-CARDINALITY and caller-chosen — never a job
+// id, a source ref, or an error string, all of which are unbounded and
+// can carry caller data.
+//
+// In the result package, target is set from WebhookOptions.Name, so the
+// `target` field of a retry warning and the `sink` field of the matching
+// give-up error carry the same string. See docs/result-envelope.md.
+func WithRetryLog(log *slog.Logger, target string) DoOption {
+	return func(o *doOpts) {
+		o.log = log
+		o.target = target
+	}
+}
+
+// OnRetry registers a callback fired once per backoff. It lets a caller
+// drive a counter without this package taking a metrics dependency.
+func OnRetry(f func()) DoOption {
+	return func(o *doOpts) { o.onRetry = f }
+}
+
 // DoJSON POSTs body and returns the response body, retrying transient
 // failures with bounded exponential backoff.
 //
 // Classification (F.4): 429, 5xx, timeouts, and transient network errors
 // are retryable; other 4xx are terminal (no retry). Retry-After is
-// honored. After retries are exhausted the error is marked
-// moderation.Retryable so the caller's fail-safe path (Verdict=error →
-// dead-letter) can distinguish it — it never becomes "allow".
-func DoJSON(ctx context.Context, client *http.Client, build func() (*http.Request, error), maxAttempts int, baseBackoff time.Duration, errCodeHeader string) ([]byte, error) {
+// honored. After retries are exhausted the error wraps ErrAttemptsExhausted
+// and is marked moderation.Retryable so the caller's fail-safe path
+// (Verdict=error → dead-letter) can distinguish it — it never becomes
+// "allow".
+func DoJSON(ctx context.Context, client *http.Client, build func() (*http.Request, error), maxAttempts int, baseBackoff time.Duration, errCodeHeader string, opts ...DoOption) ([]byte, error) {
 	if maxAttempts <= 0 {
 		maxAttempts = 3
 	}
 	if baseBackoff <= 0 {
 		baseBackoff = 500 * time.Millisecond
 	}
+	var o doOpts
+	for _, opt := range opts {
+		opt(&o)
+	}
+
+	// backoff logs the wait and then performs it. Every sleep in this
+	// function goes through here, so there is no silent stall path.
+	backoff := func(attempt int, d time.Duration, status int, reason string) error {
+		if o.onRetry != nil {
+			o.onRetry()
+		}
+		if o.log != nil {
+			o.log.Warn("retrying after transient failure",
+				"target", o.target,
+				"attempt", attempt,
+				"max_attempts", maxAttempts,
+				"delay_ms", d.Milliseconds(),
+				"status", status,
+				"reason", reason,
+			)
+		}
+		return sleepCtx(ctx, d)
+	}
+
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		req, err := build()
 		if err != nil {
 			return nil, err // terminal: request construction bug
 		}
+		status, reason := 0, retryReasonNetwork
 		resp, err := client.Do(req.WithContext(ctx))
 		if err != nil {
 			lastErr = err // network/timeout: retryable
 		} else {
 			body, rerr := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 			_ = resp.Body.Close()
+			status = resp.StatusCode
 			if rerr != nil {
 				lastErr = rerr
+				reason = retryReasonBody
 			} else if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 				return body, nil
 			} else {
@@ -96,8 +197,9 @@ func DoJSON(ctx context.Context, client *http.Client, build func() (*http.Reques
 					return nil, herr // terminal 4xx: fail now, no retry
 				}
 				lastErr = herr
+				reason = retryReasonStatus
 				if ra := RetryAfter(resp); ra > 0 && attempt < maxAttempts {
-					if err := sleepCtx(ctx, ra); err != nil {
+					if err := backoff(attempt, ra, status, reason); err != nil {
 						return nil, moderation.Retryable(lastErr)
 					}
 					continue
@@ -107,7 +209,8 @@ func DoJSON(ctx context.Context, client *http.Client, build func() (*http.Reques
 				// long enough to actually leave it (Azure returns 429 with
 				// no header on quota exhaustion).
 				if resp.StatusCode == http.StatusTooManyRequests && attempt < maxAttempts {
-					if err := sleepCtx(ctx, rate429Floor*time.Duration(1<<(attempt-1))); err != nil {
+					d := rate429Floor * time.Duration(1<<(attempt-1))
+					if err := backoff(attempt, d, status, reason); err != nil {
 						return nil, moderation.Retryable(lastErr)
 					}
 					continue
@@ -115,12 +218,13 @@ func DoJSON(ctx context.Context, client *http.Client, build func() (*http.Reques
 			}
 		}
 		if attempt < maxAttempts {
-			if err := sleepCtx(ctx, baseBackoff*time.Duration(1<<(attempt-1))); err != nil {
+			d := baseBackoff * time.Duration(1<<(attempt-1))
+			if err := backoff(attempt, d, status, reason); err != nil {
 				return nil, moderation.Retryable(lastErr)
 			}
 		}
 	}
-	return nil, moderation.Retryable(fmt.Errorf("after %d attempts: %w", maxAttempts, lastErr))
+	return nil, moderation.Retryable(fmt.Errorf("%w after %d attempts: %w", ErrAttemptsExhausted, maxAttempts, lastErr))
 }
 
 // rate429Floor is the minimum backoff for a 429 that carries no usable

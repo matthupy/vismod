@@ -123,7 +123,8 @@ internal/queue/        Queue iface; memq (dev, non-durable) + redisq
 internal/pipeline/     per-job flow: frames -> dedup -> fan-out -> thresholds
                        -> rollup -> sink -> audit -> ack/DLQ
 internal/result/       ResultEnvelope + Sink implementations (JSONL, file,
-                       webhook, multi)
+                       webhook, multi) + routing (Predicate, RoutedSink)
+                       and rendering (Formatter: json, discord)
 internal/audit/        append-only hash-chained log + verify (JCS canonical)
 internal/observe/      slog, Prometheus metrics, backpressure, JobTracker
 internal/ui/           embedded read-mostly dashboard (off by default)
@@ -261,6 +262,32 @@ import needs justification.
   `WebhookSink` claims a JobID before sending and RELEASES it on failure;
   dropping that release would make a failed webhook permanently skipped
   on redelivery.
+- **A sink predicate can only NARROW, so the fail-safe lives in the config
+  SHAPE, not in the predicate.** `result.Predicate` is a closed struct
+  (verdicts / categories+min score / source kinds; OR within a group, AND
+  across groups) precisely so an unfireable rule is a boot refusal. But
+  no per-predicate check can catch the real hazard: if EVERY sink is
+  predicated, an envelope matching none of them is emitted nowhere, and a
+  rule that is syntactically perfect and simply never matches passes every
+  static check. `config.validateOutput` and `cli.buildSinks` therefore
+  both require at least one sink with `Predicate.IsEmpty()`, overridable
+  only by `output.allow_unrouted`. Do not add an expression language here
+  — the moment a predicate needs a parser, that boot-time guarantee is
+  gone. Two more rules that look like details and are not: a predicate
+  MISS returns nil (an error would reach `queue.Retry` and re-bill the
+  vendor for every allow verdict), and a nil `Score` never satisfies a
+  minimum, including a minimum of 0 — could-not-evaluate is not a value.
+- **A non-JSON `Formatter` is a disclosure boundary.** `format` (json,
+  discord) is orthogonal to `type` (stdout, file, webhook): transport and
+  rendering are separate axes, so a chat integration is a formatter, never
+  a new sink type. The carve-out that lets caller `metadata` sit in a sink
+  envelope does NOT extend to a rendered chat message — that is a
+  third-party service. Chat formatters are allow-list renderers that name
+  every field they emit, so adding a field to `ResultEnvelope` can never
+  silently start publishing it to Discord;
+  `TestDiscordFormatterNeverLeaksMetadata` fails on exactly that. Null
+  scores render as `unknown`, never `0.00`, for the same reason they
+  serialize as `null`.
 - **A sink failure costs vendor money and loses the audit record.** The
   sink write happens BEFORE `p.Audit.Record` in
   `internal/pipeline/pipeline.go`, and a sink error returns
@@ -275,6 +302,45 @@ import needs justification.
   intentional-by-inertia, not proven correct; treat changing it as a
   design change with its own review, and until then budget the webhook's
   `timeout` and `max_attempts` as documented in `config.example.yaml`.
+- **A webhook URL is a CREDENTIAL, so nothing on the delivery path may log
+  it.** A Discord webhook URL carries its token in the PATH
+  (`/api/webhooks/<id>/<token>`), and `url.Redacted()` does not help — it
+  strips userinfo and leaves the path intact. Every log field and error
+  message on the retry/failure path therefore names an operator-facing
+  label (`webhook[1]`, from `WebhookOptions.Name`) and never the URL;
+  `moderate.WithRetryLog` takes that label for the same reason. **Its
+  parameter is called `target`, which reads like an address and is not
+  one** — it is the sink's zero-based position in `output.sinks`, or
+  `adapter:hive` for an adapter call. That misreading is the likely way
+  this invariant gets broken, so the meaning is spelled out in three
+  places (the `WithRetryLog` godoc, `WebhookOptions.Name`, and
+  docs/result-envelope.md) and must stay spelled out. One value, two field
+  names: `target` on the retry warning (shared with adapter calls) and
+  `sink` on the give-up error (matching `output.sinks` and the
+  `vismod_sink_*` metrics); they must remain equal or the two records
+  cannot be joined, which `TestWebhookRetryTargetMatchesGiveUpSink`
+  asserts. The
+  redirect refusal in `NewWebhookSink` also stops naming its target: that
+  string is attacker-chosen text on a path that gets logged.
+  `TestWebhookDeliveryLogNeverCarriesTheURL` and
+  `TestDoJSONRetryLogNeverCarriesTheURL` fail on any regression. The same
+  rule bounds the log/metric `reason` and `status` fields to closed sets —
+  an error string there is both a cardinality bomb and a way for a URL to
+  reach a label.
+- **"Gave up after N attempts" and "the receiver said no" are different
+  errors.** `moderate.DoJSON` retries 429/5xx/timeout with exponential
+  backoff and returns `ErrAttemptsExhausted`; every other 4xx returns
+  immediately with an `HTTPError` and no retry at all. Both mean the
+  envelope arrived nowhere, so every sink wraps `result.ErrDeliveryFailed`
+  — one `errors.Is` answers "did this destination get it?" regardless of
+  transport — but the bounded `reason` (`exhausted` / `rejected` /
+  `format` / `write`) is what tells an operator whether to look for an
+  outage or a bad payload. Do not collapse them, and do not replace the
+  underlying error when wrapping: `moderation.IsRetryable` still decides
+  the QUEUE-level disposition and must survive. Retries are counted in
+  `vismod_sink_retries_total` and give-ups in
+  `vismod_sink_write_failures_total`; rising retries with flat failures is
+  a destination that is throttling but still delivering.
 - **The audit digest travels out of band, and that is not an
   optimization.** `evaluateFrame` returns the adapter's `Raw` alongside
   the frame result; `processImage`/`processVideo` hand it up as evidence;

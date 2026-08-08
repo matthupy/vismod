@@ -46,13 +46,13 @@ func (s *FileSink) Write(_ context.Context, env ResultEnvelope) error {
 	b, err := json.Marshal(env)
 	if err != nil {
 		s.d.Release(env.JobID)
-		return fmt.Errorf("result: marshal envelope: %w", err)
+		return fmt.Errorf("%w: file sink (%s): %w", ErrDeliveryFailed, deliveryReasonFormat, err)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, err := s.f.Write(append(b, '\n')); err != nil {
 		s.d.Release(env.JobID)
-		return fmt.Errorf("result: write envelope: %w", err)
+		return fmt.Errorf("%w: file sink (%s): %w", ErrDeliveryFailed, deliveryReasonWrite, err)
 	}
 	return nil
 }

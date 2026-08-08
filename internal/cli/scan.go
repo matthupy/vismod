@@ -163,7 +163,7 @@ func runScan(ctx context.Context, out io.Writer, args []string, opts scanOptions
 		}()
 	}
 
-	sink, closeSinks, err := buildSinks(cfg, out, nil)
+	sink, closeSinks, err := buildSinks(cfg, out, nil, log)
 	if err != nil {
 		return 0, err
 	}

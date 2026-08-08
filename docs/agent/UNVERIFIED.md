@@ -260,3 +260,38 @@ auditor must hold to reproduce the digest.
 The pre-fix state is settled and needs no further proof: the empty
 `raw_sha256` was observed on live Azure records dated 2026-08-03 and
 2026-08-07 in the `audit-b` volume.
+
+## Partly verified: the Discord payload reaches a real Discord webhook
+
+**Settled on 2026-08-08.** An operator ran the compose stack against a
+live Discord webhook with `format: discord` and
+`predicate.verdicts: [block, error]`, and messages arrived in the
+channel. `result.discordFormatter`'s Execute Webhook body (`username`,
+`embeds[]`, each embed carrying `title`, `color`, `timestamp`, `fields[]`
+of `{name,value,inline}`) is therefore accepted by the real API, not only
+by the `httptest` server this repo wrote.
+
+The SHAPE was separately verified against the Discord API reference on
+2026-08-07 (`docs.discord.com/developers/resources/webhook` for Execute
+Webhook, `.../resources/message` for the Embed object): embeds an array
+of at most 10, a successful call answering `204 No Content`, and the
+limits enforced in `fitEmbedBudget` — title 256, field name 256, field
+value 1024, and a 6000-character combined budget across title plus all
+field names and values.
+
+**Still open — two paths the live run did not exercise:**
+
+1. An `error` verdict carrying a **nil `Result`**. The live run's
+   predicate accepted `error`, but a scan that fails before any result
+   exists renders a different body (`Score: unknown`, no `Top category`,
+   an `Error` field). Whether Discord accepts *that* body is untested.
+2. The **6000-character clamp**. No envelope in the live run was large
+   enough to reach `fitEmbedBudget`'s squeeze path, so the branch that
+   exists specifically to avoid a `400` has never produced a payload a
+   real endpoint judged. A `400` is terminal in `moderate.DoJSON`, so a
+   failure here is a notification lost with no retry.
+
+**Proves the rest:** submit two jobs against a live webhook — one whose
+provider call fails outright (point the adapter at an unreachable
+endpoint), and one whose `source.ref` is a few thousand characters — and
+record the returned status for each.
