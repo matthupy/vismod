@@ -125,6 +125,39 @@ Do not point a `json` sink at a chat webhook to get around that narrowing.
 The full envelope is the contract for a receiver you control, not for a
 third-party service.
 
+#### Passing metadata through to a notification
+
+Your `metadata` is meant to survive the whole pipeline, and a correlation
+id that reaches the JSON envelope but not the alert a human reads has not
+survived it. `metadata_fields` names the keys a non-JSON sink may publish:
+
+```yaml
+- type: webhook
+  format: discord
+  metadata_fields: [request_id, tenant]   # or ["*"] for every key
+```
+
+Named keys render in the order you list them, ahead of the source ref and
+error string so a long ref can never truncate your id away. `["*"]`
+renders every key, sorted, so two renders of one envelope are identical.
+Omitting the key publishes nothing, which is what every sink did before.
+
+- **Absent keys render nothing** — naming a key the caller didn't send is
+  not an error, so one sink config works across callers that attach
+  different fields.
+- **Scalars render bare** (`abc-123`, `42`, `true`); objects and arrays
+  render as compact JSON.
+- **Embeds cap at 25 fields.** A `["*"]` over a large metadata object is
+  truncated rather than rejected — the verdict fields always survive.
+- **`metadata_fields` on `format: json` is a boot error**, not a no-op:
+  that envelope already carries all metadata.
+
+This is an allow-list on purpose. The person who *writes* metadata is
+usually not the person who *configures the sink*, so naming a key is a
+disclosure decision on behalf of every future caller. vismod validates key
+names at boot but never values — values arrive per job. The guarantee is
+"only the fields you named," never "only safe content."
+
 ### Predicate: which results a sink receives
 
 A sink may carry a `predicate` that narrows what reaches it. It is a

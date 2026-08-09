@@ -47,7 +47,9 @@ func buildSinks(cfg config.Config, stdout io.Writer, m *observe.Metrics, log *sl
 	for i, sc := range cfg.Output.Sinks {
 		// The format is resolved before the transport so an unknown name
 		// is a boot failure with the same shape as an unknown type.
-		fmtr, err := result.FormatterFor(sc.Format)
+		fmtr, err := result.FormatterFor(sc.Format, result.FormatOptions{
+			MetadataFields: sc.MetadataFields,
+		})
 		if err != nil {
 			_ = closeAll()
 			return nil, nil, fmt.Errorf("output.sinks[%d]: %w", i, err)

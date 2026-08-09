@@ -51,7 +51,7 @@ func richEnvelope() ResultEnvelope {
 }
 
 func TestFormatterForUnknownNameIsAnError(t *testing.T) {
-	if _, err := FormatterFor("smoke-signal"); err == nil {
+	if _, err := FormatterFor("smoke-signal", FormatOptions{}); err == nil {
 		t.Fatal("want an error for an unknown format name, got nil")
 	}
 }
@@ -60,7 +60,7 @@ func TestFormatterForUnknownNameIsAnError(t *testing.T) {
 // default: a sink with no `format:` key must send exactly what it sends
 // today.
 func TestFormatterForEmptyNameIsJSON(t *testing.T) {
-	f, err := FormatterFor("")
+	f, err := FormatterFor("", FormatOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,7 +73,7 @@ func TestFormatterForEmptyNameIsJSON(t *testing.T) {
 // compatibility: existing webhook receivers must see no change.
 func TestJSONFormatterIsByteIdenticalToTheEnvelope(t *testing.T) {
 	env := richEnvelope()
-	f, err := FormatterFor("json")
+	f, err := FormatterFor("json", FormatOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,7 +96,7 @@ func TestJSONFormatterIsByteIdenticalToTheEnvelope(t *testing.T) {
 // renderer must not carry it there. Same for a url source's RefDigest and
 // the provider raw digest.
 func TestDiscordFormatterNeverLeaksMetadata(t *testing.T) {
-	f, err := FormatterFor("discord")
+	f, err := FormatterFor("discord", FormatOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -112,7 +112,7 @@ func TestDiscordFormatterNeverLeaksMetadata(t *testing.T) {
 }
 
 func TestDiscordFormatterShape(t *testing.T) {
-	f, _ := FormatterFor("discord")
+	f, _ := FormatterFor("discord", FormatOptions{})
 	body, err := f.Format(richEnvelope())
 	if err != nil {
 		t.Fatal(err)
@@ -160,7 +160,7 @@ func TestDiscordFormatterNullScoreRendersUnknown(t *testing.T) {
 	env.Result.Overall.MaxScore = nil
 	env.Result.Overall.TopCategory = nil
 	env.Result.Overall.Verdict = moderation.VerdictError
-	f, _ := FormatterFor("discord")
+	f, _ := FormatterFor("discord", FormatOptions{})
 	body, err := f.Format(env)
 	if err != nil {
 		t.Fatal(err)
@@ -183,7 +183,7 @@ func TestDiscordFormatterHandlesNilResult(t *testing.T) {
 		Error:      "provider timeout after 3 attempts",
 		FinishedAt: time.Date(2026, 8, 7, 12, 0, 3, 0, time.UTC),
 	}
-	f, _ := FormatterFor("discord")
+	f, _ := FormatterFor("discord", FormatOptions{})
 	body, err := f.Format(env)
 	if err != nil {
 		t.Fatalf("a nil-result envelope must still format: %v", err)
@@ -200,7 +200,7 @@ func TestDiscordFormatterHandlesNilResult(t *testing.T) {
 func TestDiscordFormatterTruncatesLongValues(t *testing.T) {
 	env := richEnvelope()
 	env.Source.Ref = "https://cdn.example.com/" + strings.Repeat("a", 4000) + ".jpg"
-	f, _ := FormatterFor("discord")
+	f, _ := FormatterFor("discord", FormatOptions{})
 	body, err := f.Format(env)
 	if err != nil {
 		t.Fatal(err)
@@ -234,7 +234,7 @@ func TestDiscordFormatterRespectsTheTotalEmbedBudget(t *testing.T) {
 	env.Error = strings.Repeat("e", 4000)
 	env.ModelID.ModelVersion = strings.Repeat("v", 3000)
 
-	f, _ := FormatterFor("discord")
+	f, _ := FormatterFor("discord", FormatOptions{})
 	body, err := f.Format(env)
 	if err != nil {
 		t.Fatal(err)

@@ -59,9 +59,13 @@ go build ./... && go vet ./... && go test ./...
   envelope, log, audit record, queue payload, or UI surface. ONE
   carve-out: caller-supplied `metadata` (`queue.Job.Metadata` /
   `ResultEnvelope.Metadata`, validated by `queue.ValidateMetadata`) is
-  opaque JSON permitted in the queue payload and the result envelope
-  ONLY — still forbidden in the audit log, in logs, and in the UI, and it
-  never influences a verdict. Do not widen it further.
+  opaque JSON permitted in the queue payload, the result envelope, and —
+  only for keys an operator NAMED in `output.sinks[].metadata_fields` — a
+  non-JSON formatter's rendered output. It is still forbidden in the audit
+  log, in logs, and in the UI, and it never influences a verdict. Widening
+  it beyond an operator-named allow-list needs its own review: the point
+  of the allow-list is that a caller adding a metadata key cannot start
+  publishing it anywhere new without an operator naming it first.
 - If the change touched rollup, thresholds, or null handling: the
   existing rollup tests still pass UNMODIFIED. Making them pass by
   weakening them is a failed gate, not a fix.
@@ -280,14 +284,25 @@ import needs justification.
 - **A non-JSON `Formatter` is a disclosure boundary.** `format` (json,
   discord) is orthogonal to `type` (stdout, file, webhook): transport and
   rendering are separate axes, so a chat integration is a formatter, never
-  a new sink type. The carve-out that lets caller `metadata` sit in a sink
-  envelope does NOT extend to a rendered chat message — that is a
-  third-party service. Chat formatters are allow-list renderers that name
+  a new sink type. Chat formatters are allow-list renderers that name
   every field they emit, so adding a field to `ResultEnvelope` can never
   silently start publishing it to Discord;
-  `TestDiscordFormatterNeverLeaksMetadata` fails on exactly that. Null
-  scores render as `unknown`, never `0.00`, for the same reason they
-  serialize as `null`.
+  `TestDiscordFormatterNeverLeaksMetadata` fails on exactly that, and
+  `Source.RefDigest` and the provider raw digest stay out permanently.
+  Caller `metadata` is the ONE opt-in exception, because passthrough that
+  dies before the notification a human reads is not passthrough: a
+  correlation id is the field operators most need in an alert.
+  `output.sinks[].metadata_fields` names the keys a sink may publish (`*`
+  for all), defaulting to none. Keep it an allow-list rather than a
+  boolean — the caller who WRITES metadata is not the operator who
+  configures the sink, so an enumerated key is a reviewable disclosure
+  decision while `include_metadata: true` is a blank cheque against every
+  future caller. Note the limit honestly: only key NAMES are knowable at
+  boot, so vismod can promise "only the fields you named" and never "only
+  safe content". `metadata_fields` on `format: json` is a boot refusal,
+  not a no-op — that envelope already carries everything. Null scores
+  render as `unknown`, never `0.00`, for the same reason they serialize as
+  `null`.
 - **A sink failure costs vendor money and loses the audit record.** The
   sink write happens BEFORE `p.Audit.Record` in
   `internal/pipeline/pipeline.go`, and a sink error returns

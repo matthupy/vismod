@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/vismod/vismod/pkg/moderation"
@@ -27,31 +28,95 @@ type Formatter interface {
 	Format(env ResultEnvelope) ([]byte, error)
 }
 
-var formatters = map[string]Formatter{
-	"json":    jsonFormatter{},
-	"discord": discordFormatter{},
+// MetadataWildcard names every key in a job's metadata object. It is the
+// "pass the whole thing through" setting, for operators who do not control
+// which keys their callers attach.
+const MetadataWildcard = "*"
+
+// FormatOptions is the per-sink configuration a Formatter is built with.
+type FormatOptions struct {
+	// MetadataFields names the caller-metadata keys this sink may publish,
+	// in the order they should render. Empty publishes none, which is the
+	// backward-compatible default. A single MetadataWildcard entry
+	// publishes every key, sorted for determinism.
+	//
+	// This is an ALLOW-LIST by design: naming keys means a caller adding a
+	// new metadata key can never silently start publishing it to a
+	// third-party service. See the disclosure note on discordFormatter.
+	MetadataFields []string
+}
+
+// normalized validates the options and returns a canonical copy.
+func (o FormatOptions) normalized() (FormatOptions, error) {
+	if len(o.MetadataFields) == 0 {
+		return FormatOptions{}, nil
+	}
+	seen := make(map[string]bool, len(o.MetadataFields))
+	out := make([]string, 0, len(o.MetadataFields))
+	wildcard := false
+	for _, k := range o.MetadataFields {
+		k = strings.TrimSpace(k)
+		if k == "" {
+			return FormatOptions{}, fmt.Errorf("result: metadata_fields contains an empty key")
+		}
+		if k == MetadataWildcard {
+			wildcard = true
+		}
+		if seen[k] {
+			return FormatOptions{}, fmt.Errorf("result: metadata_fields lists %q twice", k)
+		}
+		seen[k] = true
+		out = append(out, k)
+	}
+	// A wildcard already covers every key, so naming one alongside it is
+	// an operator who expects ordering or filtering they will not get.
+	if wildcard && len(out) > 1 {
+		return FormatOptions{}, fmt.Errorf("result: metadata_fields %q cannot be combined with named keys", MetadataWildcard)
+	}
+	return FormatOptions{MetadataFields: out}, nil
+}
+
+// formatterFactories builds a Formatter per sink, because format options
+// are per-sink configuration rather than process-wide.
+var formatterFactories = map[string]func(FormatOptions) (Formatter, error){
+	"json": func(o FormatOptions) (Formatter, error) {
+		// The json envelope already carries metadata in full, so naming
+		// fields here configures nothing. Accepting it silently is exactly
+		// the misconfiguration this project refuses to boot on.
+		if len(o.MetadataFields) > 0 {
+			return nil, fmt.Errorf("result: metadata_fields is not valid for format \"json\" — the envelope already carries all metadata")
+		}
+		return jsonFormatter{}, nil
+	},
+	"discord": func(o FormatOptions) (Formatter, error) {
+		return discordFormatter{metaFields: o.MetadataFields}, nil
+	},
 }
 
 // FormatterFor resolves a configured format name. An empty name is the
 // JSON envelope, so a sink with no `format:` key keeps sending exactly
 // what it sends today.
-func FormatterFor(name string) (Formatter, error) {
+func FormatterFor(name string, opts FormatOptions) (Formatter, error) {
 	key := strings.ToLower(strings.TrimSpace(name))
 	if key == "" {
 		key = "json"
 	}
-	f, ok := formatters[key]
+	newFormatter, ok := formatterFactories[key]
 	if !ok {
 		return nil, fmt.Errorf("result: unknown format %q (want one of: %s)", name, strings.Join(KnownFormats(), ", "))
 	}
-	return f, nil
+	o, err := opts.normalized()
+	if err != nil {
+		return nil, err
+	}
+	return newFormatter(o)
 }
 
 // KnownFormats lists every registered format name, sorted, for config
 // validation and error messages.
 func KnownFormats() []string {
-	names := make([]string, 0, len(formatters))
-	for n := range formatters {
+	names := make([]string, 0, len(formatterFactories))
+	for n := range formatterFactories {
 		names = append(names, n)
 	}
 	sort.Strings(names)
@@ -87,6 +152,9 @@ const (
 	discordMaxFieldName  = 256
 	discordMaxTitle      = 256
 	discordMaxEmbedTotal = 6000
+	// An embed carries at most 25 fields. The core fields alone never
+	// approach it, but a metadata wildcard over a large object does.
+	discordMaxFields = 25
 )
 
 // Embed strip colors, chosen so the verdict is readable at a glance
@@ -121,14 +189,30 @@ type discordPayload struct {
 //
 // It is an ALLOW-LIST renderer: it names each field it emits, so adding a
 // field to ResultEnvelope can never silently start publishing that field
-// to a third-party chat service. Caller Metadata, Source.RefDigest and
-// the provider raw digest are all deliberately absent.
-type discordFormatter struct{}
+// to a third-party chat service. Source.RefDigest and the provider raw
+// digest are deliberately absent and stay that way.
+//
+// Caller Metadata is the one exception, and only by explicit opt-in.
+// Metadata exists to be passed through the whole pipeline — a caller's
+// correlation id is useless if it survives the queue and the envelope but
+// dies at the notification a human actually reads. metaFields therefore
+// names the keys this sink may publish (or MetadataWildcard for all),
+// defaulting to none so an existing config is unchanged. The allow-list
+// shape is what keeps the guarantee: a caller adding a key cannot start
+// publishing it without an operator naming it first.
+//
+// What vismod CANNOT promise is that a named key holds safe content.
+// Metadata is opaque and arrives per job, so only the key names are
+// knowable at boot. Naming a key is a disclosure decision about every
+// future value under it.
+type discordFormatter struct {
+	metaFields []string
+}
 
 func (discordFormatter) Name() string        { return "discord" }
 func (discordFormatter) ContentType() string { return "application/json" }
 
-func (discordFormatter) Format(env ResultEnvelope) ([]byte, error) {
+func (d discordFormatter) Format(env ResultEnvelope) ([]byte, error) {
 	verdict := verdictOf(env)
 
 	color := discordColorAllow
@@ -154,8 +238,17 @@ func (discordFormatter) Format(env ResultEnvelope) ([]byte, error) {
 		{Name: "Verdict", Value: string(verdict), Inline: true},
 		{Name: "Top category", Value: orDash(topCategoryName(env)), Inline: true},
 		{Name: "Score", Value: scoreText(env), Inline: true},
-		{Name: "Source", Value: env.Source.Kind + " · " + env.Source.Ref, Inline: false},
 	}
+
+	// Metadata sits AHEAD of the unbounded free-text fields on purpose.
+	// fitEmbedBudget squeezes in field order, so a correlation id placed
+	// after the source ref would be the first thing truncated away — the
+	// one field the operator configured this for.
+	fields = append(fields, d.metadataFields(env)...)
+
+	fields = append(fields,
+		discordEmbedField{Name: "Source", Value: env.Source.Kind + " · " + env.Source.Ref, Inline: false},
+	)
 	if env.ModelID.Adapter != "" {
 		model := env.ModelID.Adapter
 		if env.ModelID.ModelVersion != "" {
@@ -190,6 +283,84 @@ func (discordFormatter) Format(env ResultEnvelope) ([]byte, error) {
 		return nil, fmt.Errorf("result: marshal discord payload: %w", err)
 	}
 	return b, nil
+}
+
+// metadataFields renders the caller-metadata keys this sink is configured
+// to publish. It returns nothing when none are configured, when the job
+// carried no metadata, or when the metadata will not parse — a rendering
+// path must never fail a delivery over caller free text.
+//
+// queue.ValidateMetadata guarantees a compacted JSON OBJECT under a size
+// cap, so the unmarshal target is safe; the error branch exists for
+// envelopes constructed outside that path.
+func (d discordFormatter) metadataFields(env ResultEnvelope) []discordEmbedField {
+	if len(d.metaFields) == 0 || len(env.Metadata) == 0 {
+		return nil
+	}
+	var meta map[string]json.RawMessage
+	if err := json.Unmarshal(env.Metadata, &meta); err != nil {
+		return nil
+	}
+
+	keys := d.metaFields
+	if len(keys) == 1 && keys[0] == MetadataWildcard {
+		// Go map iteration is randomized, so an unsorted wildcard would
+		// reorder fields between two renders of the same envelope.
+		keys = make([]string, 0, len(meta))
+		for k := range meta {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+	}
+
+	// Leave room for the core fields, which carry the verdict and must
+	// never be the thing a metadata wildcard pushes out of the embed.
+	budget := discordMaxFields - discordCoreFieldCount
+	out := make([]discordEmbedField, 0, min(len(keys), budget))
+	for _, k := range keys {
+		if len(out) >= budget {
+			break
+		}
+		raw, ok := meta[k]
+		if !ok {
+			continue // a key the caller did not send renders nothing
+		}
+		out = append(out, discordEmbedField{
+			Name:   clamp(k, discordMaxFieldName),
+			Value:  orDash(metadataValueText(raw)),
+			Inline: true,
+		})
+	}
+	return out
+}
+
+// discordCoreFieldCount is the most fields Format emits before metadata:
+// Job, Verdict, Top category, Score, Source, Model, Error.
+const discordCoreFieldCount = 7
+
+// metadataValueText renders one metadata value. Scalars render bare so a
+// correlation id reads as itself rather than as a quoted JSON string;
+// objects and arrays keep their compact JSON, which is honest about the
+// caller having sent a structure.
+func metadataValueText(raw json.RawMessage) string {
+	var v any
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return clamp(string(raw), discordMaxFieldValue)
+	}
+	switch t := v.(type) {
+	case string:
+		return clamp(t, discordMaxFieldValue)
+	case bool:
+		return strconv.FormatBool(t)
+	case float64:
+		// -1 renders the shortest form that round-trips, so an integer id
+		// does not come back as 1.234567e+06.
+		return strconv.FormatFloat(t, 'f', -1, 64)
+	case nil:
+		return "null"
+	default:
+		return clamp(string(raw), discordMaxFieldValue)
+	}
 }
 
 // fitEmbedBudget clamps the title and every field so the embed satisfies

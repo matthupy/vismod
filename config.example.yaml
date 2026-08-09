@@ -358,6 +358,7 @@ output:
     # - type: webhook
     #   url: https://discord.com/api/webhooks/<id>/<token>
     #   format: discord            # json (default) | discord
+    #   metadata_fields: [request_id]   # named keys, or ["*"] for all
     #   predicate:                 # verdicts | categories | source_kinds
     #     verdicts: [block]
 

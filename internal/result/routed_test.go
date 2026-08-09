@@ -76,7 +76,7 @@ func TestWebhookSinkSendsTheDiscordPayload(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	f, err := FormatterFor("discord")
+	f, err := FormatterFor("discord", FormatOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}

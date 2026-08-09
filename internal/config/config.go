@@ -317,6 +317,19 @@ type SinkConfig struct {
 	// Predicate narrows which envelopes this sink receives. The zero value
 	// is unconditional. See the catch-all rule in validateOutput.
 	Predicate result.Predicate `mapstructure:"predicate"`
+	// MetadataFields names which caller-metadata keys a non-JSON format may
+	// publish ("*" for all). Empty publishes none. Metadata exists to be
+	// passed through the whole pipeline, so a correlation id must be able
+	// to reach a chat notification — but naming a key is a DISCLOSURE
+	// decision about every future value under it, and only the key names
+	// are knowable at boot. Not valid for format "json", whose envelope
+	// already carries all metadata.
+	MetadataFields []string `mapstructure:"metadata_fields"`
+}
+
+// formatOptions is the per-sink rendering config handed to result.
+func (s *SinkConfig) formatOptions() result.FormatOptions {
+	return result.FormatOptions{MetadataFields: s.MetadataFields}
 }
 
 // OutputConfig selects where result envelopes go. An absent block means
@@ -610,7 +623,7 @@ func validateOutput(o *OutputConfig) error {
 	unconditional := 0
 	for i := range o.Sinks {
 		s := &o.Sinks[i]
-		if _, err := result.FormatterFor(s.Format); err != nil {
+		if _, err := result.FormatterFor(s.Format, s.formatOptions()); err != nil {
 			return fmt.Errorf("config: output.sinks[%d]: %w", i, err)
 		}
 		if err := s.Predicate.Normalize(); err != nil {

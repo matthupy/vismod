@@ -167,3 +167,91 @@ func TestDefaultStdoutSinkIsUnconditional(t *testing.T) {
 		t.Error("the default stdout sink must be unconditional")
 	}
 }
+
+// TestOutputSinkParsesMetadataFields: a caller's correlation id has to be
+// nameable in config, or passthrough metadata stops at the JSON envelope.
+func TestOutputSinkParsesMetadataFields(t *testing.T) {
+	cfg, err := Load(writeTempYAML(t, `
+ffmpeg:
+  max_frames: 8
+output:
+  sinks:
+    - type: stdout
+    - type: webhook
+      url: `+discordURL+`
+      format: discord
+      metadata_fields: [request_id, tenant]
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := cfg.Output.Sinks[1].MetadataFields
+	if len(got) != 2 || got[0] != "request_id" || got[1] != "tenant" {
+		t.Errorf("metadata_fields: got %v, want [request_id tenant]", got)
+	}
+}
+
+// TestOutputSinkAcceptsMetadataWildcard covers the operator who does not
+// control which keys their callers attach.
+func TestOutputSinkAcceptsMetadataWildcard(t *testing.T) {
+	if _, err := Load(writeTempYAML(t, `
+ffmpeg:
+  max_frames: 8
+output:
+  sinks:
+    - type: stdout
+    - type: webhook
+      url: `+discordURL+`
+      format: discord
+      metadata_fields: ["*"]
+`)); err != nil {
+		t.Fatalf("a metadata wildcard must be accepted: %v", err)
+	}
+}
+
+// TestOutputSinkRefusesMetadataFieldsOnJSON: the json envelope already
+// carries all metadata, so the key configures nothing. Accepting it
+// silently is the misconfiguration class this project refuses to boot on.
+func TestOutputSinkRefusesMetadataFieldsOnJSON(t *testing.T) {
+	_, err := Load(writeTempYAML(t, `
+ffmpeg:
+  max_frames: 8
+output:
+  sinks:
+    - type: webhook
+      url: https://collector.internal/results
+      metadata_fields: [request_id]
+`))
+	if err == nil {
+		t.Fatal("want a boot refusal for metadata_fields on format json")
+	}
+	if !strings.Contains(err.Error(), "metadata_fields") {
+		t.Errorf("error must name the offending key, got: %v", err)
+	}
+}
+
+// TestOutputSinkRefusesBadMetadataFields: an unusable entry is a boot
+// refusal, not a rule that quietly renders nothing.
+func TestOutputSinkRefusesBadMetadataFields(t *testing.T) {
+	for name, list := range map[string]string{
+		"duplicate":     `[id, id]`,
+		"empty key":     `["", id]`,
+		"wildcard plus": `["*", id]`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Load(writeTempYAML(t, `
+ffmpeg:
+  max_frames: 8
+output:
+  sinks:
+    - type: stdout
+    - type: webhook
+      url: `+discordURL+`
+      format: discord
+      metadata_fields: `+list+`
+`)); err == nil {
+				t.Errorf("want a boot refusal for %s", name)
+			}
+		})
+	}
+}
