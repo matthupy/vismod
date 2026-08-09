@@ -48,10 +48,16 @@ handful of tool calls, and do not spawn agents to re-check your own work.
 A task is done when all of these hold:
 
 ```sh
+gofmt -l .    # must print NOTHING
 go build ./... && go vet ./... && go test ./...
 ```
 
-- All three exit 0. A skipped ffmpeg test is a pass; a failing one is not.
+- All four pass. A skipped ffmpeg test is a pass; a failing one is not.
+- **`gofmt -l .` is first because it is the one CI runs that nothing else
+  catches.** `go vet` does not check formatting and `go test` does not
+  care, so a build-vet-test gate is green on code CI rejects. The usual
+  way in is a scripted edit (`sed` over call sites) that produces valid
+  but unformatted Go — `2*time.Second` rather than `2 * time.Second`.
 - Every doc under "Docs that must stay true" whose described behavior
   changed is updated in the SAME commit.
 - No new module import unless the commit message justifies it.

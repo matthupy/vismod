@@ -115,7 +115,7 @@ func TestWebhookSinkNilFormatterKeepsTheJSONEnvelope(t *testing.T) {
 	defer srv.Close()
 
 	env := richEnvelope()
-	s := NewWebhookSink(srv.URL, WebhookOptions{Timeout: 2*time.Second, MaxAttempts: 1})
+	s := NewWebhookSink(srv.URL, WebhookOptions{Timeout: 2 * time.Second, MaxAttempts: 1})
 	if err := s.Write(context.Background(), env); err != nil {
 		t.Fatal(err)
 	}
