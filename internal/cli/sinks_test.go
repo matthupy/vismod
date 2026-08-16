@@ -12,7 +12,7 @@ import (
 
 func TestBuildSinksDefaultsToStdout(t *testing.T) {
 	cfg := config.Defaults()
-	s, closeFn, err := buildSinks(cfg, io.Discard, observe.NewMetrics())
+	s, closeFn, err := buildSinks(cfg, io.Discard, observe.NewMetrics(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -27,7 +27,7 @@ func TestBuildSinksConstructsFileSink(t *testing.T) {
 	cfg := config.Defaults()
 	cfg.Output.Sinks = []config.SinkConfig{{Type: "file", Path: p}}
 
-	_, closeFn, err := buildSinks(cfg, io.Discard, observe.NewMetrics())
+	_, closeFn, err := buildSinks(cfg, io.Discard, observe.NewMetrics(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -40,7 +40,7 @@ func TestBuildSinksConstructsFileSink(t *testing.T) {
 func TestBuildSinksUnwritableFilePathRefusesBoot(t *testing.T) {
 	cfg := config.Defaults()
 	cfg.Output.Sinks = []config.SinkConfig{{Type: "file", Path: filepath.Join(t.TempDir(), "nope", "out.jsonl")}}
-	if _, _, err := buildSinks(cfg, io.Discard, observe.NewMetrics()); err == nil {
+	if _, _, err := buildSinks(cfg, io.Discard, observe.NewMetrics(), nil); err == nil {
 		t.Fatal("want boot refusal for an unwritable path, got nil")
 	}
 }
@@ -48,7 +48,7 @@ func TestBuildSinksUnwritableFilePathRefusesBoot(t *testing.T) {
 func TestBuildSinksUnknownTypeRefusesBoot(t *testing.T) {
 	cfg := config.Defaults()
 	cfg.Output.Sinks = []config.SinkConfig{{Type: "carrier-pigeon"}}
-	if _, _, err := buildSinks(cfg, io.Discard, observe.NewMetrics()); err == nil {
+	if _, _, err := buildSinks(cfg, io.Discard, observe.NewMetrics(), nil); err == nil {
 		t.Fatal("want boot refusal for an unknown sink type, got nil")
 	}
 }
@@ -61,7 +61,7 @@ func TestBuildSinksClosesFileOnPartialFailure(t *testing.T) {
 		{Type: "file", Path: good},
 		{Type: "file", Path: filepath.Join(dir, "nope", "bad.jsonl")},
 	}
-	if _, _, err := buildSinks(cfg, io.Discard, observe.NewMetrics()); err == nil {
+	if _, _, err := buildSinks(cfg, io.Discard, observe.NewMetrics(), nil); err == nil {
 		t.Fatal("want boot refusal, got nil")
 	}
 	// The already-opened good file must have been closed, not leaked.
@@ -84,7 +84,7 @@ func TestBuildSinksClosesFileOnPartialFailure(t *testing.T) {
 func TestBuildSinksZeroSinksRefusesBoot(t *testing.T) {
 	cfg := config.Defaults()
 	cfg.Output.Sinks = []config.SinkConfig{}
-	s, closeFn, err := buildSinks(cfg, io.Discard, observe.NewMetrics())
+	s, closeFn, err := buildSinks(cfg, io.Discard, observe.NewMetrics(), nil)
 	if err == nil {
 		if closeFn != nil {
 			_ = closeFn()

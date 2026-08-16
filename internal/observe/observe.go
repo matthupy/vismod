@@ -47,6 +47,7 @@ type Metrics struct {
 	FramesScannedTotal     prometheus.Counter
 	JobFrames              *prometheus.HistogramVec
 	SinkWriteFailuresTotal *prometheus.CounterVec
+	SinkRetriesTotal       *prometheus.CounterVec
 	FetchSeconds           prometheus.Histogram
 	FetchBytesTotal        prometheus.Counter
 	FetchFailuresTotal     *prometheus.CounterVec
@@ -91,6 +92,10 @@ func NewMetrics() *Metrics {
 			Name: "vismod_sink_write_failures_total",
 			Help: "Result-sink write failures, by sink type.",
 		}, []string{"type"}),
+		SinkRetriesTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "vismod_sink_retries_total",
+			Help: "Result-sink delivery retries (one per backoff), by sink type. Distinct from vismod_sink_write_failures_total, which counts only final give-ups: a rising retry rate with flat failures is a destination that is throttling but still delivering.",
+		}, []string{"type"}),
 		FetchSeconds: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name:    "vismod_fetch_duration_seconds",
 			Help:    "Remote media fetch latency.",
@@ -109,7 +114,7 @@ func NewMetrics() *Metrics {
 	reg.MustRegister(m.JobsTotal, m.AdapterRequestSeconds, m.AdapterErrorsTotal,
 		m.QueueDepth, m.ProcessingDepth, m.DeadletterDepth, m.WorkersActive,
 		m.FramesScannedTotal, m.JobFrames, m.SinkWriteFailuresTotal,
-		m.FetchSeconds, m.FetchBytesTotal, m.FetchFailuresTotal)
+		m.SinkRetriesTotal, m.FetchSeconds, m.FetchBytesTotal, m.FetchFailuresTotal)
 	return m
 }
 

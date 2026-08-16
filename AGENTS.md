@@ -48,10 +48,26 @@ handful of tool calls, and do not spawn agents to re-check your own work.
 A task is done when all of these hold:
 
 ```sh
+gofmt -l .    # must print NOTHING
 go build ./... && go vet ./... && go test ./...
 ```
 
-- All three exit 0. A skipped ffmpeg test is a pass; a failing one is not.
+- All four pass. A skipped ffmpeg test is a pass; a failing one is not.
+- **`gofmt -l .` is first because it is the one CI runs that nothing else
+  catches.** `go vet` does not check formatting and `go test` does not
+  care, so a build-vet-test gate is green on code CI rejects. The usual
+  way in is a scripted edit (`sed` over call sites) that produces valid
+  but unformatted Go — `2*time.Second` rather than `2 * time.Second`.
+- **Every line the change adds is covered, or the commit says why not.**
+  The target is 100% patch coverage; >=90% is accepted, and the gap is
+  reserved for lines that cannot be covered — branches unreachable by
+  construction, kept as guards against a future edit. Below 80% the
+  change is undertested and not done. Name the uncovered lines and the
+  reason in the commit message; "hard to test" is a reason to restructure
+  the code, not to skip the test. Failure paths come first: a sink that
+  cannot render, a provider that ran out of retries, a config that must
+  refuse to boot. Those are where the fail-safe posture lives, and an
+  untested failure arm is how a silent `allow` ships.
 - Every doc under "Docs that must stay true" whose described behavior
   changed is updated in the SAME commit.
 - No new module import unless the commit message justifies it.
@@ -59,9 +75,13 @@ go build ./... && go vet ./... && go test ./...
   envelope, log, audit record, queue payload, or UI surface. ONE
   carve-out: caller-supplied `metadata` (`queue.Job.Metadata` /
   `ResultEnvelope.Metadata`, validated by `queue.ValidateMetadata`) is
-  opaque JSON permitted in the queue payload and the result envelope
-  ONLY — still forbidden in the audit log, in logs, and in the UI, and it
-  never influences a verdict. Do not widen it further.
+  opaque JSON permitted in the queue payload, the result envelope, and —
+  only for keys an operator NAMED in `output.sinks[].metadata_fields` — a
+  non-JSON formatter's rendered output. It is still forbidden in the audit
+  log, in logs, and in the UI, and it never influences a verdict. Widening
+  it beyond an operator-named allow-list needs its own review: the point
+  of the allow-list is that a caller adding a metadata key cannot start
+  publishing it anywhere new without an operator naming it first.
 - If the change touched rollup, thresholds, or null handling: the
   existing rollup tests still pass UNMODIFIED. Making them pass by
   weakening them is a failed gate, not a fix.
@@ -123,7 +143,8 @@ internal/queue/        Queue iface; memq (dev, non-durable) + redisq
 internal/pipeline/     per-job flow: frames -> dedup -> fan-out -> thresholds
                        -> rollup -> sink -> audit -> ack/DLQ
 internal/result/       ResultEnvelope + Sink implementations (JSONL, file,
-                       webhook, multi)
+                       webhook, multi) + routing (Predicate, RoutedSink)
+                       and rendering (Formatter: json, discord)
 internal/audit/        append-only hash-chained log + verify (JCS canonical)
 internal/observe/      slog, Prometheus metrics, backpressure, JobTracker
 internal/ui/           embedded read-mostly dashboard (off by default)
@@ -261,6 +282,43 @@ import needs justification.
   `WebhookSink` claims a JobID before sending and RELEASES it on failure;
   dropping that release would make a failed webhook permanently skipped
   on redelivery.
+- **A sink predicate can only NARROW, so the fail-safe lives in the config
+  SHAPE, not in the predicate.** `result.Predicate` is a closed struct
+  (verdicts / categories+min score / source kinds; OR within a group, AND
+  across groups) precisely so an unfireable rule is a boot refusal. But
+  no per-predicate check can catch the real hazard: if EVERY sink is
+  predicated, an envelope matching none of them is emitted nowhere, and a
+  rule that is syntactically perfect and simply never matches passes every
+  static check. `config.validateOutput` and `cli.buildSinks` therefore
+  both require at least one sink with `Predicate.IsEmpty()`, overridable
+  only by `output.allow_unrouted`. Do not add an expression language here
+  — the moment a predicate needs a parser, that boot-time guarantee is
+  gone. Two more rules that look like details and are not: a predicate
+  MISS returns nil (an error would reach `queue.Retry` and re-bill the
+  vendor for every allow verdict), and a nil `Score` never satisfies a
+  minimum, including a minimum of 0 — could-not-evaluate is not a value.
+- **A non-JSON `Formatter` is a disclosure boundary.** `format` (json,
+  discord) is orthogonal to `type` (stdout, file, webhook): transport and
+  rendering are separate axes, so a chat integration is a formatter, never
+  a new sink type. Chat formatters are allow-list renderers that name
+  every field they emit, so adding a field to `ResultEnvelope` can never
+  silently start publishing it to Discord;
+  `TestDiscordFormatterNeverLeaksMetadata` fails on exactly that, and
+  `Source.RefDigest` and the provider raw digest stay out permanently.
+  Caller `metadata` is the ONE opt-in exception, because passthrough that
+  dies before the notification a human reads is not passthrough: a
+  correlation id is the field operators most need in an alert.
+  `output.sinks[].metadata_fields` names the keys a sink may publish (`*`
+  for all), defaulting to none. Keep it an allow-list rather than a
+  boolean — the caller who WRITES metadata is not the operator who
+  configures the sink, so an enumerated key is a reviewable disclosure
+  decision while `include_metadata: true` is a blank cheque against every
+  future caller. Note the limit honestly: only key NAMES are knowable at
+  boot, so vismod can promise "only the fields you named" and never "only
+  safe content". `metadata_fields` on `format: json` is a boot refusal,
+  not a no-op — that envelope already carries everything. Null scores
+  render as `unknown`, never `0.00`, for the same reason they serialize as
+  `null`.
 - **A sink failure costs vendor money and loses the audit record.** The
   sink write happens BEFORE `p.Audit.Record` in
   `internal/pipeline/pipeline.go`, and a sink error returns
@@ -275,6 +333,45 @@ import needs justification.
   intentional-by-inertia, not proven correct; treat changing it as a
   design change with its own review, and until then budget the webhook's
   `timeout` and `max_attempts` as documented in `config.example.yaml`.
+- **A webhook URL is a CREDENTIAL, so nothing on the delivery path may log
+  it.** A Discord webhook URL carries its token in the PATH
+  (`/api/webhooks/<id>/<token>`), and `url.Redacted()` does not help — it
+  strips userinfo and leaves the path intact. Every log field and error
+  message on the retry/failure path therefore names an operator-facing
+  label (`webhook[1]`, from `WebhookOptions.Name`) and never the URL;
+  `moderate.WithRetryLog` takes that label for the same reason. **Its
+  parameter is called `target`, which reads like an address and is not
+  one** — it is the sink's zero-based position in `output.sinks`, or
+  `adapter:hive` for an adapter call. That misreading is the likely way
+  this invariant gets broken, so the meaning is spelled out in three
+  places (the `WithRetryLog` godoc, `WebhookOptions.Name`, and
+  docs/result-envelope.md) and must stay spelled out. One value, two field
+  names: `target` on the retry warning (shared with adapter calls) and
+  `sink` on the give-up error (matching `output.sinks` and the
+  `vismod_sink_*` metrics); they must remain equal or the two records
+  cannot be joined, which `TestWebhookRetryTargetMatchesGiveUpSink`
+  asserts. The
+  redirect refusal in `NewWebhookSink` also stops naming its target: that
+  string is attacker-chosen text on a path that gets logged.
+  `TestWebhookDeliveryLogNeverCarriesTheURL` and
+  `TestDoJSONRetryLogNeverCarriesTheURL` fail on any regression. The same
+  rule bounds the log/metric `reason` and `status` fields to closed sets —
+  an error string there is both a cardinality bomb and a way for a URL to
+  reach a label.
+- **"Gave up after N attempts" and "the receiver said no" are different
+  errors.** `moderate.DoJSON` retries 429/5xx/timeout with exponential
+  backoff and returns `ErrAttemptsExhausted`; every other 4xx returns
+  immediately with an `HTTPError` and no retry at all. Both mean the
+  envelope arrived nowhere, so every sink wraps `result.ErrDeliveryFailed`
+  — one `errors.Is` answers "did this destination get it?" regardless of
+  transport — but the bounded `reason` (`exhausted` / `rejected` /
+  `format` / `write`) is what tells an operator whether to look for an
+  outage or a bad payload. Do not collapse them, and do not replace the
+  underlying error when wrapping: `moderation.IsRetryable` still decides
+  the QUEUE-level disposition and must survive. Retries are counted in
+  `vismod_sink_retries_total` and give-ups in
+  `vismod_sink_write_failures_total`; rising retries with flat failures is
+  a destination that is throttling but still delivering.
 - **The audit digest travels out of band, and that is not an
   optimization.** `evaluateFrame` returns the adapter's `Raw` alongside
   the frame result; `processImage`/`processVideo` hand it up as evidence;

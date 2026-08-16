@@ -15,6 +15,7 @@ import (
 
 	"github.com/spf13/viper"
 
+	"github.com/vismod/vismod/internal/result"
 	"github.com/vismod/vismod/pkg/moderation"
 )
 
@@ -308,6 +309,27 @@ type SinkConfig struct {
 	URL         string        `mapstructure:"url"`          // webhook
 	Timeout     time.Duration `mapstructure:"timeout"`      // webhook
 	MaxAttempts int           `mapstructure:"max_attempts"` // webhook
+	// Format names the wire rendering (result.KnownFormats). Empty means
+	// the raw JSON envelope, which is what every existing receiver
+	// expects. Transport (Type) and rendering (Format) are orthogonal: a
+	// chat integration is a format, not a new sink type.
+	Format string `mapstructure:"format"`
+	// Predicate narrows which envelopes this sink receives. The zero value
+	// is unconditional. See the catch-all rule in validateOutput.
+	Predicate result.Predicate `mapstructure:"predicate"`
+	// MetadataFields names which caller-metadata keys a non-JSON format may
+	// publish ("*" for all). Empty publishes none. Metadata exists to be
+	// passed through the whole pipeline, so a correlation id must be able
+	// to reach a chat notification — but naming a key is a DISCLOSURE
+	// decision about every future value under it, and only the key names
+	// are knowable at boot. Not valid for format "json", whose envelope
+	// already carries all metadata.
+	MetadataFields []string `mapstructure:"metadata_fields"`
+}
+
+// formatOptions is the per-sink rendering config handed to result.
+func (s *SinkConfig) formatOptions() result.FormatOptions {
+	return result.FormatOptions{MetadataFields: s.MetadataFields}
 }
 
 // OutputConfig selects where result envelopes go. An absent block means
@@ -315,6 +337,11 @@ type SinkConfig struct {
 // nothing silently is the failure mode this project exists to prevent.
 type OutputConfig struct {
 	Sinks []SinkConfig `mapstructure:"sinks"`
+	// AllowUnrouted is the gated override for the catch-all rule: when
+	// true, a config in which EVERY sink carries a predicate is permitted,
+	// accepting that some envelopes reach no destination at all. Same
+	// shape, and the same reason, as failsafe.allow_empty_video_skip.
+	AllowUnrouted bool `mapstructure:"allow_unrouted"`
 }
 
 type FailsafeConfig struct {
@@ -503,7 +530,13 @@ func Validate(cfg Config) error {
 	if err := validateProviderThresholds(cfg.ProviderThresholds); err != nil {
 		return err
 	}
-	if err := validateOutput(cfg.Output); err != nil {
+	// &cfg.Output is deliberate even though cfg is a value: validateOutput
+	// normalizes each sink predicate in place, and the Sinks slice header
+	// copy still points at the caller's backing array, so the canonical
+	// category keys land on the Config the caller keeps. A predicate that
+	// skipped normalization would carry viper's lowercased keys and match
+	// nothing.
+	if err := validateOutput(&cfg.Output); err != nil {
 		return err
 	}
 	if err := validateURLSource(cfg.Source.URL); err != nil {
@@ -579,11 +612,26 @@ func validateProviderThresholds(p ProviderThresholds) error {
 
 // validateOutput fails closed on every ambiguous sink definition. A sink
 // that cannot be built is a boot error, never a silently dropped output.
-func validateOutput(o OutputConfig) error {
+//
+// It takes a POINTER because it also normalizes each sink's predicate in
+// place (viper lowercases yaml map keys; the canonical category taxonomy
+// is uppercase).
+func validateOutput(o *OutputConfig) error {
 	if len(o.Sinks) == 0 {
 		return fmt.Errorf("config: output.sinks is present but empty — vismod would emit no results anywhere; remove the output block to use stdout, or list at least one sink")
 	}
-	for i, s := range o.Sinks {
+	unconditional := 0
+	for i := range o.Sinks {
+		s := &o.Sinks[i]
+		if _, err := result.FormatterFor(s.Format, s.formatOptions()); err != nil {
+			return fmt.Errorf("config: output.sinks[%d]: %w", i, err)
+		}
+		if err := s.Predicate.Normalize(); err != nil {
+			return fmt.Errorf("config: output.sinks[%d]: %w", i, err)
+		}
+		if s.Predicate.IsEmpty() {
+			unconditional++
+		}
 		switch strings.ToLower(strings.TrimSpace(s.Type)) {
 		case "stdout":
 		case "file":
@@ -603,6 +651,17 @@ func validateOutput(o OutputConfig) error {
 		default:
 			return fmt.Errorf("config: output.sinks[%d].type must be \"stdout\", \"file\" or \"webhook\", got %q", i, s.Type)
 		}
+	}
+
+	// The catch-all rule. A predicate can only NARROW what a sink
+	// receives, so a config in which every sink is predicated has
+	// envelopes that reach no destination at all — a silent drop, and no
+	// static check on an individual predicate can detect it (a rule that
+	// is syntactically perfect and never matches passes every check).
+	// The guarantee therefore comes from the SHAPE of the config: at
+	// least one sink must be unconditional.
+	if unconditional == 0 && !o.AllowUnrouted {
+		return fmt.Errorf("config: every sink in output.sinks carries a predicate, so a result matching none of them would be emitted NOWHERE; give at least one sink no predicate, or set output.allow_unrouted: true to accept that risk deliberately")
 	}
 	return nil
 }

@@ -25,7 +25,7 @@ func TestWebhookSinkPostsEnvelope(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	s := NewWebhookSink(srv.URL, 2*time.Second, 3)
+	s := NewWebhookSink(srv.URL, WebhookOptions{Timeout: 2 * time.Second, MaxAttempts: 3})
 	sent := envFixture("job-1")
 	if err := s.Write(context.Background(), sent); err != nil {
 		t.Fatal(err)
@@ -59,7 +59,7 @@ func TestWebhookSinkRetriesOn5xxThenSucceeds(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	s := NewWebhookSink(srv.URL, 2*time.Second, 3)
+	s := NewWebhookSink(srv.URL, WebhookOptions{Timeout: 2 * time.Second, MaxAttempts: 3})
 	if err := s.Write(context.Background(), envFixture("job-1")); err != nil {
 		t.Fatalf("want success after retry, got %v", err)
 	}
@@ -80,7 +80,7 @@ func TestWebhookSinkRetriesOn429(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	s := NewWebhookSink(srv.URL, 5*time.Second, 3)
+	s := NewWebhookSink(srv.URL, WebhookOptions{Timeout: 5 * time.Second, MaxAttempts: 3})
 	if err := s.Write(context.Background(), envFixture("job-1")); err != nil {
 		t.Fatalf("want success after 429 retry, got %v", err)
 	}
@@ -97,7 +97,7 @@ func TestWebhookSinkTerminalOn4xx(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	s := NewWebhookSink(srv.URL, 2*time.Second, 3)
+	s := NewWebhookSink(srv.URL, WebhookOptions{Timeout: 2 * time.Second, MaxAttempts: 3})
 	if err := s.Write(context.Background(), envFixture("job-1")); err == nil {
 		t.Fatal("want error on 400, got nil")
 	}
@@ -114,7 +114,7 @@ func TestWebhookSinkCapsAttempts(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	s := NewWebhookSink(srv.URL, 2*time.Second, 2)
+	s := NewWebhookSink(srv.URL, WebhookOptions{Timeout: 2 * time.Second, MaxAttempts: 2})
 	if err := s.Write(context.Background(), envFixture("job-1")); err == nil {
 		t.Fatal("want error after exhausting attempts, got nil")
 	}
@@ -131,7 +131,7 @@ func TestWebhookSinkIdempotentPerJobID(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	s := NewWebhookSink(srv.URL, 2*time.Second, 3)
+	s := NewWebhookSink(srv.URL, WebhookOptions{Timeout: 2 * time.Second, MaxAttempts: 3})
 	env := envFixture("job-1")
 	for range 3 {
 		if err := s.Write(context.Background(), env); err != nil {
@@ -157,7 +157,7 @@ func TestWebhookSinkFailedWriteIsRetriableLater(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	s := NewWebhookSink(srv.URL, 2*time.Second, 1)
+	s := NewWebhookSink(srv.URL, WebhookOptions{Timeout: 2 * time.Second, MaxAttempts: 1})
 	env := envFixture("job-1")
 	if err := s.Write(context.Background(), env); err == nil {
 		t.Fatal("want first write to fail")
@@ -191,7 +191,7 @@ func TestWebhookSinkDoesNotFollowRedirects(t *testing.T) {
 	}))
 	defer redirector.Close()
 
-	s := NewWebhookSink(redirector.URL, 2*time.Second, 1)
+	s := NewWebhookSink(redirector.URL, WebhookOptions{Timeout: 2 * time.Second, MaxAttempts: 1})
 	if err := s.Write(context.Background(), envFixture("job-redirect")); err == nil {
 		t.Fatal("redirect was followed or tolerated; want an error from CheckRedirect")
 	}

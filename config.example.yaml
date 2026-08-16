@@ -338,50 +338,29 @@ ui:
   auth: basic                   # credentials via VISMOD_UI_USER / VISMOD_UI_PASSWORD
 
 # ── Output sinks ─────────────────────────────────────────────────────────
-# Where result envelopes go. Omit this block entirely for stdout-only
-# (the default, and what every release before this one did).
-#
-# A present block with an empty `sinks` list refuses to boot: emitting
-# nothing silently is exactly the failure mode this project avoids.
+# Omit for stdout-only. Formats, predicates, retry and failure behavior:
+# docs/result-envelope.md. Webhook URL rules: SECURITY.md.
 output:
   sinks:
     - type: stdout
 
-    # Append-only JSONL. ONE PROCESS PER FILE — two replicas sharing a
-    # path interleave writes, the same hazard the audit log has.
-    #
-    # CONSUMERS MUST DEDUPE ON job_id. Unlike the audit log, this sink
-    # does NOT replay its file on open: the per-job_id dedupe set is in
-    # memory only, so a job redelivered after a restart is appended a
-    # SECOND time with the same job_id. Idempotency here is per process
-    # lifetime, not durable.
+    # Consumers must dedupe on job_id. One process per file.
     # - type: file
     #   path: /var/lib/vismod/results.jsonl
 
-    # POST each envelope to a receiver. This URL is OPERATOR config, not
-    # job input, so private/internal addresses are expected and allowed
-    # (SECURITY.md's operator-endpoint class). http is accepted only for
-    # loopback and RFC 1918 hosts; a public host must be https.
-    # Redirects are refused.
-    #
-    # The receiver must dedupe on job_id: delivery is at-least-once and a
-    # worker restart can resend (same per-process limit as the file sink).
-    #
-    # BUDGET timeout AND max_attempts DELIBERATELY. A webhook failure is
-    # not local to this sink:
-    #   * MultiSink returns the failure, so the whole JOB retries — frame
-    #     extraction and a fresh, BILLED vendor call included. With
-    #     queue.max_retries: 3 a receiver outage costs up to 4x vendor
-    #     quota per job before the job dead-letters.
-    #   * The audit record is written AFTER the sink, so a job that
-    #     dead-letters this way leaves NO audit entry at all, even though
-    #     the envelope is already in the stdout/file sinks.
-    #   * Retry-After is honored up to 120s and attempts are serial, so a
-    #     slow receiver can occupy a worker for minutes and starve the
-    #     pool. Keep timeout x max_attempts well under your job budget.
-    # An unreliable receiver is better fed by tailing the file sink than
-    # by putting it in this list.
+    # A failed delivery re-runs the whole job, vendor call included —
+    # keep timeout x max_attempts inside your job budget.
     # - type: webhook
     #   url: https://collector.internal/results
     #   timeout: 5s
     #   max_attempts: 3
+
+    # - type: webhook
+    #   url: https://discord.com/api/webhooks/<id>/<token>
+    #   format: discord            # json (default) | discord
+    #   metadata_fields: [request_id]   # named keys, or ["*"] for all
+    #   predicate:                 # verdicts | categories | source_kinds
+    #     verdicts: [block]
+
+  # At least one sink must have no predicate, or vismod refuses to boot.
+  # allow_unrouted: false

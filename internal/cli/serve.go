@@ -108,7 +108,7 @@ func newServer(cfg config.Config) (*server, error) {
 		return nil, err
 	}
 
-	sink, closeSinks, err := buildSinks(cfg, os.Stdout, metrics)
+	sink, closeSinks, err := buildSinks(cfg, os.Stdout, metrics, log)
 	if err != nil {
 		_ = mod.Close()
 		if auditLog != nil {

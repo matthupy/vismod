@@ -260,3 +260,55 @@ auditor must hold to reproduce the digest.
 The pre-fix state is settled and needs no further proof: the empty
 `raw_sha256` was observed on live Azure records dated 2026-08-03 and
 2026-08-07 in the `audit-b` volume.
+
+## Mostly verified: the Discord payload reaches a real Discord webhook
+
+**Settled 2026-08-08/09.** An operator ran the compose stack against a
+live Discord webhook with `format: discord` and validated **all three
+verdict renderings — `block`, `allow`, and `error`** — with the matching
+`predicate.verdicts` config for each. Messages arrived in the channel.
+`result.discordFormatter`'s Execute Webhook body (`username`, `embeds[]`,
+each embed carrying `title`, `color`, `timestamp`, `fields[]` of
+`{name,value,inline}`) is therefore accepted by the real API, not only by
+the `httptest` server this repo wrote. That covers every embed color, the
+`Top category`/`Score` fields on a scored verdict, and the degraded
+rendering an `error` produces.
+
+The SHAPE was separately verified against the Discord API reference on
+2026-08-07 (`docs.discord.com/developers/resources/webhook` for Execute
+Webhook, `.../resources/message` for the Embed object): embeds an array
+of at most 10, a successful call answering `204 No Content`, and the
+limits enforced in `fitEmbedBudget` — title 256, field name 256, field
+value 1024, and a 6000-character combined budget across title plus all
+field names and values.
+
+Named caller metadata was validated live on 2026-08-09: a job carrying
+`{"test":"123"}` with `metadata_fields: [test]` rendered the key as its
+own embed field in a `block` notification. That covers the whole
+`metadataFields` path for named keys — key lookup, scalar rendering, and
+placement ahead of the free-text fields.
+
+`format: json` needs no live run of its own. `jsonFormatter` is
+`json.Marshal(env)` — the pre-existing envelope contract, unchanged and
+pinned byte-for-byte by `TestJSONFormatterIsByteIdenticalToTheEnvelope`.
+It has no limits to clamp and no fields to drop, so there is nothing a
+live receiver could reject that the existing wire format did not already
+face.
+
+**Still open — the three size/shape limits, none of which a normal job
+reaches.** Each exists specifically to avoid a `400`, and a `400` is
+terminal in `moderate.DoJSON`: notification lost, no retry.
+
+1. The **6000-character combined embed budget** (`fitEmbedBudget`). No
+   live envelope was large enough to reach the squeeze path.
+2. The **25-field embed cap**. Only a `metadata_fields: ["*"]` over a
+   metadata object with many keys reaches it; the core fields never do.
+3. The **wildcard itself**. `["*"]` is covered by unit tests but has
+   never rendered against a live endpoint, including its sorted key
+   order.
+
+**Proves them:** three jobs against a live webhook — one whose
+`source.ref` is a few thousand characters, one with `metadata_fields:
+["*"]` and a metadata object of ~30 keys, and one with `["*"]` over a
+small object to confirm ordinary wildcard rendering. Record the returned
+status for each.
