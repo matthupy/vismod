@@ -464,7 +464,10 @@ func TestNewMultipartRequestInputEdges(t *testing.T) {
 			if err != nil {
 				t.Fatalf("read part body: %v", err)
 			}
-			if !bytes.Equal(got, tc.content) && !(len(got) == 0 && len(tc.content) == 0) {
+			// bytes.Equal treats nil and an empty slice as equal, so the
+			// empty-content and nil-content rows need no special case:
+			// io.ReadAll returns a non-nil empty slice for an empty part.
+			if !bytes.Equal(got, tc.content) {
 				t.Errorf("part bytes = %v, want %v", got, tc.content)
 			}
 		})
