@@ -9,8 +9,33 @@ coverage:
         threshold: 1%       # tolerate small movement
         informational: true # never fail the check run
     patch:
+      # Two thresholds, because "how much of this change is tested" has two
+      # different answers and collapsing them into one number loses the
+      # distinction.
+      #
+      # The target is 100%. Every line of a change should be covered — that
+      # is the standard, not an ideal to gesture at. The 10% threshold is
+      # what makes the standard survivable: it passes at >=90%, and that
+      # slack exists for lines that CANNOT be covered, not for lines nobody
+      # got around to. The known members of that set are branches
+      # unreachable by construction — a bytes.Buffer write that cannot
+      # fail, a struct of scalars json.Marshal cannot reject, a length
+      # check on two slices appended in lockstep. They stay in the code as
+      # guards against a future edit, so they stay in the denominator too.
+      #
+      # Reaching for the slack is a thing to justify in the commit message,
+      # not a budget to spend.
       default:
+        target: 100%
+        threshold: 10%
+        informational: true
+      # The floor. Below 80% a change is undertested — not "covered except
+      # for the untestable parts", just undertested. Separated from the
+      # target so the two failures look different: patch/minimum red means
+      # write more tests, patch red alone means account for the gap.
+      minimum:
         target: 80%
+        threshold: 0%
         informational: true
 
 comment:

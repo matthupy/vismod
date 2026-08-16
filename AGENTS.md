@@ -58,6 +58,16 @@ go build ./... && go vet ./... && go test ./...
   care, so a build-vet-test gate is green on code CI rejects. The usual
   way in is a scripted edit (`sed` over call sites) that produces valid
   but unformatted Go — `2*time.Second` rather than `2 * time.Second`.
+- **Every line the change adds is covered, or the commit says why not.**
+  The target is 100% patch coverage; >=90% is accepted, and the gap is
+  reserved for lines that cannot be covered — branches unreachable by
+  construction, kept as guards against a future edit. Below 80% the
+  change is undertested and not done. Name the uncovered lines and the
+  reason in the commit message; "hard to test" is a reason to restructure
+  the code, not to skip the test. Failure paths come first: a sink that
+  cannot render, a provider that ran out of retries, a config that must
+  refuse to boot. Those are where the fail-safe posture lives, and an
+  untested failure arm is how a silent `allow` ships.
 - Every doc under "Docs that must stay true" whose described behavior
   changed is updated in the SAME commit.
 - No new module import unless the commit message justifies it.
