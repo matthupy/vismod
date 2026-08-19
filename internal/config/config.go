@@ -297,6 +297,37 @@ type UIConfig struct {
 	Auth    string `mapstructure:"auth"` // "basic" (credentials env-only) | "none" (loopback only)
 }
 
+// IntakeConfig groups the optional surfaces served on intake_addr. The
+// address itself stays at the top level as intake_addr, where it has
+// always been; this block is for what the intake listener SERVES.
+type IntakeConfig struct {
+	ResultAPI ResultAPIConfig `mapstructure:"result_api"`
+}
+
+// ResultAPIConfig configures the read side of the intake mux
+// (GET /jobs/{id} and POST /jobs/status). Off by default: it discloses
+// verdicts, refs and caller metadata to anyone who can reach the port and
+// authenticate, so an operator opts in.
+//
+// The store behind it is bounded and ephemeral — it is NOT durable and it
+// is NOT the audit log. See SECURITY.md and docs/rest-api.md.
+type ResultAPIConfig struct {
+	Enabled bool   `mapstructure:"enabled"`
+	Auth    string `mapstructure:"auth"` // "basic" (credentials env-only) | "none" (loopback only)
+	// MaxEntries caps how many job records the store holds; the oldest
+	// (least recently touched) is evicted past the cap.
+	MaxEntries int `mapstructure:"max_entries"`
+	// TTL is how long a record stays readable after its last transition.
+	TTL time.Duration `mapstructure:"ttl"`
+}
+
+// AuthModeBasic and AuthModeNone are the two auth modes shared by the UI
+// and the result API. Credentials for "basic" are env-only in both cases.
+const (
+	AuthModeBasic = "basic"
+	AuthModeNone  = "none"
+)
+
 // SinkConfig is one entry in output.sinks. Fields not relevant to the
 // chosen Type are ignored; Validate rejects a Type whose required field
 // is missing rather than silently emitting nowhere.
@@ -376,6 +407,7 @@ type Config struct {
 	LogLevel           string             `mapstructure:"log_level"`
 	MetricsAddr        string             `mapstructure:"metrics_addr"`
 	IntakeAddr         string             `mapstructure:"intake_addr"`
+	Intake             IntakeConfig       `mapstructure:"intake"`
 }
 
 func f64(v float64) *float64 { return &v }
@@ -458,8 +490,13 @@ func Defaults() Config {
 			DeadLetterMax: 1000,
 			Redis:         RedisConfig{Addr: "localhost:6379"},
 		},
-		Audit:        AuditConfig{Enabled: true, Path: "audit.log"},
-		UI:           UIConfig{Enabled: false, Addr: "127.0.0.1:8081", Auth: "basic"},
+		Audit: AuditConfig{Enabled: true, Path: "audit.log"},
+		UI:    UIConfig{Enabled: false, Addr: "127.0.0.1:8081", Auth: AuthModeBasic},
+		Intake: IntakeConfig{ResultAPI: ResultAPIConfig{
+			// Off by default, basic auth as the default mode: the same
+			// shape as UI above. An operator opts into disclosure.
+			Enabled: false, Auth: AuthModeBasic, MaxEntries: 1000, TTL: time.Hour,
+		}},
 		Output:       OutputConfig{Sinks: []SinkConfig{{Type: "stdout"}}},
 		Backpressure: BackpressureConfig{ConsecutiveErrors: 20, ErrorRatePct: 50, Window: 60 * time.Second, RecoverySuccesses: 5},
 		LogLevel:     "info",
@@ -481,6 +518,11 @@ func Load(path string) (Config, error) {
 		v.SetConfigFile(path)
 		if err := v.ReadInConfig(); err != nil {
 			return Config{}, fmt.Errorf("config: read %s: %w", path, err)
+		}
+		// Before Unmarshal, because these keys have no struct field to
+		// land in: after Unmarshal there is nothing left to detect.
+		if err := refuseYAMLCredentials(v); err != nil {
+			return Config{}, err
 		}
 	}
 	if err := v.Unmarshal(&cfg); err != nil {
@@ -541,6 +583,57 @@ func Validate(cfg Config) error {
 	}
 	if err := validateURLSource(cfg.Source.URL); err != nil {
 		return err
+	}
+	if err := validateResultAPI(cfg.Intake.ResultAPI); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateResultAPI checks the read side's own settings. It runs whether
+// or not the API is enabled: a typo in a block that is off today is still
+// a typo, and finding it the day an operator flips enabled to true — in
+// an incident, most likely — is the worst possible time.
+func validateResultAPI(r ResultAPIConfig) error {
+	switch r.Auth {
+	case AuthModeBasic, AuthModeNone:
+	default:
+		return fmt.Errorf("config: intake.result_api.auth must be %q or %q, got %q",
+			AuthModeBasic, AuthModeNone, r.Auth)
+	}
+	if r.MaxEntries <= 0 {
+		return fmt.Errorf("config: intake.result_api.max_entries must be > 0, got %d", r.MaxEntries)
+	}
+	if r.TTL <= 0 {
+		return fmt.Errorf("config: intake.result_api.ttl must be > 0, got %s", r.TTL)
+	}
+	return nil
+}
+
+// resultAPICredentialKeys are the yaml keys that must never exist.
+//
+// The read side's credentials are env-only (invariant 4), and viper
+// silently ignores keys that no struct field claims — so without this
+// check an operator who wrote them under intake.result_api would get a
+// config file that LOOKS like it configured auth and an endpoint running
+// on whatever the environment happened to hold. A boot refusal is the
+// only honest answer; there is deliberately no fallback.
+var resultAPICredentialKeys = []string{
+	"intake.result_api.user",
+	"intake.result_api.password",
+}
+
+// refuseYAMLCredentials rejects a config FILE that carries either
+// credential. It reads only what the file set: v.InConfig consults the
+// parsed config map alone, never the env overlay, so the env vars this
+// check exists to protect can never trip it.
+func refuseYAMLCredentials(v *viper.Viper) error {
+	for _, key := range resultAPICredentialKeys {
+		if v.InConfig(key) {
+			return fmt.Errorf(
+				"config: %s must not appear in yaml — the result API's credentials are env-only, set %s and %s in the environment instead",
+				key, EnvPrefix+"_RESULT_API_USER", EnvPrefix+"_RESULT_API_PASSWORD")
+		}
 	}
 	return nil
 }

@@ -64,6 +64,10 @@ type server struct {
 	queue    queue.Queue
 	tracker  *observe.JobTracker
 	sw       *intakeSwitch
+	// results is the read side's store, or nil when
+	// intake.result_api.enabled is false. Nil is the disabled state
+	// itself: no store is allocated for verdicts nobody can read.
+	results *resultStore
 
 	auditLog   *audit.Log
 	closeSinks func() error
@@ -153,10 +157,18 @@ func newServer(cfg config.Config) (*server, error) {
 		})
 	}
 
+	var results *resultStore
+	if ra := cfg.Intake.ResultAPI; ra.Enabled {
+		results = newResultStore(ra.MaxEntries, ra.TTL)
+		log.Warn("intake result api is ENABLED: job verdicts, refs and caller metadata are readable over http on intake_addr",
+			"auth", ra.Auth, "max_entries", ra.MaxEntries, "ttl", ra.TTL)
+	}
+
 	return &server{
 		cfg: cfg, log: log, metrics: metrics, bp: bp, health: health,
 		mod: mod, pipeline: p, queue: q,
 		tracker: observe.NewJobTracker(200), sw: &intakeSwitch{},
+		results:  results,
 		auditLog: auditLog, closeSinks: closeSinks,
 	}, nil
 }
@@ -200,12 +212,16 @@ func runServe(parent context.Context) error {
 // never answered.
 func (s *server) run(ctx context.Context) error {
 	cfg, log, metrics, p, q := s.cfg, s.log, s.metrics, s.pipeline, s.queue
-	bp, tracker := s.bp, s.tracker
+	bp, tracker, results := s.bp, s.tracker, s.results
 
 	// Worker handler: pipeline + backpressure + metrics + UI job feed.
 	handler := func(hctx context.Context, j queue.Job) (queue.Disposition, error) {
 		metrics.WorkersActive.Inc()
 		defer metrics.WorkersActive.Dec()
+		// This handler is the one place a job's outcome is known, so it is
+		// where the read side observes state. Every call is a no-op on the
+		// nil store the disabled API leaves behind.
+		results.record(jobStatus{JobID: j.ID, State: stateProcessing})
 		env, disp, perr := p.ProcessJob(hctx, j)
 		verdict := string(moderation.VerdictError)
 		switch {
@@ -251,6 +267,7 @@ func (s *server) run(ctx context.Context) error {
 				metrics.JobFrames.WithLabelValues(rec.MediaType).Observe(float64(rec.FramesScanned))
 			}
 			tracker.Record(rec)
+			recordTerminalStatus(results, j.ID, env, disp, perr)
 		}
 		bp.Record(disp == queue.Ack)
 		return disp, perr
@@ -275,7 +292,7 @@ func (s *server) run(ctx context.Context) error {
 
 	sw := s.sw
 	metricsSrv := observe.Serve(cfg.MetricsAddr, metrics, s.health, log)
-	intakeSrv := serveIntake(cfg, q, bp, sw, log)
+	intakeSrv := serveIntake(cfg, q, bp, sw, log, withResultStore(results))
 
 	var uiSrv *http.Server
 	if cfg.UI.Enabled {
@@ -454,13 +471,36 @@ func hostSet(hosts []string) map[string]bool {
 	return m
 }
 
+// intakeOption configures an optional surface on the intake mux.
+//
+// It is a variadic option rather than a sixth parameter so that adding
+// the read side did not change serveIntake's signature: every existing
+// caller and every existing intake test still describes the write path
+// exactly as it did before, which is what makes "POST /jobs is
+// unchanged" a fact rather than a claim.
+type intakeOption func(*intakeOptions)
+
+type intakeOptions struct{ results *resultStore }
+
+// withResultStore attaches the read side's store. A nil store leaves the
+// mux write-only, so this is safe to call unconditionally.
+func withResultStore(s *resultStore) intakeOption {
+	return func(o *intakeOptions) { o.results = s }
+}
+
 // serveIntake exposes the dev/demo HTTP intake: POST /jobs with a JSON
-// body. Rejections are retryable signals (503 + Retry-After), never
-// silent drops. Payloads carry file refs only, never media bytes.
-func serveIntake(cfg config.Config, q queue.Queue, bp *observe.Backpressure, sw *intakeSwitch, log *slog.Logger) *http.Server {
+// body, plus the opt-in read side (GET /jobs/{id}, POST /jobs/status)
+// when intake.result_api is enabled. Rejections are retryable signals
+// (503 + Retry-After), never silent drops. Payloads carry file refs only,
+// never media bytes.
+func serveIntake(cfg config.Config, q queue.Queue, bp *observe.Backpressure, sw *intakeSwitch, log *slog.Logger, opts ...intakeOption) *http.Server {
 	addr := cfg.IntakeAddr
 	if addr == "" {
 		return nil
+	}
+	var o intakeOptions
+	for _, opt := range opts {
+		opt(&o)
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /jobs", func(w http.ResponseWriter, r *http.Request) {
@@ -541,6 +581,12 @@ func serveIntake(cfg config.Config, q queue.Queue, bp *observe.Backpressure, sw 
 		// would change which rejections get a Retry-After.
 		switch err {
 		case nil:
+			// Recorded AFTER the enqueue succeeded, so a rejected job
+			// never leaves a phantom record behind. A worker may already
+			// have finished this job by now; resultStore.record refuses
+			// transitions that would walk a job backwards, so this cannot
+			// overwrite a state that has moved on.
+			o.results.record(jobStatus{JobID: id, State: stateQueued})
 			w.WriteHeader(http.StatusAccepted)
 			_ = json.NewEncoder(w).Encode(map[string]string{"job_id": string(id)})
 		case queue.ErrDeadLetterFull, queue.ErrQueueFull:
@@ -552,6 +598,13 @@ func serveIntake(cfg config.Config, q queue.Queue, bp *observe.Backpressure, sw 
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 		}
 	})
+	// The read side joins THIS mux — one listener, one address, one
+	// thing for an operator to firewall. resultAPIRoutes returns nil
+	// when the API is off, so the disabled shape registers nothing and
+	// both routes 404 from the mux itself.
+	for _, rt := range resultAPIRoutes(cfg.Intake.ResultAPI, o.results) {
+		mux.HandleFunc(rt.pattern, rt.handler)
+	}
 	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {

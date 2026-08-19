@@ -5,16 +5,20 @@ nav_order: 6
 
 # Submitting jobs over HTTP
 
-`vismod serve` exposes one endpoint — `POST /jobs` — on `intake_addr`.
-It accepts a local file path or, once you enable it, an allow-listed
-`https` URL.
+`vismod serve` exposes `POST /jobs` on `intake_addr`. It accepts a local
+file path or, once you enable it, an allow-listed `https` URL. Two
+**opt-in, off-by-default** read routes join the same listener when you
+set `intake.result_api.enabled` — see [§4](#4-read-the-result-back).
 
-⚠️ **This intake is dev/demo scope.** It has **no authentication, no
-authorization, and no per-caller rate limiting**, and it binds only when
-`intake_addr` is set (default `127.0.0.1:8080`, loopback-only). For
-production, put your own authenticated API in front of it and keep
-`intake_addr` on loopback or a private network — or enqueue onto Redis
-directly and leave `intake_addr` unset. Read
+⚠️ **This intake is dev/demo scope.** `POST /jobs` has **no
+authentication, no authorization, and no per-caller rate limiting**, and
+it binds only when `intake_addr` is set (default `127.0.0.1:8080`,
+loopback-only). For production, put your own authenticated API in front
+of it and keep `intake_addr` on loopback or a private network — or
+enqueue onto Redis directly and leave `intake_addr` unset. The read
+routes in §4 do have their own basic auth, but they are served on this
+same unauthenticated listener, so enabling them does not make the port
+safe to expose. Read
 [SECURITY.md](https://github.com/matthupy/vismod/blob/main/SECURITY.md)
 before exposing it anywhere.
 
@@ -168,7 +172,126 @@ included. What gets **recorded** is only scheme+host+path, plus
 
 ### 4. Read the result back
 
-The verdict is in the sinks, not in the HTTP response. With a file sink:
+**The record of what was decided is the sinks and the audit log.** The
+read routes below are a convenience on top of them, with a stated
+horizon — read [What the read side is not](#what-the-read-side-is-not)
+before you build on it.
+
+#### The result readback API
+
+Off by default. Turn it on and it joins the intake listener:
+
+```yaml
+intake:
+  result_api:
+    enabled: true
+    auth: basic        # credentials env-only; see below
+    max_entries: 1000
+    ttl: 1h
+```
+
+```
+GET  /jobs/{id}     → 200 status document | 404 unknown or evicted
+POST /jobs/status   → 200 {"jobs":[…]}      the batch form
+```
+
+Both return a **job status document**, not a bare envelope:
+
+```json
+{"job_id": "job-1754160000000000000",
+ "state": "queued|processing|done|dead_lettered",
+ "result": {"…": "the result envelope — only when state is done"},
+ "reason": "…only when state is dead_lettered"}
+```
+
+`state` is the point. It separates *not finished yet* from
+*dead-lettered* from *never existed*, which one HTTP status code cannot:
+a bare envelope would answer `404` for all three, and "no verdict yet"
+and "this job died" want opposite responses. `result` is present only for
+`done`, and it is byte-identical to what the configured sinks received
+for the same `job_id`. `reason` is present only for `dead_lettered`, and
+carries the same text as that job's dead-letter entry. A dead-lettered
+job **never** carries a `result`: it produced no decision anyone should
+act on, and a synthesized `verdict:"error"` would be a verdict no
+pipeline run ever made.
+
+```sh
+curl -sS -u "$VISMOD_RESULT_API_USER:$VISMOD_RESULT_API_PASSWORD" \
+  http://127.0.0.1:8080/jobs/job-1754160000000000000
+# {"job_id":"job-1754160000000000000","state":"done","result":{…}}
+
+curl -sS -u "$VISMOD_RESULT_API_USER:$VISMOD_RESULT_API_PASSWORD" \
+  -X POST http://127.0.0.1:8080/jobs/status \
+  -H 'content-type: application/json' \
+  -d '{"job_ids":["job-1754160000000000000","job-1754160000000000001"]}'
+# {"jobs":[{"job_id":"…0","state":"done","result":{…}},
+#          {"job_id":"…1","state":"not_found"}]}
+```
+
+The batch form answers about **every id you asked about, in the order you
+asked**, duplicates included, so you can zip the response back onto your
+own list. An id the store does not hold comes back as
+`state: "not_found"` — that is the batch spelling of the single-job
+`404`, because one `200` answering about many ids cannot carry a status
+code per entry. At most 1000 ids per request; an empty list is a `400`,
+since an empty answer reads as "all unknown".
+
+| Response | Meaning |
+|---|---|
+| `200` | A status document. Read `state` before anything else |
+| `400` | Malformed batch body, empty `job_ids`, or more than 1000 ids |
+| `401` | `auth: basic` and the credentials did not match. `WWW-Authenticate: Basic realm="vismod"` |
+| `404` | Unknown id, **or** evicted, **or** expired, **or** the read side is disabled. All four are the same answer on purpose: a store that cannot answer says so, rather than guessing |
+| `503` | `auth: basic` with `VISMOD_RESULT_API_USER` or `VISMOD_RESULT_API_PASSWORD` unset. It refuses rather than serving open |
+
+#### Authentication, and what this discloses
+
+Credentials are **environment-only**: `VISMOD_RESULT_API_USER` and
+`VISMOD_RESULT_API_PASSWORD`. Writing `user:` or `password:` under
+`intake.result_api` in yaml is a **boot refusal**, not a fallback. Both
+are compared in constant time. This is the same auth the web UI uses,
+deliberately unchanged.
+
+`auth: "none"` is permitted and serves unauthenticated. It is for a
+**loopback-only** `intake_addr` behind a trusted sidecar — never on a
+routable address.
+
+⚠️ These routes are a **disclosure boundary**, and the first one vismod
+has over HTTP. Anyone who can reach the port and authenticate can read
+verdicts, source refs, and the `metadata` the submitting caller
+attached. That last one bears repeating here even though it is stated
+beside the [`metadata` request field](#request-body): metadata is echoed
+back verbatim on the envelope, so **do not put secrets in it** — this
+endpoint is now one more place it comes back out. Media bytes, provider
+`Raw` payloads, OCR and the audit-only raw digest are not in the
+envelope at all and cannot be read here. A url job's ref comes back
+redacted to scheme+host+path, never the presigned query string.
+
+#### What the read side is not
+
+- **Not durable.** The store is in memory. A restart empties it and
+  every job in it becomes a `404`.
+- **Not the audit log.** The hash-chained audit log and the sinks remain
+  the record of what was decided. This is a read-side convenience with a
+  horizon; do not treat it as a source of truth or an archive.
+- **Bounded, and eviction is silent.** Past `max_entries` the
+  least-recently-read job is dropped; past `ttl` a job expires. Either
+  way you get a `404` that is indistinguishable from an id that was
+  never submitted. Size `ttl` past the slowest job you expect, and
+  `max_entries` past the most jobs you expect in flight within it.
+- **Single replica, for now.** Under `queue.driver: redis` with more
+  than one replica, a `GET` can land on a replica that never processed
+  the job and answer `404` for a job that succeeded. Until the
+  Redis-backed store lands, either run one replica or read verdicts from
+  the sinks.
+- **A job under retry reads as `processing`.** Retry exhaustion is
+  decided inside the queue driver, so a job that dies that way stays
+  `processing` until its `ttl` expires rather than flipping to
+  `dead_lettered`. The dead-letter queue is authoritative for that case.
+
+#### Or read the sinks, which is the durable path
+
+With a file sink:
 
 ```yaml
 output:

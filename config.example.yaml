@@ -331,6 +331,37 @@ metrics_addr: ":9090"           # /metrics /healthz /readyz
 # any host is accepted; populate it to narrow. See the source: block above.
 intake_addr: "127.0.0.1:8080"
 
+# What the intake listener SERVES (the address itself stays above).
+intake:
+  # Read side: GET /jobs/{id} and POST /jobs/status return a job status
+  # document — {job_id, state, result?, reason?} — so a caller can tell
+  # "not finished yet" from "dead-lettered" from "never existed".
+  #
+  # OFF BY DEFAULT, and it is a disclosure decision: anyone who can reach
+  # this port and authenticate can read verdicts, refs, and whatever
+  # `metadata` the submitting caller attached. Do not put secrets in
+  # metadata. See SECURITY.md and docs/rest-api.md §4.
+  #
+  # The store behind it is BOUNDED and EPHEMERAL: in memory, capped at
+  # max_entries, expiring at ttl, and empty after a restart. It is NOT
+  # durable and it is NOT the audit log — the sinks and audit.log remain
+  # the record of what was decided. Past max_entries or ttl a job answers
+  # 404, which is indistinguishable from never having existed.
+  #
+  # Single replica only, for now: under queue.driver: redis with more
+  # than one replica a GET can land on a replica that never processed the
+  # job and answer 404 for a job that succeeded.
+  result_api:
+    enabled: false
+    auth: basic                 # credentials via VISMOD_RESULT_API_USER /
+                                # VISMOD_RESULT_API_PASSWORD (env-only; either
+                                # key written here is a boot refusal).
+                                # "none" serves unauthenticated and is for a
+                                # LOOPBACK-ONLY intake_addr behind a trusted
+                                # sidecar — never on a routable address.
+    max_entries: 1000           # LRU cap; the oldest read is evicted first
+    ttl: 1h                     # how long a job stays readable after it ends
+
 # ── Web UI (stretch; read-mostly; never renders media) ──────────────────
 ui:
   enabled: true
