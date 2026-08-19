@@ -204,6 +204,62 @@ whatever the operator pointed the webhook at. That is still moderation
 metadata leaving the process, and choosing the receiver is the
 operator's whole control.
 
+### The result readback API is a disclosure boundary (off by default)
+
+`intake.result_api.enabled` adds two **read-only** routes to the intake
+listener — `GET /jobs/{id}` and `POST /jobs/status` — returning a job
+status document (`{job_id, state, result?, reason?}`). It is **off by
+default**, and turning it on is a disclosure decision, not a
+convenience one: it is the first HTTP surface in vismod from which a
+verdict can be read at all. Before this existed, `POST /jobs` returned
+`202 {job_id}` and the verdict only ever went to the operator's own
+configured sinks.
+
+**What it discloses**, to anyone who can reach the port and
+authenticate: the **verdict** and full normalized scores for a job, the
+recorded **source ref**, and the caller-supplied **`metadata`** —
+verbatim, unredacted, exactly as the `webhook` sink discloses it above.
+The same warning applies with the same force: vismod validates only that
+`metadata` is a JSON object under 4096 bytes and never inspects its
+contents, so a caller who puts a secret in it hands that secret to
+whoever can read this endpoint. `docs/rest-api.md` repeats the rule at
+the read path for that reason.
+
+**What it cannot disclose**, because invariant 3 keeps it out of the
+envelope in the first place: media bytes, provider `Raw` payloads, OCR
+text or captions, and the audit-only `SHA-256(Raw)` digest (which is
+`json:"-"`). A `kind:"url"` job comes back with the **redacted** ref —
+scheme+host+path plus `ref_digest` — never the presigned query string
+the queue payload still holds; the free-text `reason` on a dead-lettered
+job is passed through the same redaction, because a transport error
+quotes the request URL in full.
+
+**Auth**, mirroring the web UI exactly: `auth: basic` with
+`VISMOD_RESULT_API_USER` / `VISMOD_RESULT_API_PASSWORD`, **env-only** —
+either key written under `intake.result_api` in yaml is a boot refusal,
+not a fallback — compared with `subtle.ConstantTimeCompare`. With
+`auth: basic` and either credential unset it returns `503` rather than
+serving open. `auth: "none"` is permitted for a **loopback-only**
+`intake_addr` behind a trusted sidecar, and is documented as such.
+Note the asymmetry deliberately: these routes are authenticated while
+`POST /jobs` on the same listener is not, so enabling them does not make
+`intake_addr` safe to expose. The listener's exposure is still governed
+by the dev/demo warning in `docs/rest-api.md`.
+
+**It is not durable and it is not the audit log.** The store behind it
+is bounded (`max_entries`) and ephemeral (`ttl`), in memory, and empty
+after a restart; eviction and expiry both answer `404`, which is
+deliberately indistinguishable from an id that was never submitted — a
+store that cannot answer says so rather than returning a soft "unknown
+but probably fine". The sinks and the hash-chained audit log remain the
+record of what was decided. Under `queue.driver: redis` with more than
+one replica a `GET` can also land on a replica that never processed the
+job, so until the Redis-backed store lands, treat a `404` from a
+multi-replica deployment as "ask the sinks".
+
+Every route added here is a read. Nothing on this surface mutates a job,
+a queue, or a configuration.
+
 ### Audit log: tamper-EVIDENT, not tamper-PROOF (honest scope)
 
 The audit log is an append-only hash chain:

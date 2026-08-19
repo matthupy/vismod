@@ -312,3 +312,46 @@ terminal in `moderate.DoJSON`: notification lost, no retry.
 ["*"]` and a metadata object of ~30 keys, and one with `["*"]` over a
 small object to confirm ordinary wildcard rendering. Record the returned
 status for each.
+
+## The result readback store has never run under `-race`, or on Redis
+
+`intake.result_api` (issue #72) adds `resultStore` in `internal/cli`: a
+bounded LRU + TTL map written from the worker handler and from the intake
+handler, and read from every HTTP request. In a running `serve` that is
+`queue.workers` goroutines plus the intake goroutine plus one goroutine
+per in-flight request, all on one `sync.Mutex` that covers the map and
+the `container/list` together. `go test -race` has never been run against
+it: this box has `CGO_ENABLED=0` and no C toolchain, so `-race` errors
+with `-race requires cgo`. The concurrent exercise it did get is
+`TestResultStoreUnderConcurrentTransitionsAndReads` (8 goroutines x 60
+jobs, interleaving all three transitions with reads against a store
+deliberately smaller than the job count), looped `go test -run
+TestResultStoreUnderConcurrentTransitionsAndReads -count=20
+./internal/cli/`, which passed but cannot detect a data race the way
+`-race` can.
+
+**Proves it:** `go test -race ./internal/cli/` on a machine with a C
+toolchain. CI is the gate.
+
+Two behavioral claims written into `SECURITY.md` and `docs/rest-api.md`
+§4 are reasoned rather than observed, because neither is reachable from
+this suite:
+
+1. **The multi-replica `404`.** Both docs state that under
+   `queue.driver: redis` with more than one replica a `GET` can land on a
+   replica that never processed the job and answer `404` for a job that
+   succeeded. That follows from the store being per-process, but no
+   two-replica run has been made. **Proves it:** two `serve` replicas
+   against one Redis, jobs submitted to replica A, then `GET /jobs/{id}`
+   against replica B. It is the whole reason for issue #73, the
+   Redis-backed store.
+2. **A url job never reaches `done` in this suite**, so the redaction of a
+   SUCCESSFUL url job's `source.ref` on this endpoint rests on the
+   envelope's own contract rather than on an observation.
+   `TestResultAPINeverDisclosesThePresignedURL` drives a real url job, but
+   with no credentials and no reachable host it dead-letters — so what
+   that test proves is that the free-text `reason` is redacted. The `done`
+   path returns `env.Source` unmodified, and `pipeline.resolveSource` is
+   what makes that the redacted form. **Proves it:** a url job fetched
+   from a reachable https origin with a query string on the ref, read back
+   through `GET /jobs/{id}`.
