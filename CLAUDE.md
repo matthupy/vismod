@@ -24,14 +24,30 @@ internal/frames/  ffmpeg frame extraction, workflow guardrails, dHash dedup
 internal/fetch/   allow-listed https media download for kind:"url" sources
 internal/queue/   memq (dev) and redisq (durable, at-least-once)
 internal/pipeline/  frames -> dedup -> fan-out -> thresholds -> rollup -> sink
-internal/result/  result envelope + Sink implementations (JSONL, file, webhook, multi)
+internal/result/  result envelope + Sinks (JSONL, file, webhook, multi),
+                  routing (Predicate/RoutedSink), formats (json, discord)
 internal/audit/   append-only hash-chained decision log
 internal/observe/ slog, Prometheus metrics, backpressure
 internal/ui/      embedded read-mostly operator dashboard (off by default)
 ```
 
+## Commands
+
 Build and test with `go build ./...`, `go vet ./...`, `go test ./...`.
 The full suite runs with no network and no credentials.
+
+```sh
+go test ./internal/pipeline/...              # one package
+go test ./internal/pipeline/ -run TestRollupVerdictPrecedence   # one test
+go test -update ./internal/moderate/...      # regenerate goldens
+gofmt -l .                                   # must print NOTHING
+golangci-lint run ./... && govulncheck ./... # CI also runs both
+go mod tidy && git diff --exit-code go.mod go.sum
+```
+
+`go test -race` cannot run on the primary dev box (`CGO_ENABLED=0`, no C
+toolchain) — CI is the only data-race gate. Everything else above runs
+locally. Full done gate: [AGENTS.md](AGENTS.md).
 
 ## Where to go next
 
@@ -49,10 +65,14 @@ extension point, and the gotchas that have already bitten someone.
 | Trust boundaries, SSRF posture, audit scope | [SECURITY.md](SECURITY.md) |
 | Deployment ethics, human-in-the-loop | [RESPONSIBLE_USE.md](RESPONSIBLE_USE.md) |
 | Why scores are not portable across vendors | [MODEL_LIMITATIONS.md](MODEL_LIMITATIONS.md) |
+| What each envelope field means, sink routing and formats | [docs/result-envelope.md](docs/result-envelope.md) |
+| Per-model limits, class maps, auth, verification status | [docs/models.md](docs/models.md) |
 | Which open-weight model to self-host, and why | [docs/self-hosted-classifiers.md](docs/self-hosted-classifiers.md) |
+| What the audit chain records, and verifying it | [docs/audit-log.md](docs/audit-log.md) |
 | Human contributor rules | [CONTRIBUTING.md](CONTRIBUTING.md) |
 | Custom ffmpeg workflows | [docs/custom-ffmpeg-workflows.md](docs/custom-ffmpeg-workflows.md) |
 | Submitting jobs over HTTP, scanning from a URL | [docs/rest-api.md](docs/rest-api.md) |
 | Scaling, KEDA/HPA, rate-limit budgeting | [deploy/README.md](deploy/README.md) |
 | Try it locally with Docker Compose | [deploy/compose/README.md](deploy/compose/README.md) |
+| What to check before going to production | [docs/production-checklist.md](docs/production-checklist.md) |
 | Config surface | [config.example.yaml](config.example.yaml) |
