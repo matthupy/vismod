@@ -36,7 +36,7 @@ Verified against the tree at `main` (2c8e7d1), not inferred:
 | Requirement | Blocker |
 |---|---|
 | Read a verdict back from a remote instance | There is no read side. `POST /jobs` (`internal/cli/serve.go:466`) returns `202 {job_id}`; verdicts go to the **server's** sinks. `docs/rest-api.md` says so plainly: "The verdict is not in the response." No `GET /jobs/{id}` exists |
-| Scan a local file on a remote instance | `kind:"file"` `ref` is resolved with `filepath.Abs` against the **server's** cwd (`serve.go:520-528`), and intake never `stat`s it. There is no upload endpoint — bodies are capped at 1 MiB and carry refs only |
+| Scan a local file on a remote instance | `kind:"file"` `ref` is resolved with `filepath.Abs` against the **server's** cwd (`serve.go:521-529`), and intake never `stat`s it. There is no upload endpoint — bodies are capped at 1 MiB and carry refs only |
 | Capture a cassette from a remote run | `CapturingModerator` (#57) wraps `moderation.Moderator` in-process. There is no such seam across a network, and `billed_calls` is therefore not directly countable |
 | Express "flagged / not flagged" | The manifest's `expect.verdict` is 3-valued (`allow`/`flag`/`block`). No boolean form exists |
 | Emit anything but a run record and a console report | #62 and #63 are the whole output surface |
@@ -242,7 +242,7 @@ deployment, and the harness cannot introspect it. So:
   the corpus and reporting 100% abstention.
 
 The canary matters because intake does not `stat` the ref
-(`serve.go:520-528`): an unreachable path is accepted with `202` and
+(`serve.go:521-529`): an unreachable path is accepted with `202` and
 fails deep in the pipeline as `verdict:"error"`. Without the canary that
 surfaces on the report as an abstention gate failure — indistinguishable
 from a provider outage, and easily misread as a model problem. It is
@@ -326,7 +326,7 @@ ran.
 
 `--format` is repeatable and defaults to `console,json`. The registry
 mirrors `internal/result/format.go:81` — a
-`map[string]func(Options) (Formatter, error)`, an unknown name is an
+`map[string]func(FormatOptions) (Formatter, error)`, an unknown name is an
 error, and each formatter names itself and its content type.
 
 | Format | Content |
