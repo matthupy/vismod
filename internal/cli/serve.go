@@ -160,7 +160,7 @@ func newServer(cfg config.Config) (*server, error) {
 	var results *resultStore
 	if ra := cfg.Intake.ResultAPI; ra.Enabled {
 		results = newResultStore(ra.MaxEntries, ra.TTL)
-		log.Warn("intake result api is ENABLED: job verdicts, refs and caller metadata are readable over http on intake_addr; the store is bounded and ephemeral, NOT the audit log",
+		log.Warn("intake result api is ENABLED: job verdicts, refs and caller metadata are readable over http on intake_addr",
 			"auth", ra.Auth, "max_entries", ra.MaxEntries, "ttl", ra.TTL)
 	}
 
