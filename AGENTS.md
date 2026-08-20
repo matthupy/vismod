@@ -281,9 +281,32 @@ import needs justification.
   `validateProviderLabelBoot`, which must keep reading `ProviderLabels()`
   off the unwrapped adapter, because a boot check that depends on what a
   wrapper happens to forward is a check that silently stops checking. A
-  hook that is nil, or that returns nil, is a boot failure: a nil Moderator
-  would panic on the first job the worker had already accepted, and a hook
-  silently skipped is a caller that believes it is wrapping and is not.
+  hook that is nil, or that returns nil — including a TYPED nil, which
+  `isNilModerator` looks through the interface to catch — is a boot
+  failure: a nil Moderator would panic on the first job the worker had
+  already accepted, and a hook silently skipped is a caller that believes
+  it is wrapping and is not.
+- **A decorator that DROPS an optional interface the adapter satisfied
+  fails boot.** Because the hook lands on the adapter, every downstream
+  type assertion — `observe.InstrumentModerator`, `buildPipeline`'s
+  `ModelIdentity` stamp, the pipeline's video branch — now runs against
+  caller code, and a type assertion sees only the method set in front of
+  it. A wrapper that forwards nothing does not error and does not log; the
+  capability just disappears. `applyModeratorDecorator` therefore records
+  what the adapter satisfied BEFORE calling the hook and refuses to boot if
+  `ModelVersion()` or `AnalyzeVideo()` came back missing: losing the first
+  stamps `model_version:"unversioned"` on every envelope and audit record
+  and computes `ConfigHash` over that string — the run's central auditable
+  question answered wrong forever, with nothing to notice it by — and
+  losing the second silently falls back to frame extraction against a
+  video-native provider. The check is ONE-DIRECTIONAL: it requires
+  forwarding, not invention, so a decorator over an adapter that never
+  declared the capability still boots. `Close()` cannot be guarded this way
+  — it is part of `moderation.Moderator`, so every decorator has it and
+  none can be asserted for; a decorator that implements `Close()` without
+  forwarding leaks the adapter, and that one stays a documented contract.
+  `TestDecoratorMustNotDropOptionalInterfaces` and
+  `TestDecoratorForwardingOptionalInterfacesBoots` pin both directions.
 - **The address policy is chosen from the hostname, before resolution.**
   `Fetcher.dial` picks `DenyMetadata` over `DenyPrivate` only when the
   dialed hostname is in `allow_private_hosts`. Selecting it from the

@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -109,24 +110,78 @@ func withModeratorDecorator(fn func(moderation.Moderator) moderation.Moderator) 
 	return func(o *serverOptions) { o.decorateModerator, o.decoratorSet = fn, true }
 }
 
-// decorateModerator applies a caller-supplied hook to the built adapter.
+// applyModeratorDecorator applies a caller-supplied hook to the built
+// adapter, and refuses to boot on any of the three ways the hook can hand
+// back something the rest of boot would then use wrongly and silently.
 //
 // A nil hook, or one that returns nil, is a boot failure. A nil Moderator
 // would panic on the first job — after the worker had already accepted it —
 // and the fail-safe answer to a caller bug is refusing to start, not a
 // worker that cannot score what it takes in.
-func decorateModerator(mod moderation.Moderator, fn func(moderation.Moderator) moderation.Moderator) (moderation.Moderator, error) {
+//
+// A hook that DROPS an optional interface the adapter satisfied is also a
+// boot failure, and this is the arm that has to be structural rather than
+// documented. Everything downstream of this point reads capabilities off the
+// moderator by type assertion — observe.InstrumentModerator, buildPipeline's
+// ModelIdentity stamp, the pipeline's video branch — and a type assertion
+// sees only the method set in front of it. A wrapper that forwards nothing
+// does not error and does not log; the capability just disappears (see
+// observe.InstrumentModerator's godoc, which pays a type per combination for
+// exactly this reason). The two that are assertable:
+//
+//   - ModelVersion(): dropping it stamps model_version "unversioned" on every
+//     envelope and audit record and computes ConfigHash over that string, so
+//     the run's central auditable question — which model scored this? — is
+//     answered wrong, forever, with nothing to notice it by.
+//   - AnalyzeVideo(): dropping it silently falls back to frame extraction
+//     against a provider that analyzes video natively.
+//
+// The check is one-directional: it requires FORWARDING, not invention. A
+// decorator over an adapter that never declared the capability is fine, and a
+// decorator is still free to add one.
+//
+// Close() cannot be guarded this way — it is part of moderation.Moderator, so
+// every decorator has it and none can be asserted for. A decorator that
+// implements Close() without forwarding leaks the adapter at shutdown and on
+// every later boot-failure arm below. That one stays a documented contract.
+func applyModeratorDecorator(mod moderation.Moderator, fn func(moderation.Moderator) moderation.Moderator) (moderation.Moderator, error) {
 	if fn == nil {
 		return nil, fmt.Errorf("moderator decorator: the hook is nil")
 	}
+	_, wasVersioned := mod.(modelVersioner)
+	_, wasVideo := mod.(moderation.VideoModerator)
+
 	wrapped := fn(mod)
-	if wrapped == nil {
-		// Only an untyped nil is catchable here: a hook returning a typed
-		// nil pointer still produces a non-nil interface, the same trap
-		// newFetcher guards for fetch.New.
+	if isNilModerator(wrapped) {
 		return nil, fmt.Errorf("moderator decorator: the hook returned nil, leaving nothing to score the jobs this worker would accept")
 	}
+	if _, ok := wrapped.(modelVersioner); wasVersioned && !ok {
+		return nil, fmt.Errorf("moderator decorator: the hook dropped ModelVersion(); every envelope and audit record would stamp model_version %q and hash the config over that string", unversionedModel)
+	}
+	if _, ok := wrapped.(moderation.VideoModerator); wasVideo && !ok {
+		return nil, fmt.Errorf("moderator decorator: the hook dropped AnalyzeVideo(); video jobs would fall back to frame extraction against a provider that analyzes video natively")
+	}
 	return wrapped, nil
+}
+
+// isNilModerator reports whether m carries nothing usable, including the
+// typed-nil case a plain `m == nil` misses: a hook returning a nil *T hands
+// back a non-nil interface holding a nil pointer, so the guard above would
+// pass and the worker would panic on the first job it had already accepted.
+// wire.go's newFetcher guards the same trap for fetch.New; there the source
+// is a constructor this repo controls, so an untyped-nil check is enough.
+// Here the source is caller code, so the check has to look through the
+// interface.
+func isNilModerator(m moderation.Moderator) bool {
+	if m == nil {
+		return true
+	}
+	switch v := reflect.ValueOf(m); v.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Map, reflect.Pointer, reflect.Slice, reflect.UnsafePointer:
+		return v.IsNil()
+	default:
+		return false
+	}
 }
 
 // newServer performs all of boot: validation, adapter construction, sinks,
@@ -171,7 +226,7 @@ func newServer(cfg config.Config, opts ...serverOption) (*server, error) {
 	// every call the pipeline makes, and applied before instrumentation so
 	// the metrics still measure what actually ran.
 	if o.decoratorSet {
-		decorated, derr := decorateModerator(mod, o.decorateModerator)
+		decorated, derr := applyModeratorDecorator(mod, o.decorateModerator)
 		if derr != nil {
 			_ = mod.Close()
 			return nil, derr

@@ -403,11 +403,15 @@ func TestProviderLabelBootValidatesUnwrappedModerator(t *testing.T) {
 		}
 	})
 
+	// The subject here is the label check, not opacity, so the decorator is
+	// a FORWARDING one. Booting an opaque wrapper would encode "a wrapper
+	// may swallow ModelVersion()" as expected behaviour, which
+	// TestDecoratorMustNotDropOptionalInterfaces exists to forbid.
 	t.Run("a configured label boots with the decorator installed", func(t *testing.T) {
 		c := labeled(t)
 		c.ProviderThresholds.Labels = config.Thresholds{"cli-test/violence": config.CategoryThreshold{}}
 		s, err := newServer(c, withModeratorDecorator(func(m moderation.Moderator) moderation.Moderator {
-			return opaqueModerator{inner: m}
+			return countingModerator{inner: m, calls: &atomic.Int64{}}
 		}))
 		if err != nil {
 			t.Fatalf("a fully configured adapter must boot with a decorator installed: %v", err)
@@ -428,6 +432,13 @@ func TestNilDecoratorResultIsBootError(t *testing.T) {
 	}{
 		{"hook returns nil", func(moderation.Moderator) moderation.Moderator { return nil }},
 		{"hook is nil", nil},
+		// A typed nil pointer produces a NON-nil interface, so `wrapped ==
+		// nil` is false and the worker would panic on the first job it had
+		// already accepted — the trap wire.go's newFetcher guards for
+		// fetch.New, arriving here from caller code instead.
+		{"hook returns a typed nil", func(moderation.Moderator) moderation.Moderator {
+			return (*nilPointerModerator)(nil)
+		}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -450,5 +461,220 @@ func TestNilDecoratorResultIsBootError(t *testing.T) {
 				t.Errorf("adapter closed %d times on the failed boot, want 1: a failed boot must not leak the adapter", got)
 			}
 		})
+	}
+}
+
+// videoNativeModerator is a registered adapter that analyzes video natively,
+// like a video-capable vendor would. No SHIPPED adapter satisfies
+// moderation.VideoModerator today, so the seam's video guard would otherwise
+// have nothing to guard against until the day one does — which is exactly
+// when a silently dropped AnalyzeVideo would start costing frame extractions
+// against a provider that never needed them.
+type videoNativeModerator struct{ scriptedModerator }
+
+func (videoNativeModerator) Name() string { return "cli-test-video" }
+
+func (videoNativeModerator) Capabilities() moderation.Caps {
+	c := scriptedModerator{}.Capabilities()
+	c.SupportsVideo = true
+	return c
+}
+
+func (videoNativeModerator) AnalyzeVideo(context.Context, moderation.Source) (moderation.NormalizedResult, error) {
+	return moderation.NormalizedResult{Provider: "cli-test-video"}, nil
+}
+
+// nilPointerModerator exists to be returned as a TYPED nil. A hook that
+// returns (*nilPointerModerator)(nil) hands back a non-nil interface holding
+// a nil pointer, so `wrapped == nil` is false — the same trap wire.go's
+// newFetcher guards for fetch.New, arriving here from CALLER code rather
+// than from a constructor this repo controls.
+type nilPointerModerator struct{}
+
+func (*nilPointerModerator) Name() string                  { return "cli-test-typed-nil" }
+func (*nilPointerModerator) ModelVersion() string          { return "cli-test-v1" }
+func (*nilPointerModerator) Close() error                  { return nil }
+func (*nilPointerModerator) Capabilities() moderation.Caps { return moderation.Caps{} }
+func (*nilPointerModerator) AnalyzeImage(context.Context, moderation.Image) (moderation.NormalizedResult, error) {
+	return moderation.NormalizedResult{}, nil
+}
+
+// videoForwardingModerator is what a decorator over a video-native adapter
+// has to look like to be legal: it forwards ModelVersion() (via
+// countingModerator) AND AnalyzeVideo(). Forwarding by composition costs one
+// type per combination — the same price observe.InstrumentModerator pays,
+// and for the same reason.
+type videoForwardingModerator struct {
+	countingModerator
+	video moderation.VideoModerator
+}
+
+func (v videoForwardingModerator) AnalyzeVideo(ctx context.Context, src moderation.Source) (moderation.NormalizedResult, error) {
+	return v.video.AnalyzeVideo(ctx, src)
+}
+
+// bareModerator is a registered adapter that satisfies moderation.Moderator
+// and NOTHING else — no ModelVersion(), no AnalyzeVideo(). It proves the
+// capability guard checks FORWARDING, not invention: wrapping it opaquely is
+// legal, because nothing was lost. It is written out rather than embedding
+// scriptedModerator because embedding would promote ModelVersion() and make
+// this exact case untestable.
+type bareModerator struct{}
+
+func (bareModerator) Name() string                  { return "cli-test-bare" }
+func (bareModerator) Close() error                  { return nil }
+func (bareModerator) Capabilities() moderation.Caps { return scriptedModerator{}.Capabilities() }
+func (bareModerator) AnalyzeImage(ctx context.Context, img moderation.Image) (moderation.NormalizedResult, error) {
+	return scriptedModerator{}.AnalyzeImage(ctx, img)
+}
+
+func init() {
+	moderate.Register("cli-test-video", func(moderate.AdapterConfig) (moderation.Moderator, error) {
+		return videoNativeModerator{}, nil
+	})
+	moderate.Register("cli-test-bare", func(moderate.AdapterConfig) (moderation.Moderator, error) {
+		return bareModerator{}, nil
+	})
+}
+
+// TestDecoratorMustNotDropOptionalInterfaces: the hook lands on the adapter
+// itself, so every optional-interface type assertion downstream — in
+// observe.InstrumentModerator, in buildPipeline, in the pipeline's video
+// branch — now runs against caller code. A wrapper that forwards nothing
+// does not error and does not log; the capability just disappears, and the
+// worker keeps running with an audit trail that answers the "which model
+// scored this?" question wrong. Fail-safe means refusing to boot.
+func TestDecoratorMustNotDropOptionalInterfaces(t *testing.T) {
+	cases := []struct {
+		name    string
+		adapter string
+		hook    func(moderation.Moderator) moderation.Moderator
+		wantErr string
+	}{
+		{
+			// scriptedModerator (via closeCountingModerator) declares
+			// ModelVersion(); opaqueModerator forwards nothing.
+			name:    "a wrapper that drops ModelVersion refuses to boot",
+			adapter: "cli-test-closes",
+			hook:    func(m moderation.Moderator) moderation.Moderator { return opaqueModerator{inner: m} },
+			wantErr: "ModelVersion",
+		},
+		{
+			// countingModerator forwards ModelVersion() but has no
+			// AnalyzeVideo, so it passes the first guard and must trip the
+			// second: silently falling back to frame extraction is a cost
+			// and fidelity change nobody asked for.
+			name:    "a wrapper that drops AnalyzeVideo refuses to boot",
+			adapter: "cli-test-video",
+			hook: func(m moderation.Moderator) moderation.Moderator {
+				return countingModerator{inner: m, calls: &atomic.Int64{}}
+			},
+			wantErr: "AnalyzeVideo",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := serveConfig(t)
+			c.Adapter = config.AdapterSection{Name: tc.adapter}
+
+			s, err := newServer(c, withModeratorDecorator(tc.hook))
+			if err == nil {
+				s.close()
+				t.Fatalf("boot succeeded with a decorator that swallowed %s(); the capability disappears with nothing logged", tc.wantErr)
+			}
+			if s != nil {
+				t.Error("newServer returned both a server and an error")
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("boot error does not name the dropped capability %s(): %v", tc.wantErr, err)
+			}
+			if !strings.Contains(err.Error(), "decorator") {
+				t.Errorf("boot error does not name the decorator as the cause: %v", err)
+			}
+		})
+	}
+}
+
+// TestDecoratorDroppingModelVersionClosesTheAdapter: the capability guard is
+// a boot-failure arm like every other one in newServer, so it must not leak
+// the adapter built moments earlier.
+func TestDecoratorDroppingModelVersionClosesTheAdapter(t *testing.T) {
+	c := serveConfig(t)
+	c.Adapter = config.AdapterSection{Name: "cli-test-closes"}
+	before := testAdapterCloses.Load()
+
+	s, err := newServer(c, withModeratorDecorator(func(m moderation.Moderator) moderation.Moderator {
+		return opaqueModerator{inner: m}
+	}))
+	if err == nil {
+		s.close()
+		t.Fatal("boot succeeded with a decorator that swallowed ModelVersion()")
+	}
+	if got := testAdapterCloses.Load() - before; got != 1 {
+		t.Errorf("adapter closed %d times on the failed boot, want 1: a failed boot must not leak the adapter", got)
+	}
+}
+
+// TestDecoratorForwardingOptionalInterfacesBoots is the other half of the
+// guard: it constrains what a decorator may be, and the constraint must be
+// "forward what you were handed", not "add nothing". A wrapper that forwards
+// both — which the one intended caller does — still boots, and a wrapper on
+// an adapter that never had the capability is not penalised for not
+// inventing it.
+func TestDecoratorForwardingOptionalInterfacesBoots(t *testing.T) {
+	t.Run("a wrapper that forwards ModelVersion and AnalyzeVideo boots", func(t *testing.T) {
+		c := serveConfig(t)
+		c.Adapter = config.AdapterSection{Name: "cli-test-video"}
+		s, err := newServer(c, withModeratorDecorator(func(m moderation.Moderator) moderation.Moderator {
+			return videoForwardingModerator{
+				countingModerator: countingModerator{inner: m, calls: &atomic.Int64{}},
+				video:             m.(moderation.VideoModerator),
+			}
+		}))
+		if err != nil {
+			t.Fatalf("a forwarding decorator must boot: %v", err)
+		}
+		s.close()
+	})
+
+	t.Run("a wrapper over an adapter with no optional interfaces boots", func(t *testing.T) {
+		c := serveConfig(t)
+		c.Adapter = config.AdapterSection{Name: "cli-test-bare"}
+		s, err := newServer(c, withModeratorDecorator(func(m moderation.Moderator) moderation.Moderator {
+			return opaqueModerator{inner: m}
+		}))
+		if err != nil {
+			t.Fatalf("the guard must check forwarding, not invention: %v", err)
+		}
+		s.close()
+	})
+}
+
+// TestWithModeratorDecoratorLastOptionWins pins the documented behaviour of
+// passing the option twice: the last hook is the one that runs, and it runs
+// once. One Moderator, one wrap (invariant 8) — not two wraps, and not the
+// first hook silently winning over the caller's later intent.
+func TestWithModeratorDecoratorLastOptionWins(t *testing.T) {
+	var first, second atomic.Int64
+	s, err := newServer(serveConfig(t),
+		withModeratorDecorator(func(m moderation.Moderator) moderation.Moderator {
+			first.Add(1)
+			return countingModerator{inner: m, calls: &atomic.Int64{}}
+		}),
+		withModeratorDecorator(func(m moderation.Moderator) moderation.Moderator {
+			second.Add(1)
+			return countingModerator{inner: m, calls: &atomic.Int64{}}
+		}),
+	)
+	if err != nil {
+		t.Fatalf("newServer with the option passed twice: %v", err)
+	}
+	defer s.close()
+
+	if got := first.Load(); got != 0 {
+		t.Errorf("the superseded hook ran %d times, want 0", got)
+	}
+	if got := second.Load(); got != 1 {
+		t.Errorf("the last hook ran %d times, want exactly 1", got)
 	}
 }

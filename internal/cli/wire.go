@@ -214,11 +214,16 @@ func validateProviderLabelBoot(cfg config.Config, mod moderation.Moderator) erro
 // the audit ModelIdentity without widening the public Moderator interface.
 type modelVersioner interface{ ModelVersion() string }
 
+// unversionedModel is what ModelIdentity records when nothing in the chain
+// declares a version. serve.go's decorator guard names it in the error it
+// refuses to boot with, so the two must not drift apart.
+const unversionedModel = "unversioned"
+
 func modelVersion(m moderation.Moderator) string {
 	if v, ok := m.(modelVersioner); ok {
 		return v.ModelVersion()
 	}
-	return "unversioned"
+	return unversionedModel
 }
 
 func openAudit(cfg config.Config) (*audit.Log, error) {
