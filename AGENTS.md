@@ -257,6 +257,33 @@ import needs justification.
   false and a url job panics instead of producing `verdict:"error"`.
   `wire.go` has an explicit `if f == nil { return nil, nil }` for this;
   do not "simplify" it away.
+- **`newServer`'s moderator hook is generic ON PURPOSE, and where it is
+  applied is half the design.** `newServer(cfg, withModeratorDecorator(fn))`
+  lets a caller running the serve stack IN-PROCESS wrap the one Moderator
+  this process builds (invariant 8 — wrap it, never build a second). It
+  exists for the eval harness, whose capture/replay wrappers sit on the
+  `moderation.Moderator`: a separately launched `vismod serve` has no seam
+  to install them into, so billed vendor calls would be uncountable from
+  outside. The hook's type is `func(moderation.Moderator)
+  moderation.Moderator` and nothing more, because `internal/cli` is the
+  composition root — the one place adapters are wired. Naming a concrete
+  capturing or replay type here would invert the dependency: the
+  composition root would import eval tooling and the eval binary would
+  become reachable from the production image. `TestCLIHasNoEvalImports`
+  walks the module's import graph out of `internal/cli` and fails on any
+  `eval`/`captur`/`replay`/`cassette` package appearing anywhere in it;
+  `TestVismodCommandSurfaceUnchanged` pins that the shipped command tree
+  gains no subcommand or flag to reach it. Two placement rules, each with
+  its own test: the hook runs BEFORE `observe.InstrumentModerator` and
+  before `buildPipeline` — a wrapper installed outside the instrumentation
+  counts the wrapper's calls rather than the adapter's, and the pipeline
+  would analyze through the undecorated moderator — and AFTER
+  `validateProviderLabelBoot`, which must keep reading `ProviderLabels()`
+  off the unwrapped adapter, because a boot check that depends on what a
+  wrapper happens to forward is a check that silently stops checking. A
+  hook that is nil, or that returns nil, is a boot failure: a nil Moderator
+  would panic on the first job the worker had already accepted, and a hook
+  silently skipped is a caller that believes it is wrapping and is not.
 - **The address policy is chosen from the hostname, before resolution.**
   `Fetcher.dial` picks `DenyMetadata` over `DenyPrivate` only when the
   dialed hostname is in `allow_private_hosts`. Selecting it from the

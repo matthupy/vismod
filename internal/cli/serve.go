@@ -73,13 +73,73 @@ type server struct {
 	closeSinks func() error
 }
 
+// serverOption configures an optional seam on the assembled server.
+//
+// It is a variadic option rather than a second parameter for the same
+// reason serveIntake takes one (see intakeOption below): every existing
+// caller and every existing serve test still describes boot exactly as it
+// did before the seam existed, which is what makes "the wiring is unchanged
+// when no option is passed" a fact rather than a claim.
+type serverOption func(*serverOptions)
+
+type serverOptions struct {
+	// decorateModerator wraps the ONE Moderator this process builds.
+	// decoratorSet distinguishes "no hook" from "a hook that is nil": the
+	// second is a caller bug and must fail boot, because a hook silently
+	// skipped is a caller that believes it is wrapping and is not.
+	decorateModerator func(moderation.Moderator) moderation.Moderator
+	decoratorSet      bool
+}
+
+// withModeratorDecorator lets a caller that builds the server IN-PROCESS
+// wrap the Moderator buildModerator returned, before instrumentation and
+// before the pipeline is built around it.
+//
+// The hook type is deliberately GENERIC. internal/cli is the composition
+// root — the one place adapters are wired — and naming a concrete wrapper
+// here would invert the dependency: the composition root would import that
+// tooling, and code that has no business in the shipped binary would become
+// reachable from it. All this package knows is that a caller may wrap what
+// buildModerator returned. It wraps the single Moderator; it never permits
+// a second one (invariant 8), and it is not a route for configuration or
+// credentials — those stay env-only via config.Secret (invariant 4).
+//
+// Passing the option twice keeps the last hook: one Moderator, one wrap.
+func withModeratorDecorator(fn func(moderation.Moderator) moderation.Moderator) serverOption {
+	return func(o *serverOptions) { o.decorateModerator, o.decoratorSet = fn, true }
+}
+
+// decorateModerator applies a caller-supplied hook to the built adapter.
+//
+// A nil hook, or one that returns nil, is a boot failure. A nil Moderator
+// would panic on the first job — after the worker had already accepted it —
+// and the fail-safe answer to a caller bug is refusing to start, not a
+// worker that cannot score what it takes in.
+func decorateModerator(mod moderation.Moderator, fn func(moderation.Moderator) moderation.Moderator) (moderation.Moderator, error) {
+	if fn == nil {
+		return nil, fmt.Errorf("moderator decorator: the hook is nil")
+	}
+	wrapped := fn(mod)
+	if wrapped == nil {
+		// Only an untyped nil is catchable here: a hook returning a typed
+		// nil pointer still produces a non-nil interface, the same trap
+		// newFetcher guards for fetch.New.
+		return nil, fmt.Errorf("moderator decorator: the hook returned nil, leaving nothing to score the jobs this worker would accept")
+	}
+	return wrapped, nil
+}
+
 // newServer performs all of boot: validation, adapter construction, sinks,
 // audit log, pipeline, queue. Every failure here is a boot failure — the
 // caller gets an error and nothing has been started.
 //
 // On any error the resources already opened are released, so a failed boot
 // never leaks a file handle or a Redis connection.
-func newServer(cfg config.Config) (*server, error) {
+func newServer(cfg config.Config, opts ...serverOption) (*server, error) {
+	var o serverOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
 	log := observe.NewLogger(cfg.LogLevel)
 	metrics := observe.NewMetrics()
 	bp := observe.NewBackpressure(
@@ -97,12 +157,26 @@ func newServer(cfg config.Config) (*server, error) {
 		return nil, err
 	}
 	// After buildModerator: the declaration lives on the adapter, so this
-	// cannot run in config.Load. Before instrumentation: the wrapper forwards
-	// ModelVersion() but NOT ProviderLabels(), so asserting it here keeps the
-	// check independent of what the wrapper happens to forward.
+	// cannot run in config.Load. Before instrumentation AND before any
+	// caller-supplied decorator: the instrumentation wrapper forwards
+	// ModelVersion() but NOT ProviderLabels(), and a decorator is free to
+	// forward neither, so asserting it here keeps the check independent of
+	// what a wrapper happens to forward. A boot check that reads an optional
+	// interface off a wrapper is a check that silently stops checking.
 	if err := validateProviderLabelBoot(cfg, mod); err != nil {
 		_ = mod.Close()
 		return nil, fmt.Errorf("boot validation: %w", err)
+	}
+	// The in-process seam, applied to the adapter itself so a wrapper sees
+	// every call the pipeline makes, and applied before instrumentation so
+	// the metrics still measure what actually ran.
+	if o.decoratorSet {
+		decorated, derr := decorateModerator(mod, o.decorateModerator)
+		if derr != nil {
+			_ = mod.Close()
+			return nil, derr
+		}
+		mod = decorated
 	}
 	mod = observe.InstrumentModerator(mod, metrics)
 
