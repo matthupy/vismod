@@ -16,6 +16,7 @@ yields `verdict: "error"` and human review — never a silent `allow`.
 
 ```
 cmd/vismod/       thin main
+cmd/vismod-eval/  eval harness CLI; never on the serving path
 pkg/moderation/   public contract types (Moderator, NormalizedResult, Verdict)
 internal/cli/     cobra composition root; the only place adapters are wired
 internal/config/  viper loader, thresholds, workflows, ConfigHash
@@ -29,6 +30,7 @@ internal/result/  result envelope + Sinks (JSONL, file, webhook, multi),
 internal/audit/   append-only hash-chained decision log
 internal/observe/ slog, Prometheus metrics, backpressure
 internal/ui/      embedded read-mostly operator dashboard (off by default)
+internal/eval/    evaluation harness: corpus loader (manifest + CSV on-ramp)
 ```
 
 ## Commands

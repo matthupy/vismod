@@ -125,6 +125,8 @@ go build ./... && go vet ./... && go test ./...
 
 ```
 cmd/vismod/            thin main -> internal/cli
+cmd/vismod-eval/       eval harness CLI, separate binary on purpose: the
+                       harness never moderates and is not in the prod image
 pkg/moderation/        PUBLIC contract types (no internal deps): Moderator,
                        NormalizedResult, Category, ScoreOrigin, Verdict
 internal/cli/          cobra composition root; the ONLY place adapters are
@@ -148,6 +150,9 @@ internal/result/       ResultEnvelope + Sink implementations (JSONL, file,
 internal/audit/        append-only hash-chained log + verify (JCS canonical)
 internal/observe/      slog, Prometheus metrics, backpressure, JobTracker
 internal/ui/           embedded read-mostly dashboard (off by default)
+internal/eval/         evaluation harness, NOT reachable from internal/cli:
+                       corpus/ loads the v1 manifest and desugars the CSV
+                       on-ramp into one, then digests the manifest it wrote
 ```
 
 Job flow specifics that trip people up:
