@@ -17,7 +17,9 @@ yields `verdict: "error"` and human review — never a silent `allow`.
 ```
 cmd/vismod/       thin main
 pkg/moderation/   public contract types (Moderator, NormalizedResult, Verdict)
-internal/cli/     cobra composition root; the only place adapters are wired
+internal/cli/     cobra composition root; the only place adapters are wired.
+                  boot.go exports cli.Serve(ctx, cfg, opts...) for a caller
+                  running the serve stack in-process (the eval harness)
 internal/config/  viper loader, thresholds, workflows, ConfigHash
 internal/moderate/  adapter registry, rate limiter, retrying HTTP; adapters/*
 internal/frames/  ffmpeg frame extraction, workflow guardrails, dHash dedup

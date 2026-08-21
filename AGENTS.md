@@ -257,56 +257,28 @@ import needs justification.
   false and a url job panics instead of producing `verdict:"error"`.
   `wire.go` has an explicit `if f == nil { return nil, nil }` for this;
   do not "simplify" it away.
-- **`newServer`'s moderator hook is generic ON PURPOSE, and where it is
-  applied is half the design.** `newServer(cfg, withModeratorDecorator(fn))`
-  lets a caller running the serve stack IN-PROCESS wrap the one Moderator
-  this process builds (invariant 8 — wrap it, never build a second). It
-  exists for the eval harness, whose capture/replay wrappers sit on the
-  `moderation.Moderator`: a separately launched `vismod serve` has no seam
-  to install them into, so billed vendor calls would be uncountable from
-  outside. The hook's type is `func(moderation.Moderator)
-  moderation.Moderator` and nothing more, because `internal/cli` is the
-  composition root — the one place adapters are wired. Naming a concrete
-  capturing or replay type here would invert the dependency: the
-  composition root would import eval tooling and the eval binary would
-  become reachable from the production image. `TestCLIHasNoEvalImports`
-  walks the module's import graph out of `internal/cli` and fails on any
-  `eval`/`captur`/`replay`/`cassette` package appearing anywhere in it;
-  `TestVismodCommandSurfaceUnchanged` pins that the shipped command tree
-  gains no subcommand or flag to reach it. Two placement rules, each with
-  its own test: the hook runs BEFORE `observe.InstrumentModerator` and
-  before `buildPipeline` — a wrapper installed outside the instrumentation
-  counts the wrapper's calls rather than the adapter's, and the pipeline
-  would analyze through the undecorated moderator — and AFTER
-  `validateProviderLabelBoot`, which must keep reading `ProviderLabels()`
-  off the unwrapped adapter, because a boot check that depends on what a
-  wrapper happens to forward is a check that silently stops checking. A
-  hook that is nil, or that returns nil — including a TYPED nil, which
-  `isNilModerator` looks through the interface to catch — is a boot
-  failure: a nil Moderator would panic on the first job the worker had
-  already accepted, and a hook silently skipped is a caller that believes
-  it is wrapping and is not.
-- **A decorator that DROPS an optional interface the adapter satisfied
-  fails boot.** Because the hook lands on the adapter, every downstream
-  type assertion — `observe.InstrumentModerator`, `buildPipeline`'s
-  `ModelIdentity` stamp, the pipeline's video branch — now runs against
-  caller code, and a type assertion sees only the method set in front of
-  it. A wrapper that forwards nothing does not error and does not log; the
-  capability just disappears. `applyModeratorDecorator` therefore records
-  what the adapter satisfied BEFORE calling the hook and refuses to boot if
-  `ModelVersion()` or `AnalyzeVideo()` came back missing: losing the first
-  stamps `model_version:"unversioned"` on every envelope and audit record
-  and computes `ConfigHash` over that string — the run's central auditable
-  question answered wrong forever, with nothing to notice it by — and
-  losing the second silently falls back to frame extraction against a
-  video-native provider. The check is ONE-DIRECTIONAL: it requires
-  forwarding, not invention, so a decorator over an adapter that never
-  declared the capability still boots. `Close()` cannot be guarded this way
-  — it is part of `moderation.Moderator`, so every decorator has it and
-  none can be asserted for; a decorator that implements `Close()` without
-  forwarding leaks the adapter, and that one stays a documented contract.
-  `TestDecoratorMustNotDropOptionalInterfaces` and
-  `TestDecoratorForwardingOptionalInterfacesBoots` pin both directions.
+- **The in-process boot seam lives in `internal/cli/boot.go`.**
+  `cli.Serve(ctx, cfg, cli.WithModeratorDecorator(fn))` is the exported
+  entry point for a caller running the serve stack in-process — the eval
+  harness, whose capture/replay wrappers sit on the `moderation.Moderator`
+  and have nowhere to install themselves in a separately launched `vismod
+  serve`. The hook's type is `func(moderation.Moderator)
+  moderation.Moderator` and nothing more: naming a concrete capturing type
+  here would make the eval binary reachable from the production image.
+  Three placement rules, each with a test that fails when it moves — the
+  hook runs BEFORE `observe.InstrumentModerator` and `buildPipeline`
+  (outside them, a capture counts the wrapper and the pipeline analyzes
+  through the undecorated moderator) and AFTER `validateProviderLabelBoot`
+  (a boot check reading an optional interface off a wrapper is a check that
+  silently stops checking). A nil hook, a nil return (including a typed
+  nil), or a decorator that DROPS `ModelVersion()` or `AnalyzeVideo()` the
+  adapter satisfied is a boot failure: the capability just disappears with
+  nothing logged, stamping `model_version:"unversioned"` on every envelope
+  forever or silently falling back to frame extraction. The guard requires
+  forwarding, not invention. `Close()` cannot be guarded — every decorator
+  has it and none can be asserted for — so that one stays a documented
+  contract. Rationale in `boot.go`'s godoc; guards pinned by
+  `internal/cli/architecture_test.go` and the decorator tests.
 - **The address policy is chosen from the hostname, before resolution.**
   `Fetcher.dial` picks `DenyMetadata` over `DenyPrivate` only when the
   dialed hostname is in `allow_private_hosts`. Selecting it from the
