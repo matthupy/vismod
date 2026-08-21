@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"reflect"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -74,123 +73,13 @@ type server struct {
 	closeSinks func() error
 }
 
-// serverOption configures an optional seam on the assembled server.
-//
-// It is a variadic option rather than a second parameter for the same
-// reason serveIntake takes one (see intakeOption below): every existing
-// caller and every existing serve test still describes boot exactly as it
-// did before the seam existed, which is what makes "the wiring is unchanged
-// when no option is passed" a fact rather than a claim.
-type serverOption func(*serverOptions)
-
-type serverOptions struct {
-	// decorateModerator wraps the ONE Moderator this process builds.
-	// decoratorSet distinguishes "no hook" from "a hook that is nil": the
-	// second is a caller bug and must fail boot, because a hook silently
-	// skipped is a caller that believes it is wrapping and is not.
-	decorateModerator func(moderation.Moderator) moderation.Moderator
-	decoratorSet      bool
-}
-
-// withModeratorDecorator lets a caller that builds the server IN-PROCESS
-// wrap the Moderator buildModerator returned, before instrumentation and
-// before the pipeline is built around it.
-//
-// The hook type is deliberately GENERIC. internal/cli is the composition
-// root — the one place adapters are wired — and naming a concrete wrapper
-// here would invert the dependency: the composition root would import that
-// tooling, and code that has no business in the shipped binary would become
-// reachable from it. All this package knows is that a caller may wrap what
-// buildModerator returned. It wraps the single Moderator; it never permits
-// a second one (invariant 8), and it is not a route for configuration or
-// credentials — those stay env-only via config.Secret (invariant 4).
-//
-// Passing the option twice keeps the last hook: one Moderator, one wrap.
-func withModeratorDecorator(fn func(moderation.Moderator) moderation.Moderator) serverOption {
-	return func(o *serverOptions) { o.decorateModerator, o.decoratorSet = fn, true }
-}
-
-// applyModeratorDecorator applies a caller-supplied hook to the built
-// adapter, and refuses to boot on any of the three ways the hook can hand
-// back something the rest of boot would then use wrongly and silently.
-//
-// A nil hook, or one that returns nil, is a boot failure. A nil Moderator
-// would panic on the first job — after the worker had already accepted it —
-// and the fail-safe answer to a caller bug is refusing to start, not a
-// worker that cannot score what it takes in.
-//
-// A hook that DROPS an optional interface the adapter satisfied is also a
-// boot failure, and this is the arm that has to be structural rather than
-// documented. Everything downstream of this point reads capabilities off the
-// moderator by type assertion — observe.InstrumentModerator, buildPipeline's
-// ModelIdentity stamp, the pipeline's video branch — and a type assertion
-// sees only the method set in front of it. A wrapper that forwards nothing
-// does not error and does not log; the capability just disappears (see
-// observe.InstrumentModerator's godoc, which pays a type per combination for
-// exactly this reason). The two that are assertable:
-//
-//   - ModelVersion(): dropping it stamps model_version "unversioned" on every
-//     envelope and audit record and computes ConfigHash over that string, so
-//     the run's central auditable question — which model scored this? — is
-//     answered wrong, forever, with nothing to notice it by.
-//   - AnalyzeVideo(): dropping it silently falls back to frame extraction
-//     against a provider that analyzes video natively.
-//
-// The check is one-directional: it requires FORWARDING, not invention. A
-// decorator over an adapter that never declared the capability is fine, and a
-// decorator is still free to add one.
-//
-// Close() cannot be guarded this way — it is part of moderation.Moderator, so
-// every decorator has it and none can be asserted for. A decorator that
-// implements Close() without forwarding leaks the adapter at shutdown and on
-// every later boot-failure arm below. That one stays a documented contract.
-func applyModeratorDecorator(mod moderation.Moderator, fn func(moderation.Moderator) moderation.Moderator) (moderation.Moderator, error) {
-	if fn == nil {
-		return nil, fmt.Errorf("moderator decorator: the hook is nil")
-	}
-	_, wasVersioned := mod.(modelVersioner)
-	_, wasVideo := mod.(moderation.VideoModerator)
-
-	wrapped := fn(mod)
-	if isNilModerator(wrapped) {
-		return nil, fmt.Errorf("moderator decorator: the hook returned nil, leaving nothing to score the jobs this worker would accept")
-	}
-	if _, ok := wrapped.(modelVersioner); wasVersioned && !ok {
-		return nil, fmt.Errorf("moderator decorator: the hook dropped ModelVersion(); every envelope and audit record would stamp model_version %q and hash the config over that string", unversionedModel)
-	}
-	if _, ok := wrapped.(moderation.VideoModerator); wasVideo && !ok {
-		return nil, fmt.Errorf("moderator decorator: the hook dropped AnalyzeVideo(); video jobs would fall back to frame extraction against a provider that analyzes video natively")
-	}
-	return wrapped, nil
-}
-
-// isNilModerator reports whether m carries nothing usable, including the
-// typed-nil case a plain `m == nil` misses: a hook returning a nil *T hands
-// back a non-nil interface holding a nil pointer, so the guard above would
-// pass and the worker would panic on the first job it had already accepted.
-// wire.go's newFetcher guards the same trap for fetch.New; there the source
-// is a constructor this repo controls, so an untyped-nil check is enough.
-// Here the source is caller code, so the check has to look through the
-// interface.
-func isNilModerator(m moderation.Moderator) bool {
-	if m == nil {
-		return true
-	}
-	switch v := reflect.ValueOf(m); v.Kind() {
-	case reflect.Chan, reflect.Func, reflect.Map, reflect.Pointer, reflect.Slice, reflect.UnsafePointer:
-		return v.IsNil()
-	default:
-		return false
-	}
-}
-
 // newServer performs all of boot: validation, adapter construction, sinks,
 // audit log, pipeline, queue. Every failure here is a boot failure — the
 // caller gets an error and nothing has been started.
 //
 // On any error the resources already opened are released, so a failed boot
 // never leaks a file handle or a Redis connection.
-func newServer(cfg config.Config, opts ...serverOption) (*server, error) {
+func newServer(cfg config.Config, opts ...ServerOption) (*server, error) {
 	var o serverOptions
 	for _, opt := range opts {
 		opt(&o)
@@ -322,15 +211,17 @@ func (s *server) close() {
 
 // runServe boots the worker and runs it until a signal arrives.
 func runServe(parent context.Context) error {
-	s, err := newServer(cfg)
-	if err != nil {
-		return err
-	}
-	defer s.close()
-
+	// The signal handler is this command's job, not Serve's: an in-process
+	// caller owns its own process's signals, and a library call that claimed
+	// SIGINT behind its back would fight whoever else installed one.
+	//
+	// It is installed BEFORE the boot Serve performs, so a SIGTERM arriving
+	// during a slow boot drains rather than killing the process mid-wiring.
+	// Boot itself does not take a context, so a signal cannot interrupt a
+	// boot that is already hung; it takes effect as soon as boot returns.
 	ctx, stop := signal.NotifyContext(parent, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	return s.run(ctx)
+	return Serve(ctx, cfg)
 }
 
 // run starts the worker pool, the metrics/intake/UI servers and the depth

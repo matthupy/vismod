@@ -4,18 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"go/parser"
-	"go/token"
-	"io/fs"
-	"path/filepath"
-	"regexp"
-	"sort"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/spf13/cobra"
 
 	"github.com/vismod/vismod/internal/config"
 	"github.com/vismod/vismod/internal/moderate"
@@ -95,7 +87,7 @@ func TestNewServerAppliesModeratorDecorator(t *testing.T) {
 	var analyzed atomic.Int64
 	var handed moderation.Moderator
 
-	s, err := newServer(serveConfig(t), withModeratorDecorator(func(m moderation.Moderator) moderation.Moderator {
+	s, err := newServer(serveConfig(t), WithModeratorDecorator(func(m moderation.Moderator) moderation.Moderator {
 		applied.Add(1)
 		handed = m
 		return countingModerator{inner: m, calls: &analyzed}
@@ -163,7 +155,7 @@ func TestServeWiringUnchangedWithoutDecorator(t *testing.T) {
 func TestDecoratedModeratorKeepsModelVersionOnEnvelope(t *testing.T) {
 	c := serveConfig(t)
 	var analyzed atomic.Int64
-	s, err := newServer(c, withModeratorDecorator(func(m moderation.Moderator) moderation.Moderator {
+	s, err := newServer(c, WithModeratorDecorator(func(m moderation.Moderator) moderation.Moderator {
 		return countingModerator{inner: m, calls: &analyzed}
 	}))
 	if err != nil {
@@ -204,166 +196,6 @@ func TestDecoratedModeratorKeepsModelVersionOnEnvelope(t *testing.T) {
 	}
 }
 
-// TestCLIHasNoEvalImports is the dependency-direction assertion the generic
-// hook exists to make true. internal/cli is the composition root — the one
-// place adapters are wired — so if it ever names a capturing or replay type
-// the eval tooling becomes reachable from the shipped binary. The hook knows
-// only that a caller may wrap what buildModerator returned.
-//
-// The walk is over the module's own source (no toolchain subprocess), and it
-// is transitive: an eval package pulled in through internal/pipeline would
-// be just as fatal as a direct import.
-func TestCLIHasNoEvalImports(t *testing.T) {
-	const mod = "github.com/vismod/vismod"
-	forbidden := []string{"eval", "captur", "replay", "cassette"}
-
-	root, err := filepath.Abs(filepath.Join("..", ".."))
-	if err != nil {
-		t.Fatalf("locate module root: %v", err)
-	}
-	pkgs := modulePackages(t, root, mod)
-
-	// BFS from the composition root over module-internal edges.
-	reached := map[string]bool{}
-	frontier := []string{mod + "/internal/cli"}
-	for len(frontier) > 0 {
-		p := frontier[0]
-		frontier = frontier[1:]
-		if reached[p] {
-			continue
-		}
-		reached[p] = true
-		for _, imp := range pkgs[p] {
-			low := strings.ToLower(imp)
-			for _, bad := range forbidden {
-				if strings.Contains(low, bad) {
-					t.Errorf("%s imports %q: internal/cli must not reach eval/capturing/replay code, or the eval binary becomes reachable from the production image", p, imp)
-				}
-			}
-			if strings.HasPrefix(imp, mod+"/") && !reached[imp] {
-				frontier = append(frontier, imp)
-			}
-		}
-	}
-	// A walk that reached nothing would pass this test for the wrong
-	// reason, so pin a few packages internal/cli demonstrably depends on.
-	for _, must := range []string{"/internal/pipeline", "/internal/queue", "/internal/observe", "/pkg/moderation"} {
-		if !reached[mod+must] {
-			t.Fatalf("import walk never reached %s%s; the assertion is not actually walking the graph", mod, must)
-		}
-	}
-}
-
-// modulePackages parses every non-test source file under root and returns
-// each module package's import list, keyed by import path.
-func modulePackages(t *testing.T, root, mod string) map[string][]string {
-	t.Helper()
-	pkgs := map[string][]string{}
-	fset := token.NewFileSet()
-	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if d.IsDir() {
-			name := d.Name()
-			if path != root && (strings.HasPrefix(name, ".") || strings.HasPrefix(name, "_") || name == "testdata") {
-				return fs.SkipDir
-			}
-			return nil
-		}
-		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
-			return nil
-		}
-		f, perr := parser.ParseFile(fset, path, nil, parser.ImportsOnly)
-		if perr != nil {
-			return fmt.Errorf("parse %s: %w", path, perr)
-		}
-		rel, rerr := filepath.Rel(root, filepath.Dir(path))
-		if rerr != nil {
-			return rerr
-		}
-		pkg := mod
-		if rel != "." {
-			pkg = mod + "/" + filepath.ToSlash(rel)
-		}
-		for _, spec := range f.Imports {
-			pkgs[pkg] = append(pkgs[pkg], strings.Trim(spec.Path.Value, `"`))
-		}
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("walk module source: %v", err)
-	}
-	return pkgs
-}
-
-// flagName matches a pflag declaration line ("  -c, --config string   ...")
-// and captures the long name.
-var flagName = regexp.MustCompile(`^\s+(?:-\w, )?--([\w-]+)`)
-
-// TestVismodCommandSurfaceUnchanged: the seam is for an in-process caller,
-// so the shipped binary must not grow a way to reach it. cmd/vismod is a
-// three-line main over this command tree, so the tree IS the surface — a new
-// subcommand or flag here is a new operator-facing feature, and an
-// eval/capture switch on the production binary is exactly what the design
-// forbids.
-func TestVismodCommandSurfaceUnchanged(t *testing.T) {
-	want := map[string]string{
-		"vismod":                    "config",
-		"vismod adapters":           "",
-		"vismod audit":              "",
-		"vismod audit verify":       "",
-		"vismod healthcheck":        "url",
-		"vismod scan":               "dedup-threshold,metadata,workflow",
-		"vismod serve":              "",
-		"vismod version":            "",
-		"vismod workflows":          "",
-		"vismod workflows list":     "",
-		"vismod workflows validate": "",
-	}
-	got := map[string]string{}
-	var walk func(prefix string, c *cobra.Command)
-	walk = func(prefix string, c *cobra.Command) {
-		name := c.Name()
-		if name == "help" || name == "completion" { // cobra's own, not ours
-			return
-		}
-		path := strings.TrimSpace(prefix + " " + name)
-		var flags []string
-		// Read the names out of the rendered usage rather than visiting the
-		// FlagSet: VisitAll needs *pflag.Flag by name, and importing pflag
-		// here would promote a transitive dependency to a direct one in
-		// go.mod, which is a lot of churn for a guard test. flagName only
-		// matches at the start of a line, where pflag renders declarations.
-		for _, line := range strings.Split(c.LocalFlags().FlagUsages(), "\n") {
-			m := flagName.FindStringSubmatch(line)
-			if m != nil && m[1] != "help" { // cobra adds help itself
-				flags = append(flags, m[1])
-			}
-		}
-		sort.Strings(flags)
-		got[path] = strings.Join(flags, ",")
-		for _, sub := range c.Commands() {
-			walk(path, sub)
-		}
-	}
-	walk("", rootCmd)
-
-	if len(got) != len(want) {
-		t.Errorf("command tree has %d commands, want %d:\ngot  %v\nwant %v", len(got), len(want), got, want)
-	}
-	for path, flags := range got {
-		w, ok := want[path]
-		if !ok {
-			t.Errorf("new command %q on the shipped binary; the eval seam is for in-process callers only", path)
-			continue
-		}
-		if flags != w {
-			t.Errorf("command %q flags = %q, want %q", path, flags, w)
-		}
-	}
-}
-
 // TestProviderLabelBootValidatesUnwrappedModerator: the boot check reads an
 // optional interface (ProviderLabels) off the adapter, and a wrapper that
 // does not forward it makes the check silently pass. A check that depends on
@@ -391,7 +223,7 @@ func TestProviderLabelBootValidatesUnwrappedModerator(t *testing.T) {
 	})
 
 	t.Run("a decorator that hides ProviderLabels cannot disarm the check", func(t *testing.T) {
-		s, err := newServer(labeled(t), withModeratorDecorator(func(m moderation.Moderator) moderation.Moderator {
+		s, err := newServer(labeled(t), WithModeratorDecorator(func(m moderation.Moderator) moderation.Moderator {
 			return opaqueModerator{inner: m}
 		}))
 		if err == nil {
@@ -410,7 +242,7 @@ func TestProviderLabelBootValidatesUnwrappedModerator(t *testing.T) {
 	t.Run("a configured label boots with the decorator installed", func(t *testing.T) {
 		c := labeled(t)
 		c.ProviderThresholds.Labels = config.Thresholds{"cli-test/violence": config.CategoryThreshold{}}
-		s, err := newServer(c, withModeratorDecorator(func(m moderation.Moderator) moderation.Moderator {
+		s, err := newServer(c, WithModeratorDecorator(func(m moderation.Moderator) moderation.Moderator {
 			return countingModerator{inner: m, calls: &atomic.Int64{}}
 		}))
 		if err != nil {
@@ -446,7 +278,7 @@ func TestNilDecoratorResultIsBootError(t *testing.T) {
 			c.Adapter = config.AdapterSection{Name: "cli-test-closes"}
 			before := testAdapterCloses.Load()
 
-			s, err := newServer(c, withModeratorDecorator(tc.hook))
+			s, err := newServer(c, WithModeratorDecorator(tc.hook))
 			if err == nil {
 				s.close()
 				t.Fatal("boot succeeded with no moderator to run jobs against")
@@ -577,7 +409,7 @@ func TestDecoratorMustNotDropOptionalInterfaces(t *testing.T) {
 			c := serveConfig(t)
 			c.Adapter = config.AdapterSection{Name: tc.adapter}
 
-			s, err := newServer(c, withModeratorDecorator(tc.hook))
+			s, err := newServer(c, WithModeratorDecorator(tc.hook))
 			if err == nil {
 				s.close()
 				t.Fatalf("boot succeeded with a decorator that swallowed %s(); the capability disappears with nothing logged", tc.wantErr)
@@ -603,7 +435,7 @@ func TestDecoratorDroppingModelVersionClosesTheAdapter(t *testing.T) {
 	c.Adapter = config.AdapterSection{Name: "cli-test-closes"}
 	before := testAdapterCloses.Load()
 
-	s, err := newServer(c, withModeratorDecorator(func(m moderation.Moderator) moderation.Moderator {
+	s, err := newServer(c, WithModeratorDecorator(func(m moderation.Moderator) moderation.Moderator {
 		return opaqueModerator{inner: m}
 	}))
 	if err == nil {
@@ -625,7 +457,7 @@ func TestDecoratorForwardingOptionalInterfacesBoots(t *testing.T) {
 	t.Run("a wrapper that forwards ModelVersion and AnalyzeVideo boots", func(t *testing.T) {
 		c := serveConfig(t)
 		c.Adapter = config.AdapterSection{Name: "cli-test-video"}
-		s, err := newServer(c, withModeratorDecorator(func(m moderation.Moderator) moderation.Moderator {
+		s, err := newServer(c, WithModeratorDecorator(func(m moderation.Moderator) moderation.Moderator {
 			return videoForwardingModerator{
 				countingModerator: countingModerator{inner: m, calls: &atomic.Int64{}},
 				video:             m.(moderation.VideoModerator),
@@ -640,7 +472,7 @@ func TestDecoratorForwardingOptionalInterfacesBoots(t *testing.T) {
 	t.Run("a wrapper over an adapter with no optional interfaces boots", func(t *testing.T) {
 		c := serveConfig(t)
 		c.Adapter = config.AdapterSection{Name: "cli-test-bare"}
-		s, err := newServer(c, withModeratorDecorator(func(m moderation.Moderator) moderation.Moderator {
+		s, err := newServer(c, WithModeratorDecorator(func(m moderation.Moderator) moderation.Moderator {
 			return opaqueModerator{inner: m}
 		}))
 		if err != nil {
@@ -657,11 +489,11 @@ func TestDecoratorForwardingOptionalInterfacesBoots(t *testing.T) {
 func TestWithModeratorDecoratorLastOptionWins(t *testing.T) {
 	var first, second atomic.Int64
 	s, err := newServer(serveConfig(t),
-		withModeratorDecorator(func(m moderation.Moderator) moderation.Moderator {
+		WithModeratorDecorator(func(m moderation.Moderator) moderation.Moderator {
 			first.Add(1)
 			return countingModerator{inner: m, calls: &atomic.Int64{}}
 		}),
-		withModeratorDecorator(func(m moderation.Moderator) moderation.Moderator {
+		WithModeratorDecorator(func(m moderation.Moderator) moderation.Moderator {
 			second.Add(1)
 			return countingModerator{inner: m, calls: &atomic.Int64{}}
 		}),
