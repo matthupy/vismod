@@ -355,3 +355,45 @@ this suite:
    what makes that the redacted form. **Proves it:** a url job fetched
    from a reachable https origin with a query string on the ref, read back
    through `GET /jobs/{id}`.
+
+## The boot seam has never run under `-race`
+
+**Claimed:** the boot seam adds no shared state. Three of PR #77's four
+commits say so in as many words, and each closes by noting that
+`go test -race` remains unrun locally.
+
+**Actually tested:** `go test ./...` without `-race`. This box has
+`CGO_ENABLED=0` and no C toolchain, so `-race` errors with `-race requires
+cgo` rather than passing or failing. The `serverOptions` struct is built and
+read on one goroutine inside `newServer`, and `applyModeratorDecorator` runs
+once before any worker starts — but the decorator itself is CALLER code
+wrapping the one Moderator every worker goroutine then calls concurrently, so
+a decorator's own state is exactly the thing this repo cannot check here.
+
+**Proves it:** a green `go test -race ./internal/cli/` in CI, and — once a
+real decorator exists (ticket 9) — a `-race` run with that decorator
+installed under concurrent workers, since the seam's race surface belongs to
+the wrapper, not to the option struct.
+
+## The eval harness has never booted through the seam
+
+**Claimed:** `cli.Serve(ctx, cfg, cli.WithModeratorDecorator(fn))` is
+reachable and usable by `cmd/vismod-eval` and `internal/eval` — the callers
+ticket 8 exists to serve — and a capture wrapper installed through it sees
+every adapter call the pipeline makes.
+
+**Actually tested:** `boot_external_test.go` (`package cli_test`) boots the
+stack from outside the package with its own forwarding decorator and asserts
+the hook ran, which proves REACHABILITY and nothing beyond it. Neither
+`cmd/vismod-eval` nor `internal/eval` exists yet, so no capture or replay
+wrapper has ever been installed, no corpus has been run through an in-process
+serve stack, and the claim that capture/replay bills a corpus once is
+unexercised. `TestCLIHasNoEvalImports` guards the dependency direction
+against packages that do not exist yet — it will only start doing real work
+when they do.
+
+**Proves it:** ticket 9
+(`docs/superpowers/plans/2026-08-16-eval-harness-breakdown.md`) — a whole
+corpus run through `cli.Serve` with a real capture wrapper installed, showing
+one billed vendor call per corpus case on the capture pass and zero on the
+replay pass.

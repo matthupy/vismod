@@ -215,7 +215,7 @@ func validateProviderLabelBoot(cfg config.Config, mod moderation.Moderator) erro
 type modelVersioner interface{ ModelVersion() string }
 
 // unversionedModel is what ModelIdentity records when nothing in the chain
-// declares a version. serve.go's decorator guard names it in the error it
+// declares a version. boot.go's decorator guard names it in the error it
 // refuses to boot with, so the two must not drift apart.
 const unversionedModel = "unversioned"
 
