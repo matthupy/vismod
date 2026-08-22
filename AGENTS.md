@@ -257,6 +257,35 @@ import needs justification.
   false and a url job panics instead of producing `verdict:"error"`.
   `wire.go` has an explicit `if f == nil { return nil, nil }` for this;
   do not "simplify" it away.
+- **The in-process boot seam lives in `internal/cli/boot.go`.**
+  `cli.Serve(ctx, cfg, cli.WithModeratorDecorator(fn))` is the exported
+  entry point for a caller running the serve stack in-process — the eval
+  harness, whose capture/replay wrappers sit on the `moderation.Moderator`
+  and have nowhere to install themselves in a separately launched `vismod
+  serve`. The hook's type is `func(moderation.Moderator)
+  moderation.Moderator` and nothing more: naming a concrete capturing type
+  here would make the eval binary reachable from the production image.
+  Three placement rules, each with a test that fails when it moves — the
+  hook runs BEFORE `observe.InstrumentModerator` and `buildPipeline`
+  (outside them, a capture counts the wrapper and the pipeline analyzes
+  through the undecorated moderator) and AFTER `validateProviderLabelBoot`
+  (a boot check reading an optional interface off a wrapper is a check that
+  silently stops checking). A nil hook, a nil return (including a typed
+  nil), or a decorator that DROPS `ModelVersion()` or `AnalyzeVideo()` the
+  adapter satisfied is a boot failure: the capability just disappears with
+  nothing logged, stamping `model_version:"unversioned"` on every envelope
+  forever or silently falling back to frame extraction. The guard requires
+  forwarding, not invention. The MANDATORY methods — `Close()`, `Name()`
+  and `Capabilities()` — cannot be guarded at all: every decorator has
+  them, so an assertion proves presence and never forwarding. They are
+  contract, not check. A decorator that overrides `Name()` to `""` poisons
+  `ConfigHash` and the `Provider` on every record; one that returns a zero
+  `Caps` kills the video branch even with `AnalyzeVideo()` forwarded (it
+  gates on both) and drops the oversize pre-flight. Embedding
+  `moderation.Moderator` forwards all three by construction — do not
+  override one without forwarding. Rationale in `boot.go`'s godoc; guards
+  pinned by
+  `internal/cli/architecture_test.go` and the decorator tests.
 - **The address policy is chosen from the hostname, before resolution.**
   `Fetcher.dial` picks `DenyMetadata` over `DenyPrivate` only when the
   dialed hostname is in `allow_private_hosts`. Selecting it from the

@@ -8,35 +8,75 @@ nav_order: 20
 Current state of the work. Rewrite this at the end of every iteration.
 Keep it short — it is read cold at the start of the next one.
 
-**Updated:** 2026-08-07
+**Updated:** 2026-08-21
 
-## Most recent iteration: `raw_sha256` is real
+## Most recent iteration: the in-process boot seam
 
-The audit record claims to bind a verdict to its inputs by hash. It did
-not: `raw_sha256` was the empty string on every record any shipped
-adapter ever produced, because `evaluateFrame` kept `res.Frames[0]` and
-dropped the rest of the adapter's `NormalizedResult`, `Raw` included. The
-one construction site that preserved `Raw` was the video-native path, and
-no shipped adapter is video-native. Found by reading a **live Azure
-Content Safety** audit log from the compose stack (three records, two
-sessions, two media kinds, two verdicts — all empty), not a fixture.
+Ticket 8. The eval harness's capture and replay wrappers sit on the
+`moderation.Moderator`, so the eval binary has to run the serve stack
+in-process — a separately launched `vismod serve` offers nowhere to install
+such a wrapper, and billed vendor calls are then uncountable from outside the
+process. New `internal/cli/boot.go` is that one seam in shipped code:
+`cli.Serve(ctx, cfg, cli.WithModeratorDecorator(fn))`.
 
-The evidence now travels as its own value: `evaluateFrame` returns it,
-`processImage`/`processVideo` hand it up, `ProcessJob` hashes it into
-`ResultEnvelope.RawSHA256` and drops it. `Raw` never lands on the
-`NormalizedResult` an envelope carries — invariant 3 forbids it in an
-envelope, and `env.Result` is a pointer the sink holds before audit runs,
-so clearing it after the sink write would have been a race rather than a
-boundary. The video-native path now lifts and clears `Raw` too, closing
-that latent leak before anyone ships a video-native adapter.
+The hook landed unusable at first. `newServer` and the option were both
+unexported, so `cmd/vismod-eval` and `internal/eval` — the callers the ticket
+exists for — could not reach them, and the whole suite passed while the seam
+it pinned was reachable by nobody. `Serve` is now the exported entry point,
+`newServer` + `run` behind one call so there is no two-call lifecycle to get
+wrong; `newServer`, `server`, `run` and `close` stay unexported. `Serve`
+installs NO signal handler — a library call claiming SIGINT would fight the
+process that owns it — and the cobra path keeps that job. One behavioral
+delta on `vismod serve`: `runServe` installs its handler BEFORE boot rather
+than after, so a SIGTERM during a slow boot drains instead of killing the
+process mid-wiring. A boot failure is wrapped `boot: %w`, because the harness
+must tell a stack that never started (a broken run) from one that started and
+failed to drain (a scored one with a reported timeout).
 
-Decisions recorded: video hashes a JSON array with one entry per scanned
-frame in timestamp order; a failed frame holds its index as `null`; no
-provider response at all means an empty digest, not a hash of nothing; no
-schema bump, because envelope serialization is byte-identical. Frames and
-their raw responses are held in one `frameOutcome` struct so the
-post-fan-out timestamp sort moves both — desync is unrepresentable, and
-tested for anyway.
+Placement is half the design and each half has a test that fails when it
+moves. The hook runs AFTER `validateProviderLabelBoot`, which must keep
+reading `ProviderLabels()` off the UNWRAPPED adapter — a boot check that
+depends on what a wrapper happens to forward is a check that has silently
+stopped checking. It runs BEFORE `observe.InstrumentModerator` and
+`buildPipeline`: outside the instrumentation a capture would count the
+instrumentation's calls rather than the adapter's, and the pipeline would
+analyze through the undecorated moderator.
+
+`applyModeratorDecorator` refuses to boot on every way a caller hook can hand
+back something the rest of boot would then use wrongly and silently: a nil
+hook, a hook returning nil (including a TYPED nil — `isNilModerator` looks
+through the interface, since `wrapped == nil` is false for a nil `*T` and the
+worker panicked on the first job it had already accepted), and a hook that
+DROPS an optional interface the adapter satisfied. The capability arm is the
+one that had to be structural rather than documented: a wrapper forwarding
+nothing booted clean, stamped `model_version: "unversioned"` on every envelope
+and audit record and computed `ConfigHash` over that string, with nothing
+errored and nothing logged. That was proven with a probe test on the branch,
+not inferred. `ModelVersion()` and `AnalyzeVideo()` are the two that are
+assertable; the check is ONE-DIRECTIONAL, requiring forwarding rather than
+invention, so a decorator over an adapter that never declared a capability
+still boots and may still add one. `Close()` cannot be guarded this way at
+all — it is part of `moderation.Moderator`, so every decorator has it and none
+can be asserted for; a decorator that implements it without forwarding leaks
+the adapter, and that stays a documented contract.
+
+The hook's type is deliberately generic. `internal/cli` is the composition
+root, so typing it to a concrete capturing moderator or branching on an
+`evalMode` flag would invert the dependency and make eval tooling reachable
+from the shipped image. `TestCLIHasNoEvalImports` walks the module's own
+import graph out of `internal/cli` and fails on any eval/capture/replay
+package in it, transitively; `TestVismodCommandSurfaceUnchanged` pins that the
+command tree gains no subcommand and no flag. `vismod serve` has no new flag,
+no new config key, and nothing new reaching an envelope, a log, or an audit
+record.
+
+Worth knowing about the tests: `boot_external_test.go` is `package cli_test`
+deliberately, because an in-package test cannot prove reachability — it sees
+unexported identifiers and would have passed against the broken version.
+`TestVismodCommandSurfaceUnchanged` now visits the `FlagSet` instead of
+regex-scraping rendered `FlagUsages()`; that promotes `pflag` from indirect to
+direct in `go.mod` (already in the build via cobra, so one line, no new
+module). `internal/cli` coverage rose 88.7% -> 93.9%.
 
 ## Where things stand
 
@@ -363,21 +403,44 @@ happens at `Start`, the `legacy` entry is never refreshed (so it becomes
 reapable ~60s later, possibly while old replicas still hold the work), and
 a mid-flight rollback leaves per-instance keys an old binary cannot see.
 
+Latest, landed on `main` since: `raw_sha256` is real. The audit record
+claimed to bind a verdict to its inputs by hash and did not — `raw_sha256`
+was the empty string on every record any shipped adapter ever produced,
+because `evaluateFrame` kept `res.Frames[0]` and dropped the rest of the
+adapter's `NormalizedResult`, `Raw` included. Found by reading a live Azure
+Content Safety audit log, not a fixture. The evidence now travels as its own
+value up to `ProcessJob`, which hashes it into `ResultEnvelope.RawSHA256` and
+drops it, so `Raw` never lands on the `NormalizedResult` an envelope carries.
+Video hashes a JSON array with one entry per scanned frame in timestamp
+order, a failed frame holding `null`; no provider response at all means an
+empty digest. No schema bump — envelope serialization is byte-identical.
+
+Then PR #76 (issue #72): reading a job's state and result back over HTTP,
+`intake.result_api`, OFF by default. `resultStore` in `internal/cli` is a
+bounded LRU + TTL map written from the worker and intake handlers and read
+from every request. It is PER-PROCESS, so under `queue.driver: redis` with
+more than one replica a `GET` can land on a replica that never processed the
+job and answer `404` for a job that succeeded; issue #73 is the Redis-backed
+store that closes it.
+
 ## Gate status
 
-`go build ./...`, `go vet ./...`, `go test ./...` all pass locally as of
-2026-08-05. Total coverage 93.0%; coverage of the code changed in the
-2026-08-05 review pass is 93.2% (492/528 statements).
+Green on `feat/58-newserver-moderator-decorator` as of 2026-08-21: `gofmt -l .`
+silent, `go build ./...`, `go vet ./...`, `go test ./...` all pass, and
+`golangci-lint run ./internal/cli/...` reports 0 issues.
 
-CI on PR #40 is green on all four jobs (build & test, lint,
-vulnerability scan, docker build & smoke) — the only `-race` evidence
-that exists, since that job cannot run on this box. The 2026-08-05
-changes have NOT had a `-race` run (see UNVERIFIED.md).
+`go test -race` has never run on this box (`CGO_ENABLED=0`, no C toolchain)
+and CI is the only data-race gate. Three of PR #77's four commits assert the
+change adds no shared state; that is unproven locally
+(`docs/agent/UNVERIFIED.md`).
 
 ## In flight
 
-PR #40 (`feat/url-source-kind`) is open and has had no human review. No
-fetch has ever run against a real remote host (`UNVERIFIED.md`).
+PR #77 (`feat/58-newserver-moderator-decorator`) is open. The seam it adds has
+no in-repo caller yet — `cmd/vismod-eval` and `internal/eval` do not exist —
+so the integration it exists to serve is unproven (`docs/agent/UNVERIFIED.md`).
+Ticket 9 in `docs/superpowers/plans/2026-08-16-eval-harness-breakdown.md` is
+what consumes it.
 
 ## Blocked
 

@@ -79,7 +79,11 @@ type server struct {
 //
 // On any error the resources already opened are released, so a failed boot
 // never leaks a file handle or a Redis connection.
-func newServer(cfg config.Config) (*server, error) {
+func newServer(cfg config.Config, opts ...ServerOption) (*server, error) {
+	var o serverOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
 	log := observe.NewLogger(cfg.LogLevel)
 	metrics := observe.NewMetrics()
 	bp := observe.NewBackpressure(
@@ -97,12 +101,26 @@ func newServer(cfg config.Config) (*server, error) {
 		return nil, err
 	}
 	// After buildModerator: the declaration lives on the adapter, so this
-	// cannot run in config.Load. Before instrumentation: the wrapper forwards
-	// ModelVersion() but NOT ProviderLabels(), so asserting it here keeps the
-	// check independent of what the wrapper happens to forward.
+	// cannot run in config.Load. Before instrumentation AND before any
+	// caller-supplied decorator: the instrumentation wrapper forwards
+	// ModelVersion() but NOT ProviderLabels(), and a decorator is free to
+	// forward neither, so asserting it here keeps the check independent of
+	// what a wrapper happens to forward. A boot check that reads an optional
+	// interface off a wrapper is a check that silently stops checking.
 	if err := validateProviderLabelBoot(cfg, mod); err != nil {
 		_ = mod.Close()
 		return nil, fmt.Errorf("boot validation: %w", err)
+	}
+	// The in-process seam, applied to the adapter itself so a wrapper sees
+	// every call the pipeline makes, and applied before instrumentation so
+	// the metrics still measure what actually ran.
+	if o.decoratorSet {
+		decorated, derr := applyModeratorDecorator(mod, o.decorateModerator)
+		if derr != nil {
+			_ = mod.Close()
+			return nil, derr
+		}
+		mod = decorated
 	}
 	mod = observe.InstrumentModerator(mod, metrics)
 
@@ -193,15 +211,17 @@ func (s *server) close() {
 
 // runServe boots the worker and runs it until a signal arrives.
 func runServe(parent context.Context) error {
-	s, err := newServer(cfg)
-	if err != nil {
-		return err
-	}
-	defer s.close()
-
+	// The signal handler is this command's job, not Serve's: an in-process
+	// caller owns its own process's signals, and a library call that claimed
+	// SIGINT behind its back would fight whoever else installed one.
+	//
+	// It is installed BEFORE the boot Serve performs, so a SIGTERM arriving
+	// during a slow boot drains rather than killing the process mid-wiring.
+	// Boot itself does not take a context, so a signal cannot interrupt a
+	// boot that is already hung; it takes effect as soon as boot returns.
 	ctx, stop := signal.NotifyContext(parent, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	return s.run(ctx)
+	return Serve(ctx, cfg)
 }
 
 // run starts the worker pool, the metrics/intake/UI servers and the depth

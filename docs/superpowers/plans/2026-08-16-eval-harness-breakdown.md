@@ -505,9 +505,20 @@ imports, or references the capturing or replay moderator — it only knows that
 a caller may wrap what `buildModerator` returned.
 
 **Scope — in.** The optional decorator hook, applied at the one place the
-moderator is constructed. Nothing else.
+moderator is constructed; the exported in-process entry point that makes the
+hook reachable from another package; and the boot-time guards on what the hook
+may hand back.
 
-**Scope — out.** Any eval code. Any change to `vismod serve`'s behavior.
+The last two were added after the first implementation pass. The hook alone was
+unusable: `newServer` and the option were unexported, so `cmd/vismod-eval` and
+`internal/eval` — the callers this ticket exists for — could not reach the seam,
+and every acceptance criterion below was satisfiable only from inside package
+`cli`. Separately, a decorator that forwards nothing booted cleanly and stamped
+`model_version:"unversioned"` on every envelope and audit record with nothing
+logged, which is the audit question this project cannot answer wrong.
+
+**Scope — out.** Any eval code. Any change to `vismod serve`'s behavior beyond
+where the signal handler is installed relative to boot.
 
 **Acceptance criteria**
 
@@ -520,8 +531,22 @@ Positive
       byte-for-byte what they were. Existing `serve` tests pass **unmodified**.
 - [ ] A decorator that forwards `ModelVersion()` still produces a real
       `model_version` on every envelope, not `"unversioned"`.
+- [ ] The seam is reachable from **another package**: an external
+      (`package cli_test`) test boots the stack via the exported entry point
+      with its own decorator installed. An in-package-only test does not
+      satisfy this — `cmd/vismod-eval` is a different package.
+- [ ] A boot failure is distinguishable from a run failure, so the harness can
+      tell a stack that never started from one that failed to drain.
 
 Negative / edge
+- [ ] A decorator that DROPS an optional interface the adapter satisfied
+      (`ModelVersion()`, `AnalyzeVideo()`) is a boot failure naming the
+      dropped capability. The check requires forwarding, not invention: a
+      decorator over an adapter that never had the capability still boots.
+- [ ] A hook returning a **typed** nil pointer is a boot error, not a panic on
+      the first job. (`wrapped == nil` is false for a non-nil interface holding
+      a nil pointer.)
+- [ ] Every boot-failure arm closes the adapter built moments earlier.
 - [ ] `internal/cli` gains no import of, and no reference to, any eval,
       capturing, or replay moderator type. A test or an import-graph assertion
       pins it.
