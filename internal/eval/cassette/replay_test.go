@@ -21,7 +21,7 @@ func loadReplay(t *testing.T, inner moderation.Moderator, adapter string, frames
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	replay, err := NewReplay(c, adapter)
+	replay, err := NewReplay(c, adapter, c.ModelVersion())
 	if err != nil {
 		t.Fatalf("NewReplay: %v", err)
 	}
@@ -102,7 +102,7 @@ func TestNilScoreRoundTripsAsNilNotZero(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	replay, err := NewReplay(c, "microsoft")
+	replay, err := NewReplay(c, "microsoft", c.ModelVersion())
 	if err != nil {
 		t.Fatalf("NewReplay: %v", err)
 	}
@@ -232,7 +232,7 @@ func TestCassetteRefusesForeignAdapter(t *testing.T) {
 		t.Fatalf("Load: %v", err)
 	}
 
-	replay, err := NewReplay(c, "hive")
+	replay, err := NewReplay(c, "hive", c.ModelVersion())
 	if err == nil {
 		t.Fatal("a microsoft cassette was accepted for a hive run")
 	}
@@ -241,6 +241,97 @@ func TestCassetteRefusesForeignAdapter(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "microsoft") || !strings.Contains(err.Error(), "hive") {
 		t.Errorf("error %q must name both the recorded adapter and the configured one", err)
+	}
+}
+
+// TestCassetteRefusesAForeignModelVersion extends the foreign-adapter refusal
+// to the case the adapter name cannot see. MODEL_LIMITATIONS.md's "scores are
+// not portable" argument applies WITHIN a vendor too: a shieldgemma policy-set
+// change, a microsoft api-version bump, a different google feature list — same
+// Name(), different answers. A cassette recorded under one and replayed under
+// another serves the old scores as though they were the new configuration's,
+// and every threshold swept against them is measuring a model that is not the
+// one being shipped.
+func TestCassetteRefusesAForeignModelVersion(t *testing.T) {
+	capture := func(t *testing.T, version string) *Cassette {
+		t.Helper()
+		inner := newFake("microsoft", map[string]moderation.NormalizedResult{
+			"frame-a": scripted("microsoft", "frame-a", ptr(0.1)),
+		})
+		var m moderation.Moderator = inner
+		if version != "" {
+			m = fakeVersioned{fakeModerator: inner, version: version}
+		}
+		c, err := Load(captureFrames(t, m, "frame-a"))
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		return c
+	}
+
+	for _, tc := range []struct {
+		name           string
+		recorded, want string
+	}{
+		{"a different version", "2026-06-01", "2026-08-01"},
+		{"configured version, unversioned recording", "", "2026-08-01"},
+		{"versioned recording, no configured version", "2026-06-01", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			replay, err := NewReplay(capture(t, tc.recorded), "microsoft", tc.want)
+			if err == nil {
+				t.Fatal("a cassette recorded under a different model version was accepted; its scores answer for a configuration this run is not using")
+			}
+			if replay != nil {
+				t.Error("NewReplay returned a moderator alongside its error")
+			}
+			for _, s := range []string{tc.recorded, tc.want} {
+				if s != "" && !strings.Contains(err.Error(), s) {
+					t.Errorf("error %q must name both the recorded version and the configured one", err)
+				}
+			}
+		})
+	}
+
+	t.Run("a matching version is accepted", func(t *testing.T) {
+		if _, err := NewReplay(capture(t, "2026-06-01"), "microsoft", "2026-06-01"); err != nil {
+			t.Fatalf("NewReplay: %v", err)
+		}
+	})
+
+	t.Run("unversioned on both sides is accepted", func(t *testing.T) {
+		if _, err := NewReplay(capture(t, ""), "microsoft", ""); err != nil {
+			t.Fatalf("NewReplay: %v", err)
+		}
+	})
+}
+
+// TestNewReplayRefusesAnEmptyCassette: a header-only cassette is what a
+// capture run that died before its first frame leaves behind. It loads
+// cleanly, reports Len() 0, and then misses on every frame of the corpus —
+// so the operator learns the recording never happened only after the whole
+// replay pass has run and every case is verdict:"error". The same reasoning
+// NewCapturing uses to refuse a video-native adapter at construction applies
+// here: refuse before the corpus runs, not after.
+func TestNewReplayRefusesAnEmptyCassette(t *testing.T) {
+	path := writeRawCassette(t, rawHeader(t, FormatVersion))
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v (an empty cassette is readable; it is only unusable)", err)
+	}
+	if c.Len() != 0 {
+		t.Fatalf("Len() = %d, want 0", c.Len())
+	}
+
+	replay, err := NewReplay(c, "microsoft", c.ModelVersion())
+	if err == nil {
+		t.Fatal("an empty cassette was accepted; every frame of the corpus would miss, and the run would report that only after it finished")
+	}
+	if replay != nil {
+		t.Error("NewReplay returned a moderator alongside its error")
+	}
+	if !strings.Contains(err.Error(), "no recorded frames") {
+		t.Errorf("error %q does not say the cassette holds nothing", err)
 	}
 }
 
@@ -292,7 +383,7 @@ func TestReplayReportsTheCapturedIdentity(t *testing.T) {
 // TestNewReplayRefusesNoCassette: a nil cassette is a wiring mistake, and the
 // fail-safe answer to a wiring mistake is refusing to start.
 func TestNewReplayRefusesNoCassette(t *testing.T) {
-	replay, err := NewReplay(nil, "microsoft")
+	replay, err := NewReplay(nil, "microsoft", "")
 	if err == nil {
 		t.Fatal("NewReplay(nil) succeeded")
 	}

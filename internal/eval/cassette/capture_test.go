@@ -91,7 +91,7 @@ func TestCassetteKeyIsFrameBytesNotSourceRef(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	replay, err := NewReplay(c, "microsoft")
+	replay, err := NewReplay(c, "microsoft", c.ModelVersion())
 	if err != nil {
 		t.Fatalf("NewReplay: %v", err)
 	}

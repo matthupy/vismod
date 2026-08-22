@@ -339,7 +339,7 @@ func TestALaterEntryForAKeySupersedesTheEarlierOne(t *testing.T) {
 	if c.Len() != 1 {
 		t.Errorf("Len() = %d, want 1: two lines for one key are one entry", c.Len())
 	}
-	replay, err := NewReplay(c, "microsoft")
+	replay, err := NewReplay(c, "microsoft", c.ModelVersion())
 	if err != nil {
 		t.Fatalf("NewReplay: %v", err)
 	}

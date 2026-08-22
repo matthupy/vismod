@@ -33,15 +33,27 @@ type replayVersioned struct {
 
 func (r replayVersioned) ModelVersion() string { return r.version }
 
-// NewReplay returns a Moderator that replays c, refusing a cassette recorded
-// by a different adapter than the one this run is configured for.
+// NewReplay returns a Moderator that replays c, refusing a cassette that does
+// not answer for the exact configuration this run is using: the adapter it was
+// recorded by, the model version that adapter reported, and a recording that
+// actually holds frames.
 //
-// That refusal is not bookkeeping. Scores are not portable across vendors — a
-// Microsoft severity/6, a Google likelihood bucket and a Hive head
+// Those refusals are not bookkeeping. Scores are not portable across vendors —
+// a Microsoft severity/6, a Google likelihood bucket and a Hive head
 // probability are different quantities (MODEL_LIMITATIONS.md) — so replaying
 // one vendor's cassette under another's thresholds produces numbers that look
 // entirely plausible and mean nothing.
-func NewReplay(c *Cassette, adapter string) (moderation.Moderator, error) {
+//
+// The same argument applies WITHIN a vendor, which is why modelVersion is
+// checked and not merely recorded: a shieldgemma policy-set change, a
+// microsoft api-version bump or a different google feature list all keep
+// Name() identical while changing what the model answers. modelVersion is what
+// the CONFIGURED adapter reports (empty when it reports none), and it must
+// equal what the recording adapter reported. A caller that does not know its
+// own model version cannot establish that the cassette answers for it, so
+// there is deliberately no way to skip this check — the parameter is required
+// rather than optional for the same reason the adapter name is.
+func NewReplay(c *Cassette, adapter, modelVersion string) (moderation.Moderator, error) {
 	if c == nil {
 		return nil, errors.New("cassette: no cassette to replay")
 	}
@@ -49,11 +61,32 @@ func NewReplay(c *Cassette, adapter string) (moderation.Moderator, error) {
 		return nil, fmt.Errorf("cassette: recorded by adapter %q, but this run is configured for adapter %q; scores are not portable across vendors, so this cassette cannot answer for it",
 			c.adapter, adapter)
 	}
+	if c.modelVersion != modelVersion {
+		return nil, fmt.Errorf("cassette: adapter %q recorded it reporting model version %q, but this run's %q reports %q; the same vendor answers differently across policy sets and api versions, so this cassette does not answer for the configuration being swept",
+			c.adapter, orNone(c.modelVersion), adapter, orNone(modelVersion))
+	}
+	// A header-only cassette is what a capture run that died before its first
+	// frame leaves behind. It loads cleanly and then misses on every frame, so
+	// the operator would learn the recording never happened only after the
+	// whole replay pass had run and every case was verdict:"error".
+	if c.Len() == 0 {
+		return nil, fmt.Errorf("cassette: recorded by adapter %q but holds no recorded frames; every frame of the corpus would miss, so re-record with a billed pass rather than running a corpus that cannot score", c.adapter)
+	}
 	r := &ReplayModerator{c: c}
 	if c.modelVersion != "" {
 		return replayVersioned{ReplayModerator: r, version: c.modelVersion}, nil
 	}
 	return r, nil
+}
+
+// orNone renders an absent model version as something an operator can read.
+// An error reading `reports ""` looks like a bug in the message rather than a
+// statement that the adapter reports no version at all.
+func orNone(v string) string {
+	if v == "" {
+		return "(none)"
+	}
+	return v
 }
 
 // Cassette is the recording being replayed; its Stats carry the hit and miss
