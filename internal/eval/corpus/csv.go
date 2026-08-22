@@ -134,15 +134,32 @@ func desugar(raw []byte, dir string) (manifestDoc, error) {
 	if err != nil {
 		return doc, fmt.Errorf("csv: %w", err)
 	}
+	// Every column must be one this on-ramp can express, and each may appear
+	// once. This is dec.KnownFields(true) for the CSV: a column that is read
+	// and discarded loses an assertion the operator believes they made, and
+	// the run still reports a number \u2014 wrong in a flattering direction.
+	//
+	// label_provenance is the column that makes this load-bearing rather than
+	// tidy. Convert stamps "human" on every row, which is only safe because a
+	// CSV cannot say "derived"; silently dropping a label_provenance column
+	// would leave derived rows Scoreable() and grade the pipeline against its
+	// own past output.
 	refCol, flaggedCol := -1, -1
 	for i, h := range header {
 		// A spreadsheet export leads with a byte-order mark.
-		switch strings.ToLower(strings.TrimSpace(strings.TrimPrefix(h, "\ufeff"))) {
+		name := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(h, "\ufeff")))
+		col := &refCol
+		switch name {
 		case csvRefColumn:
-			refCol = i
 		case csvFlaggedColumn:
-			flaggedCol = i
+			col = &flaggedCol
+		default:
+			return doc, fmt.Errorf("line 1: csv header column %d is %q, and this on-ramp reads only %q and %q: a column it cannot express would be read and discarded, losing an assertion the corpus still reports a number for. Convert it to a manifest to say more than a flag", i+1, h, csvRefColumn, csvFlaggedColumn)
 		}
+		if *col >= 0 {
+			return doc, fmt.Errorf("line 1: csv header names %q twice (columns %d and %d), and the second would silently win: one of the two values is dropped", name, *col+1, i+1)
+		}
+		*col = i
 	}
 	if refCol < 0 {
 		return doc, fmt.Errorf("line 1: csv header has no %q column, got %q", csvRefColumn, strings.Join(header, ","))

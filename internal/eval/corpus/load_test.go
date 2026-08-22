@@ -629,6 +629,37 @@ cases: []
 	}
 }
 
+// TestLoadRefusesASecondDocumentEvenWhenItIsMalformed closes the fail-open in
+// the multi-document guard: a second Decode that returns a non-EOF error means
+// there IS more in the file, and discarding that error accepts the manifest
+// with only the first document's cases while the digest covers the whole file.
+//
+// The everyday shape is `{ cat a.yaml; echo ---; cat b.yaml; } > all.yaml`
+// where b.yaml has a typo. The run then reports a corpus containing cases it
+// never scanned. A well-formed second document was already refused — these are
+// the ones that parse on the first Decode and only fail on the second.
+func TestLoadRefusesASecondDocumentEvenWhenItIsMalformed(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		extra string
+	}{
+		{"undefined alias", "*nope\n"},
+		{"unclosed flow sequence", "version: [1\n"},
+		{"bad indentation", "version: 1\ncases:\n   - id: case-0009\n  bad: indent\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := writeManifest(t, t.TempDir(), "corpus.yaml", validManifest+"---\n"+tc.extra)
+			_, err := Load(path, testOptions())
+			if err == nil {
+				t.Fatal("a manifest with a malformed second document loaded; its cases are silently missing from a corpus the digest says is whole")
+			}
+			if !strings.Contains(err.Error(), "document") {
+				t.Errorf("error %q does not say the trouble is a second document", err)
+			}
+		})
+	}
+}
+
 func TestLoadMissingFileIsAnError(t *testing.T) {
 	_, err := Load(filepath.Join(t.TempDir(), "nope.yaml"), testOptions())
 	if err == nil {

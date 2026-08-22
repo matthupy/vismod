@@ -283,6 +283,52 @@ http://media.example.com/a.jpg,true
 	}
 }
 
+// TestCSVRefusesColumnsItCannotExpress is the CSV half of the guarantee
+// dec.KnownFields(true) gives the manifest: a corpus that loses an assertion
+// still reports a number, and that number is wrong in a flattering direction.
+//
+// An unknown column is the sharper case of the two. The CSV on-ramp stamps
+// label_provenance: human on every row, which is safe ONLY because a CSV
+// cannot express "derived" — so an operator who adds a label_provenance
+// column and writes "derived" in it believes they excluded those rows from
+// scoring, while every one of them stays Scoreable() and the harness grades
+// the pipeline against its own past output. A duplicate column is the same
+// defect with a smaller blast radius: last-index-wins silently inverts a
+// label.
+func TestCSVRefusesColumnsItCannotExpress(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		want []string
+	}{
+		{"unknown column", `ref,expected_flagged,label_provenance
+a.jpg,true,derived
+`, []string{"line 1", "label_provenance"}},
+		{"duplicate expected_flagged", `ref,expected_flagged,expected_flagged
+a.jpg,true,false
+`, []string{"line 1", "expected_flagged", "twice"}},
+		{"duplicate ref column", `ref,ref,expected_flagged
+a.jpg,b.jpg,true
+`, []string{"line 1", "ref", "twice"}},
+		{"trailing comma leaves an unnamed column", `ref,expected_flagged,
+a.jpg,true,
+`, []string{"line 1"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			csvPath := writeCSV(t, t.TempDir(), "list.csv", tc.body)
+			_, err := LoadCSV(csvPath, filepath.Join(t.TempDir(), "corpus.yaml"), testOptions())
+			if err == nil {
+				t.Fatalf("%s accepted; the expectation it carries is silently dropped", tc.name)
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q does not mention %q", err, want)
+				}
+			}
+		})
+	}
+}
+
 func TestCSVAcceptsTheBooleanSpellingsEncodingCSVWrites(t *testing.T) {
 	c, _ := loadFlatCSV(t, `ref,expected_flagged
 a.jpg,TRUE

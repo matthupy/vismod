@@ -107,8 +107,16 @@ func decodeManifest(raw []byte) (manifestDoc, error) {
 		}
 		return doc, fmt.Errorf("parse: %w", err)
 	}
+	// Anything other than a clean EOF means there IS more in the file. A
+	// malformed second document errors HERE rather than on the first Decode,
+	// so treating a non-EOF error as "no second document" accepts the manifest
+	// with only the first document's cases — while the digest covers the whole
+	// file, and the run reports a corpus it never scanned.
 	var extra yaml.Node
-	if err := dec.Decode(&extra); err == nil {
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+		if err != nil {
+			return doc, fmt.Errorf("manifest holds more than one YAML document, and the one after the first does not parse (%v); a corpus is exactly one", err)
+		}
 		return doc, errors.New("manifest holds more than one YAML document; a corpus is exactly one")
 	}
 	return doc, nil
