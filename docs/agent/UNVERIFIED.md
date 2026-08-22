@@ -397,3 +397,22 @@ when they do.
 corpus run through `cli.Serve` with a real capture wrapper installed, showing
 one billed vendor call per corpus case on the capture pass and zero on the
 replay pass.
+
+## The eval cassette has never run under `-race`
+
+`internal/eval/cassette` is written to be shared: the pipeline fans a
+video's frames out through ONE Moderator (`errgroup.SetLimit`), so the
+`CapturingModerator` serializes its appends under a mutex and the
+`Cassette` counts hits and misses under another. Neither claim has been
+checked by the race detector — this box has `CGO_ENABLED=0` and no C
+toolchain, so `-race` errors with `-race requires cgo` rather than
+passing or failing.
+
+**Actually tested:** `TestCapturingRecordsEveryFrameOfAConcurrentFanOut`
+drives 16 concurrent `AnalyzeImage` calls through one decorator and then
+loads the cassette back, so a torn or interleaved line fails the test.
+An interleaving that still parses would not be caught, and the hit/miss
+counters are not exercised concurrently at all.
+
+**Proves it:** `go test -race ./internal/eval/cassette/` on a machine
+with a C toolchain. CI is the gate.
