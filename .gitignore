@@ -15,3 +15,7 @@ deploy/compose/config.compose.yaml
 deploy/compose/config.yaml
 media/
 !media/.gitkeep
+# eval cassettes: a recorded vendor pass over an OPERATOR's corpus. Strictly
+# local, never committed — a cassette holds provider raw output and SHA-256
+# digests of their media. See internal/eval/cassette.
+*.cassette.jsonl
