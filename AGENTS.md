@@ -275,9 +275,16 @@ import needs justification.
   adapter satisfied is a boot failure: the capability just disappears with
   nothing logged, stamping `model_version:"unversioned"` on every envelope
   forever or silently falling back to frame extraction. The guard requires
-  forwarding, not invention. `Close()` cannot be guarded — every decorator
-  has it and none can be asserted for — so that one stays a documented
-  contract. Rationale in `boot.go`'s godoc; guards pinned by
+  forwarding, not invention. The MANDATORY methods — `Close()`, `Name()`
+  and `Capabilities()` — cannot be guarded at all: every decorator has
+  them, so an assertion proves presence and never forwarding. They are
+  contract, not check. A decorator that overrides `Name()` to `""` poisons
+  `ConfigHash` and the `Provider` on every record; one that returns a zero
+  `Caps` kills the video branch even with `AnalyzeVideo()` forwarded (it
+  gates on both) and drops the oversize pre-flight. Embedding
+  `moderation.Moderator` forwards all three by construction — do not
+  override one without forwarding. Rationale in `boot.go`'s godoc; guards
+  pinned by
   `internal/cli/architecture_test.go` and the decorator tests.
 - **The address policy is chosen from the hostname, before resolution.**
   `Fetcher.dial` picks `DenyMetadata` over `DenyPrivate` only when the

@@ -101,10 +101,30 @@ func WithModeratorDecorator(fn func(moderation.Moderator) moderation.Moderator) 
 // decorator over an adapter that never declared the capability is fine, and a
 // decorator is still free to add one.
 //
-// Close() cannot be guarded this way — it is part of moderation.Moderator, so
-// every decorator has it and none can be asserted for. A decorator that
-// implements Close() without forwarding leaks the adapter at shutdown and on
-// every later boot-failure arm below. That one stays a documented contract.
+// The MANDATORY methods cannot be guarded this way at all. Close(), Name()
+// and Capabilities() are part of moderation.Moderator, so every decorator has
+// them and none can be asserted for — a type assertion proves the method is
+// present, never that it forwards. The guard above draws its line at the
+// method set precisely because that is all a type assertion can see, and the
+// natural decorator shape (embedding moderation.Moderator) forwards all three
+// by construction while dropping the optional interfaces by construction —
+// which is why those are the arms worth having. Overriding a mandatory method
+// to return a zero value is not a slip the embed can make for you. It is
+// deliberate, and it is contract, not check:
+//
+//   - Close() without forwarding leaks the adapter at shutdown and on every
+//     later boot-failure arm below.
+//   - Name() returning "" reaches ModelIdentity.Adapter and ConfigHash in
+//     buildPipeline, and Provider on every envelope and audit record — the
+//     same harm the ModelVersion() arm names, by a route no assertion sees.
+//   - Capabilities() returning a zero Caps disables the pipeline's video
+//     branch even when AnalyzeVideo() forwarded (it gates on BOTH the
+//     assertion and SupportsVideo), and reads MaxImageBytes 0 as "no limit",
+//     dropping the oversize pre-flight that exists to not spend a billed
+//     token on an image the adapter will reject.
+//
+// A decorator forwards all three, or it is broken in ways this boot path
+// cannot tell you about.
 func applyModeratorDecorator(mod moderation.Moderator, fn func(moderation.Moderator) moderation.Moderator) (moderation.Moderator, error) {
 	if fn == nil {
 		return nil, fmt.Errorf("moderator decorator: the hook is nil")
