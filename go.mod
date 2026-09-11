@@ -4,7 +4,7 @@ go 1.26.6
 
 require (
 	cloud.google.com/go/vision/v2 v2.15.0
-	github.com/alicebob/miniredis/v2 v2.38.0
+	github.com/alicebob/miniredis/v2 v2.39.0
 	github.com/prometheus/client_golang v1.23.2
 	github.com/redis/go-redis/v9 v9.22.0
 	github.com/spf13/cobra v1.10.2
