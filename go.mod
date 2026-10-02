@@ -3,7 +3,7 @@ module github.com/vismod/vismod
 go 1.26.6
 
 require (
-	cloud.google.com/go/vision/v2 v2.15.0
+	cloud.google.com/go/vision/v2 v2.16.0
 	github.com/alicebob/miniredis/v2 v2.38.0
 	github.com/prometheus/client_golang v1.23.2
 	github.com/redis/go-redis/v9 v9.22.0
@@ -13,7 +13,7 @@ require (
 	golang.org/x/sync v0.22.0
 	google.golang.org/api v0.293.0
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260807164820-c8921c73eeea
-	google.golang.org/grpc v1.83.0
+	google.golang.org/grpc v1.83.1
 )
 
 require (
